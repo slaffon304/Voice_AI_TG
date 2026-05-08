@@ -1,0 +1,8 @@
+pipecat-ai[google]
+fastapi
+uvicorn[standard]
+websockets
+httpx
+pytz
+supabase
+google-genai
