@@ -1,6 +1,6 @@
 import os
 import httpx
-from fastapi import FastAPI, WebSocket, Query
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 import datetime
 import pytz
@@ -28,10 +28,10 @@ from pipecat.transports.websocket.fastapi import (
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 
-# Ключи доступа (должны быть в переменных окружения Coolify)
+# Ключи доступа
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN") # Токен бота для уведомлений об ошибках
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 
 class RawPCMFrameSerializer(FrameSerializer):
     async def serialize(self, frame: Frame) -> bytes | str | None:
@@ -61,29 +61,24 @@ class AudioMixer:
     def add_user_audio(self, frame: InputAudioRawFrame):
         self._init_wav()
         
-        # 1. Читаем аудио пользователя (16000 Гц)
         user_chunk = np.frombuffer(frame.audio, dtype=np.int16)
         
-        # 2. Быстрый ресемплинг 16k -> 24k через линейную интерполяцию
         num_samples = int(len(user_chunk) * (self.target_rate / frame.sample_rate))
         x = np.arange(len(user_chunk))
         x_new = np.linspace(0, len(user_chunk) - 1, num_samples)
         user_resampled = np.interp(x_new, x, user_chunk).astype(np.int16)
         
-        # 3. Достаем синхронный кусок аудио ИИ из буфера
         ai_samples = np.zeros(num_samples, dtype=np.int16)
         if len(self.ai_buffer) > 0:
             take_len = min(num_samples, len(self.ai_buffer))
             ai_samples[:take_len] = self.ai_buffer[:take_len]
             self.ai_buffer = self.ai_buffer[take_len:] 
             
-        # 4. Микшируем (складываем) сигналы с защитой от цифрового перегруза
         mixed_chunk = np.clip(
             user_resampled.astype(np.int32) + ai_samples.astype(np.int32), 
             -32768, 32767
         ).astype(np.int16)
         
-        # 5. Пишем готовый стерео-микс в файл
         self._wav_file.writeframes(mixed_chunk.tobytes())
 
     def _init_wav(self):
@@ -122,6 +117,53 @@ class AIAudioCatcher(FrameProcessor):
         if isinstance(frame, OutputAudioRawFrame):
             self.mixer.add_ai_audio(frame)
         await self.push_frame(frame, direction)
+
+# ==========================================
+# АДАПТЕР ASTERISK -> WEBSOCKET
+# ==========================================
+class AsteriskWSAdapter:
+    """Обертка для совместимости TCP-сокета Asterisk и FastAPIWebsocketTransport"""
+    def __init__(self, reader, writer):
+        self.reader = reader
+        self.writer = writer
+
+    async def accept(self): 
+        pass
+
+    async def close(self, code=1000, reason=""): 
+        self.writer.close()
+        try:
+            await self.writer.wait_closed()
+        except Exception:
+            pass
+
+    async def receive_bytes(self):
+        try:
+            header = await self.reader.readexactly(3)
+            p_len = int.from_bytes(header[1:], byteorder='big')
+            data = await self.reader.readexactly(p_len)
+            if header[0] == 0x00: 
+                raise Exception("Hangup")
+            return data
+        except Exception:
+            raise
+
+    async def send_bytes(self, data):
+        try:
+            audio_array = np.frombuffer(data, dtype=np.int16)
+            new_len = int(len(audio_array) * 16000 // 24000)
+            resampled = np.interp(
+                np.linspace(0, len(audio_array) - 1, new_len),
+                np.arange(len(audio_array)),
+                audio_array
+            ).astype(np.int16).tobytes()
+            
+            header = b'\x10' + len(resampled).to_bytes(2, byteorder='big')
+            self.writer.write(header + resampled)
+            await self.writer.drain()
+        except Exception:
+            pass
+
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -255,225 +297,235 @@ async def send_final_report_to_n8n(client_id: str, transcript: str, summary: str
         except Exception as e:
             print(f"❌ Ошибка отправки финального отчета в n8n: {e}", flush=True)
 
-# --- 2. ГЛАВНЫЙ WEBSOCKET ---
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, client_id: str = Query(None)):
-    
-    print(f"--- ВХОДЯЩИЙ ЗВОНОК | client_id: {client_id} ---", flush=True)
-
-    if not client_id:
-        print("❌ ОТКАЗ (403): client_id lipsește din URL.", flush=True)
-        await websocket.close(code=1008, reason="Missing client_id")
-        return
-
-    client_data = await get_client_data(client_id)
-    if not client_data:
-        print("❌ ОТКАЗ (403): get_client_data a returnat None. Închidem conexiunea.", flush=True)
-        await websocket.close(code=1008, reason="Client not found")
-        return
-
-    sub_status = str(client_data.get("subscription_status_assistent", "")).strip().lower()
-    print(f"🔍 Statutul abonamentului: '{sub_status}'", flush=True)
-
-    if sub_status == "false":
-        print("❌ ОТКАЗ (403): Abonamentul este inactiv (false).", flush=True)
-        await websocket.close(code=1008, reason="Subscription expired")
-        return
-
-    print("🟢 TOATE VERIFICĂRILE AU TRECUT! Ridicăm apelul.", flush=True)
-    await websocket.accept()
-
-    # --- 3. ПОДГОТОВКА СИСТЕМНОГО ПРОМПТА ---
-    raw_prompt = client_data.get("system_message", "Ești un asistent virtual.")
-    
-    tz = pytz.timezone('Europe/Chisinau')
-    current_time = datetime.datetime.now(tz).strftime('%A, %d %B %Y, %H:%M')
-    office_status = "Open" 
-
-    system_prompt = raw_prompt.replace("{company_name}", client_data.get("company_name") or "Compania noastră")
-    system_prompt = system_prompt.replace("{business_context}", client_data.get("business_context") or "")
-    system_prompt = system_prompt.replace("{bot_goal}", client_data.get("bot_goal") or "")
-    system_prompt = system_prompt.replace("{tone}", client_data.get("tone") or "friendly")
-    system_prompt = system_prompt.replace("{current_datetime}", current_time or "")
-    system_prompt = system_prompt.replace("{office_status}", office_status or "")
-
-
-    # 🟢 ДОБАВЛЯЕМ ЖЕСТКИЕ ПРАВИЛА ПОВЕДЕНИЯ К ПРОМПТУ
-     
-    behavior_rules = """
-    \n\nREGULI STRICTE DE CONVERSAȚIE (URMEAZĂ-LE CU STRICTEȚE):
-    1. LIMBA: Răspunde MEREU în limba clientului. Dacă primul cuvânt este scurt, distorsionat sau nu ești sigur de limbă (ex: se aude doar zgomot sau un scurt "alo"/"bună"), folosește IMPLICIT limba Română.
-    2. PAUZELE: Dacă pui o întrebare de confirmare (ex: "Corect?", "Sunteți de acord?", "Verific?"), OPREȘTE-TE imediat din vorbit și așteaptă răspunsul clientului. NU continua fraza și NU apela nicio funcție până nu auzi răspunsul.
-    3. FĂRĂ HALUCINAȚII LA ID-URI: Pentru acțiunile 'reschedule' sau 'cancel', folosește STRICT event_id real returnat de webhook-ul 'lookup'. ESTE STRICT INTERZIS să inventezi ID-uri de test precum "event_123456". Dacă nu ai primit încă ID-ul real de la sistem, AȘTEAPTĂ! Nu apela 'reschedule' în orb.
-    """
-    system_prompt += behavior_rules
-
-
-    # --- 4. ОПРЕДЕЛЕНИЕ ИНСТРУМЕНТОВ (TOOLS) ---
-    tools = [
-        {
-            "function_declarations": [
-                                {
-                    "name": "save_lead",
-                    "description": "Salvează datele de contact și motivul apelului în CRM.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "client_name": {"type": "string"},
-                            "client_phone": {"type": "string"},
-                            "request_summary": {"type": "string"},
-                            "event_id": {"type": "string", "description": "ID-ul evenimentului din calendar (dacă a fost creat)"}
-                        },
-                        "required": ["client_name", "client_phone", "request_summary"]
-                    }
-                },
-
-                 {
-        "name": "Booking_tool",
-        "description": "Gestionează calendarul: verifică, rezervă, anulează sau reprogramează.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["check", "book", "lookup", "reschedule", "cancel"], "description": "Tipul acțiunii"},
-                "phone": {"type": "string", "description": "Telefonul clientului"},
-                "client_name": {"type": "string", "description": "Numele clientului (obligatoriu pentru 'book')"},
-                "request_summary": {"type": "string", "description": "Motivul programării sau scurtă descriere (ex: 'Consultație automatizare')"},
-                "start_time": {"type": "string", "description": "ISO 8601 start"},
-                "end_time": {"type": "string", "description": "ISO 8601 end"},
-                "event_id": {"type": "string", "description": "ID-ul REAL al evenimentului obținut exclusiv din acțiunea 'lookup'."}
-            },
-            "required": ["action"]
-        }
-    }
-            ]
-        }
-    ]
-
-    # --- 5. НАСТРОЙКА СЕРВИСОВ PIPECAT ---
-    transport = FastAPIWebsocketTransport(
-        websocket=websocket,
-        params=FastAPIWebsocketParams(
-            audio_in_enabled=True, audio_out_enabled=True, add_wav_header=False, serializer=RawPCMFrameSerializer() 
-        )
-    )
-
-    context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
-    context_aggregator = LLMContextAggregatorPair(context=context)
-
-    llm = GeminiLiveLLMService(
-        api_key=os.getenv("GEMINI_API_KEY"),
-        tools=tools,
-        settings=GeminiLiveLLMService.Settings(
-            model="gemini-3.1-flash-live-preview",
-            voice="Enceladus",
-            system_instruction=system_prompt
-        )
-    )
-
-    # --- 6. РЕАЛИЗАЦИЯ ЛОГИКИ ИНСТРУМЕНТОВ ---
-    async def process_save_lead(params: FunctionCallParams):
-        tg_chat_id = client_data.get("tg_chat_id_notify", "")
-        company_name = client_data.get("company_name", "Necunoscut")
-        async with httpx.AsyncClient() as http_client:
-            try:
-                response = await http_client.post(
-                    f"https://n8n.labupgrade.in/webhook/save_lead?client_id={client_id}&tg_chat_id={tg_chat_id}",
-                    json=params.arguments,
-                    timeout=5.0
-                )
-                response.raise_for_status()
-                await params.result_callback(response.json())
-            except asyncio.CancelledError:
-                print("⚠️ Вызов save_lead прерван (клиент перебил бота). Защита активирована.", flush=True)
-                try:
-                    await params.result_callback({"status": "cancelled", "message": "Client interrupted. Await client input."})
-                except Exception: pass
-                raise
-            except Exception as e:
-                error_msg = f"⚠️ <b>Eroare API (save_lead)</b>\n🏢 Companie: {company_name}\n🔧 Detalii eroare: <code>{str(e)}</code>\nN8N nu a putut salva lead-ul!"
-                await send_tg_alert(tg_chat_id, error_msg)
-                await params.result_callback({"error": f"Eroare CRM: {str(e)}"})
-
-    async def process_booking_tool(params: FunctionCallParams):
-        cal_id = client_data.get("google_calendar_id", "")
-        tg_chat_id = client_data.get("tg_chat_id_notify", "")
-        company_name = client_data.get("company_name", "Necunoscut")
-        
-        async with httpx.AsyncClient() as http_client:
-            try:
-                response = await http_client.post(
-                    f"https://n8n.labupgrade.in/webhook/booking?client_id={client_id}&google_calendar_id={cal_id}",
-                    json=params.arguments,
-                    timeout=10.0 
-                )
-                response.raise_for_status()
-                await params.result_callback(response.json())
-            except asyncio.CancelledError:
-                print("⚠️ Вызов Booking_tool прерван (клиент перебил бота). Защита активирована.", flush=True)
-                try:
-                    await params.result_callback({"status": "cancelled", "message": "Client interrupted the tool call. Stop and listen."})
-                except Exception: pass
-                raise
-            except Exception as e:
-                error_msg = f"⚠️ <b>Eroare API (Booking_tool)</b>\n🏢 Companie: {company_name}\n🔧 Detalii eroare: <code>{str(e)}</code>\nN8N nu a procesat rezervarea!"
-                await send_tg_alert(tg_chat_id, error_msg)
-                await params.result_callback({"status": "error", "message": f"Sistemul de rezervări nu răspunde: {str(e)}"})
-
-    # Регистрируем инструменты
-    llm.register_function("save_lead", process_save_lead)
-    llm.register_function("Booking_tool", process_booking_tool)
-
-    # 🟢 Инициализируем наш умный микшер
-    wav_filename = f"record_{client_id}_{uuid.uuid4().hex[:8]}.wav"
-    audio_mixer = AudioMixer(wav_filename)
-    user_catcher = UserAudioCatcher(audio_mixer)
-    ai_catcher = AIAudioCatcher(audio_mixer)
-
-   
-            # --- 7. ЗАПУСК ПАЙПЛАЙНА ---
-    pipeline = Pipeline([
-        transport.input(), 
-        user_catcher,         # <--- Слушает 16кГц микрофон
-        context_aggregator.user(), 
-        llm, 
-        ai_catcher,           # <--- Слушает 24кГц ответы Gemini
-        transport.output(), 
-        context_aggregator.assistant()
-    ])
-    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
-
-    @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, client):
-        context.add_message({
-            "role": "system", 
-            "content": "Clientul s-a conectat. Salută-l imediat și prezintă-te ca Grigorii. REGULĂ STRICTĂ: Vorbește în limba clientului. Dacă primul lui cuvânt e prea scurt sau neclar, începe dialogul în Română."
-        })
-        await task.queue_frames([LLMRunFrame()])
-
-    # 🟢 ФУНКЦИЯ ТАЙМЕРА ДЛЯ ТЕСТОВОГО ЗВОНКА
-    async def enforce_call_limit(current_task: PipelineTask, current_context: LLMContext):
+# --- 2. ЭНДПОИНТ ДЛЯ ASTERISK (GET UUID) ---
+@app.get("/get_uuid")
+async def get_client_uuid(sip_login: str):
+    clean_url = SUPABASE_URL.replace("/rest/v1", "").rstrip("/")
+    url = f"{clean_url}/rest/v1/saas_clients?sip_login=eq.{sip_login}&select=id"
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    async with httpx.AsyncClient() as client:
         try:
-            await asyncio.sleep(110) # Ждем 1 минуту 50 секунд
-            
-            # Впрыскиваем скрытую команду ассистенту, чтобы он попрощался
-            current_context.add_message({
-                "role": "user", 
-                "content": "SYSTEM COMMAND: Apelul de test se încheie în 10 secunde. Te rog să-ți iei la revedere scurt și politicos chiar acum, fără să menționezi că e o comandă de sistem."
-            })
-            await current_task.queue_frames([LLMRunFrame()])
-            
-            await asyncio.sleep(10) # Ждем еще 10 секунд
-            
-            # Жестко завершаем звонок (это корректно закроет сокет и запустит пост-обработку)
-            await current_task.queue_frames([EndFrame()])
-        except asyncio.CancelledError:
-            pass # Если клиент повесил трубку сам, таймер просто тихо отменится
+            resp = await client.get(url, headers=headers)
+            data = resp.json()
+            return Response(content=str(data[0].get("id")) if data else "not_found", media_type="text/plain")
+        except Exception: 
+            return Response(content="error", media_type="text/plain")
 
-    # Возвращаем правильный отступ!
-    runner = PipelineRunner()
-    timer_task = None 
-    
+# --- 3. ГЛАВНЫЙ ОБРАБОТЧИК ASTERISK (ЗАМЕНА WEBSOCKET) ---
+async def handle_asterisk_conn(reader, writer):
+    print(f"--- ВХОДЯЩИЙ ЗВОНОК ---", flush=True)
+    timer_task = None
+    audio_mixer = None
+    wav_filename = None
+
     try:
+        # Читаем UUID (первый пакет от Asterisk)
+        h = await reader.readexactly(3)
+        id_len = int.from_bytes(h[1:], byteorder='big')
+        client_id = (await reader.readexactly(id_len)).decode().strip()
+        print(f"--- ВХОДЯЩИЙ ЗВОНОК | client_id: {client_id} ---", flush=True)
+
+        if not client_id:
+            print("❌ ОТКАЗ (403): client_id lipsește din URL.", flush=True)
+            writer.close()
+            return
+
+        client_data = await get_client_data(client_id)
+        if not client_data:
+            print("❌ ОТКАЗ (403): get_client_data a returnat None. Închidem conexiunea.", flush=True)
+            writer.close()
+            return
+
+        sub_status = str(client_data.get("subscription_status_assistent", "")).strip().lower()
+        print(f"🔍 Statutul abonamentului: '{sub_status}'", flush=True)
+
+        if sub_status == "false":
+            print("❌ ОТКАЗ (403): Abonamentul este inactiv (false).", flush=True)
+            writer.close()
+            return
+
+        print("🟢 TOATE VERIFICĂRILE AU TRECUT! Ridicăm apelul.", flush=True)
+        
+        # Подключаем наш Адаптер (обманываем Pipecat)
+        fake_websocket = AsteriskWSAdapter(reader, writer)
+
+        # --- ПОДГОТОВКА СИСТЕМНОГО ПРОМПТА ---
+        raw_prompt = client_data.get("system_message", "Ești un asistent virtual.")
+        tz = pytz.timezone('Europe/Chisinau')
+        current_time = datetime.datetime.now(tz).strftime('%A, %d %B %Y, %H:%M')
+        office_status = "Open" 
+
+        system_prompt = raw_prompt.replace("{company_name}", client_data.get("company_name") or "Compania noastră")
+        system_prompt = system_prompt.replace("{business_context}", client_data.get("business_context") or "")
+        system_prompt = system_prompt.replace("{bot_goal}", client_data.get("bot_goal") or "")
+        system_prompt = system_prompt.replace("{tone}", client_data.get("tone") or "friendly")
+        system_prompt = system_prompt.replace("{current_datetime}", current_time or "")
+        system_prompt = system_prompt.replace("{office_status}", office_status or "")
+
+        behavior_rules = """
+        \n\nREGULI STRICTE DE CONVERSAȚIE (URMEAZĂ-LE CU STRICTEȚE):
+        1. LIMBA: Răspunde MEREU în limba clientului. Dacă primul cuvânt este scurt, distorsionat sau nu ești sigur de limbă (ex: se aude doar zgomot sau un scurt "alo"/"bună"), folosește IMPLICIT limba Română.
+        2. PAUZELE: Dacă pui o întrebare de confirmare (ex: "Corect?", "Sunteți de acord?", "Verific?"), OPREȘTE-TE imediat din vorbit și așteaptă răspunsul clientului. NU continua fraza și NU apela nicio funcție până nu auzi răspunsul.
+        3. FĂRĂ HALUCINAȚII LA ID-URI: Pentru acțiunile 'reschedule' sau 'cancel', folosește STRICT event_id real returnat de webhook-ul 'lookup'. ESTE STRICT INTERZIS să inventezi ID-uri de test precum "event_123456". Dacă nu ai primit încă ID-ul real de la sistem, AȘTEAPTĂ! Nu apela 'reschedule' în orb.
+        """
+        system_prompt += behavior_rules
+
+        # --- ОПРЕДЕЛЕНИЕ ИНСТРУМЕНТОВ (TOOLS) ---
+        tools = [
+            {
+                "function_declarations": [
+                    {
+                        "name": "save_lead",
+                        "description": "Salvează datele de contact și motivul apelului în CRM.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "client_name": {"type": "string"},
+                                "client_phone": {"type": "string"},
+                                "request_summary": {"type": "string"},
+                                "event_id": {"type": "string", "description": "ID-ul evenimentului din calendar (dacă a fost creat)"}
+                            },
+                            "required": ["client_name", "client_phone", "request_summary"]
+                        }
+                    },
+                    {
+                        "name": "Booking_tool",
+                        "description": "Gestionează calendarul: verifică, rezervă, anulează sau reprogramează.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "action": {"type": "string", "enum": ["check", "book", "lookup", "reschedule", "cancel"], "description": "Tipul acțiunii"},
+                                "phone": {"type": "string", "description": "Telefonul clientului"},
+                                "client_name": {"type": "string", "description": "Numele clientului (obligatoriu pentru 'book')"},
+                                "request_summary": {"type": "string", "description": "Motivul programării sau scurtă descriere (ex: 'Consultație automatizare')"},
+                                "start_time": {"type": "string", "description": "ISO 8601 start"},
+                                "end_time": {"type": "string", "description": "ISO 8601 end"},
+                                "event_id": {"type": "string", "description": "ID-ul REAL al evenimentului obținut exclusiv din acțiunea 'lookup'."}
+                            },
+                            "required": ["action"]
+                        }
+                    }
+                ]
+            }
+        ]
+
+        # --- НАСТРОЙКА СЕРВИСОВ PIPECAT ---
+        transport = FastAPIWebsocketTransport(
+            websocket=fake_websocket,
+            params=FastAPIWebsocketParams(
+                audio_in_enabled=True, audio_out_enabled=True, add_wav_header=False, serializer=RawPCMFrameSerializer() 
+            )
+        )
+
+        context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
+        context_aggregator = LLMContextAggregatorPair(context=context)
+
+        # 🟢 ЗДЕСЬ ТВОЯ ТОЧНАЯ КОНФИГУРАЦИЯ GEMINI 3.1
+        llm = GeminiLiveLLMService(
+            api_key=os.getenv("GEMINI_API_KEY"),
+            tools=tools,
+            settings=GeminiLiveLLMService.Settings(
+                model="gemini-3.1-flash-live-preview",
+                voice="Enceladus",
+                system_instruction=system_prompt
+            )
+        )
+
+        # --- РЕАЛИЗАЦИЯ ЛОГИКИ ИНСТРУМЕНТОВ ---
+        async def process_save_lead(params: FunctionCallParams):
+            tg_chat_id = client_data.get("tg_chat_id_notify", "")
+            company_name = client_data.get("company_name", "Necunoscut")
+            async with httpx.AsyncClient() as http_client:
+                try:
+                    response = await http_client.post(
+                        f"https://n8n.labupgrade.in/webhook/save_lead?client_id={client_id}&tg_chat_id={tg_chat_id}",
+                        json=params.arguments,
+                        timeout=5.0
+                    )
+                    response.raise_for_status()
+                    await params.result_callback(response.json())
+                except asyncio.CancelledError:
+                    print("⚠️ Вызов save_lead прерван (клиент перебил бота). Защита активирована.", flush=True)
+                    try:
+                        await params.result_callback({"status": "cancelled", "message": "Client interrupted. Await client input."})
+                    except Exception: pass
+                    raise
+                except Exception as e:
+                    error_msg = f"⚠️ <b>Eroare API (save_lead)</b>\n🏢 Companie: {company_name}\n🔧 Detalii eroare: <code>{str(e)}</code>\nN8N nu a putut salva lead-ul!"
+                    await send_tg_alert(tg_chat_id, error_msg)
+                    await params.result_callback({"error": f"Eroare CRM: {str(e)}"})
+
+        async def process_booking_tool(params: FunctionCallParams):
+            cal_id = client_data.get("google_calendar_id", "")
+            tg_chat_id = client_data.get("tg_chat_id_notify", "")
+            company_name = client_data.get("company_name", "Necunoscut")
+            
+            async with httpx.AsyncClient() as http_client:
+                try:
+                    response = await http_client.post(
+                        f"https://n8n.labupgrade.in/webhook/booking?client_id={client_id}&google_calendar_id={cal_id}",
+                        json=params.arguments,
+                        timeout=10.0 
+                    )
+                    response.raise_for_status()
+                    await params.result_callback(response.json())
+                except asyncio.CancelledError:
+                    print("⚠️ Вызов Booking_tool прерван (клиент перебил бота). Защита активирована.", flush=True)
+                    try:
+                        await params.result_callback({"status": "cancelled", "message": "Client interrupted the tool call. Stop and listen."})
+                    except Exception: pass
+                    raise
+                except Exception as e:
+                    error_msg = f"⚠️ <b>Eroare API (Booking_tool)</b>\n🏢 Companie: {company_name}\n🔧 Detalii eroare: <code>{str(e)}</code>\nN8N nu a procesat rezervarea!"
+                    await send_tg_alert(tg_chat_id, error_msg)
+                    await params.result_callback({"status": "error", "message": f"Sistemul de rezervări nu răspunde: {str(e)}"})
+
+        # Регистрируем инструменты
+        llm.register_function("save_lead", process_save_lead)
+        llm.register_function("Booking_tool", process_booking_tool)
+
+        # 🟢 Инициализируем наш умный микшер
+        wav_filename = f"record_{client_id}_{uuid.uuid4().hex[:8]}.wav"
+        audio_mixer = AudioMixer(wav_filename)
+        user_catcher = UserAudioCatcher(audio_mixer)
+        ai_catcher = AIAudioCatcher(audio_mixer)
+
+        # --- ЗАПУСК ПАЙПЛАЙНА ---
+        pipeline = Pipeline([
+            transport.input(), 
+            user_catcher,         # <--- Слушает 16кГц микрофон
+            context_aggregator.user(), 
+            llm, 
+            ai_catcher,           # <--- Слушает 24кГц ответы Gemini
+            transport.output(), 
+            context_aggregator.assistant()
+        ])
+        task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
+
+        @transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, client):
+            context.add_message({
+                "role": "system", 
+                "content": "Clientul s-a conectat. Salută-l imediat și prezintă-te ca Grigorii. REGULĂ STRICTĂ: Vorbește în limba clientului. Dacă primul lui cuvânt e prea scurt sau neclar, începe dialogul în Română."
+            })
+            await task.queue_frames([LLMRunFrame()])
+
+        # 🟢 ФУНКЦИЯ ТАЙМЕРА ДЛЯ ТЕСТОВОГО ЗВОНКА
+        async def enforce_call_limit(current_task: PipelineTask, current_context: LLMContext):
+            try:
+                await asyncio.sleep(110) # Ждем 1 минуту 50 секунд
+                current_context.add_message({
+                    "role": "user", 
+                    "content": "SYSTEM COMMAND: Apelul de test se încheie în 10 secunde. Te rog să-ți iei la revedere scurt și politicos chiar acum, fără să menționezi că e o comandă de sistem."
+                })
+                await current_task.queue_frames([LLMRunFrame()])
+                await asyncio.sleep(10) # Ждем еще 10 секунд
+                await current_task.queue_frames([EndFrame()])
+            except asyncio.CancelledError:
+                pass
+
+        runner = PipelineRunner()
+        
         # Принудительно проталкиваем фрейм, чтобы запустить разговор
         await task.queue_frames([LLMRunFrame()])
         
@@ -483,34 +535,42 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str = Query(None))
             timer_task = asyncio.create_task(enforce_call_limit(task, context))
         
         await runner.run(task)
+
     except Exception as e:
-        print(f"❌ Ошибка пайплайна: {e}", flush=True)
+        print(f"❌ Ошибка соединения: {e}", flush=True)
     finally:
-        # 🟢 ЕСЛИ ТАЙМЕР БЫЛ ЗАПУЩЕН, НО ЗВОНОК ЗАВЕРШИЛСЯ РАНЬШЕ — ОТМЕНЯЕМ ЕГО
         if timer_task and not timer_task.done():
             timer_task.cancel()
 
         # === ПОСТ-ОБРАБОТКА (START) ===
         print("📞 Звонок завершен. Начинаем фоновые задачи...", flush=True)
 
-        # 🟢 Закрываем микшер и финализируем файл на диске
-        audio_mixer.close()
+        if audio_mixer:
+            audio_mixer.close()
 
-        messages = context.messages
-        full_transcript = ""
-        for msg in messages:
-            if msg.get("role") in ["user", "assistant"] and msg.get("content"):
-                # Игнорируем наши скрытые системные команды в транскрипте, чтобы они не попали в n8n
-                if "SYSTEM COMMAND:" not in msg["content"]:
-                    role = "Client" if msg["role"] == "user" else "AI"
-                    full_transcript += f"{role}: {msg['content']}\n"
+        if 'context' in locals():
+            messages = context.messages
+            full_transcript = ""
+            for msg in messages:
+                if msg.get("role") in ["user", "assistant"] and msg.get("content"):
+                    if "SYSTEM COMMAND:" not in msg["content"]:
+                        role = "Client" if msg["role"] == "user" else "AI"
+                        full_transcript += f"{role}: {msg['content']}\n"
 
-        summary = await generate_summary(full_transcript)
-        audio_url = await upload_audio_to_supabase(client_id, wav_filename)
-        await send_final_report_to_n8n(client_id, full_transcript, summary, audio_url)
+            summary = await generate_summary(full_transcript)
+            audio_url = await upload_audio_to_supabase(client_id, wav_filename)
+            await send_final_report_to_n8n(client_id, full_transcript, summary, audio_url)
 
-        if os.path.exists(wav_filename):
+        if wav_filename and os.path.exists(wav_filename):
             os.remove(wav_filename)
             
         print("✅ Пост-обработка завершена успешно.", flush=True)
-        # === ПОСТ-ОБРАБОТКА (END) ===
+        writer.close()
+
+
+@app.on_event("startup")
+async def startup_event():
+    # Запускаем TCP-сервер Asterisk на порту 8085
+    server = await asyncio.start_server(handle_asterisk_conn, '0.0.0.0', 8085)
+    print(f"🚀 AudioSocket сервер запущен на порту 8085", flush=True)
+    asyncio.create_task(server.serve_forever())
