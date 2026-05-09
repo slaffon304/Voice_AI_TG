@@ -127,7 +127,8 @@ class AsteriskWSAdapter:
     def __init__(self, reader, writer):
         self.reader = reader
         self.writer = writer
-        # Подделываем состояние, чтобы Pipecat думал, что вебсокет подключен
+        from starlette.websockets import WebSocketState
+        # Имитируем статус вебсокета, чтобы Pipecat не выдавал ошибки
         self.client_state = WebSocketState.CONNECTED
         self.application_state = WebSocketState.CONNECTED
 
@@ -135,6 +136,7 @@ class AsteriskWSAdapter:
         pass
 
     async def close(self, code=1000, reason=""): 
+        from starlette.websockets import WebSocketState
         self.client_state = WebSocketState.DISCONNECTED
         self.application_state = WebSocketState.DISCONNECTED
         self.writer.close()
@@ -144,36 +146,58 @@ class AsteriskWSAdapter:
             pass
 
     async def receive_bytes(self):
+        """Читает звук от клиента и отдает в Pipecat"""
+        from starlette.websockets import WebSocketState
         try:
             header = await self.reader.readexactly(3)
             p_len = int.from_bytes(header[1:], byteorder='big')
             data = await self.reader.readexactly(p_len)
-            if header[0] == 0x00:
+            
+            if header[0] == 0x00: 
                 self.client_state = WebSocketState.DISCONNECTED
                 raise Exception("Hangup")
-            return data
-        except Exception:
-            self.client_state = WebSocketState.DISCONNECTED
-            raise
-
-    async def send_bytes(self, data):
-        if self.client_state != WebSocketState.CONNECTED:
-            return
-        try:
+            
+            # ИСПРАВЛЕНИЕ ГЛУХОТЫ: Asterisk шлет 8000 Гц, Pipecat ждет 16000 Гц.
+            # Делаем апсемплинг (х2), чтобы детектор голоса тебя услышал.
             import numpy as np
             audio_array = np.frombuffer(data, dtype=np.int16)
-            new_len = int(len(audio_array) * 16000 // 24000)
+            new_len = len(audio_array) * 2
             resampled = np.interp(
                 np.linspace(0, len(audio_array) - 1, new_len),
                 np.arange(len(audio_array)),
                 audio_array
             ).astype(np.int16).tobytes()
             
+            return resampled
+        except Exception:
+            self.client_state = WebSocketState.DISCONNECTED
+            raise
+
+    async def send_bytes(self, data):
+        """Получает звук от ИИ и отправляет в Asterisk"""
+        from starlette.websockets import WebSocketState
+        if self.client_state != WebSocketState.CONNECTED:
+            return
+            
+        try:
+            # ИСПРАВЛЕНИЕ МЕДЛЕННОСТИ: Gemini выдает 24000 Гц, Asterisk играет в 8000 Гц.
+            # Делаем даунсемплинг (делим на 3), чтобы скорость речи стала нормальной.
+            import numpy as np
+            audio_array = np.frombuffer(data, dtype=np.int16)
+            new_len = len(audio_array) // 3
+            resampled = np.interp(
+                np.linspace(0, len(audio_array) - 1, new_len),
+                np.arange(len(audio_array)),
+                audio_array
+            ).astype(np.int16).tobytes()
+            
+            # Упаковка для Asterisk: тип 0x10 + длина + данные
             header = b'\x10' + len(resampled).to_bytes(2, byteorder='big')
             self.writer.write(header + resampled)
             await self.writer.drain()
         except Exception:
             pass
+
 
 
 
