@@ -142,7 +142,6 @@ class AudioSocketWriter(FrameProcessor):
         # КРИТИЧЕСКИ ВАЖНО: пропускаем фреймы дальше по пайплайну!
         await self.push_frame(frame, direction)
 
-        return frame
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
