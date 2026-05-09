@@ -150,30 +150,33 @@ class AsteriskWSAdapter:
             pass
 
     async def receive_bytes(self):
-        """Звук от клиента (Asterisk -> ИИ)"""
+        """Чтение сырого звука и ресемплинг (Asterisk 8k -> Gemini 16k)"""
+        header = await self.reader.readexactly(3)
+        p_len = int.from_bytes(header[1:], byteorder='big')
+        data = await self.reader.readexactly(p_len)
+        
+        if header[0] == 0x00: 
+            self.client_state = WebSocketState.DISCONNECTED
+            raise Exception("Hangup")
+        
+        resampled, self.in_state = audioop.ratecv(data, 2, 1, 8000, 16000, self.in_state)
+        return resampled
+
+    async def receive(self):
+        """Главный метод, который вызывает Pipecat для прослушивания"""
         try:
-            header = await self.reader.readexactly(3)
-            p_len = int.from_bytes(header[1:], byteorder='big')
-            data = await self.reader.readexactly(p_len)
-            
-            if header[0] == 0x00: 
-                self.client_state = WebSocketState.DISCONNECTED
-                raise Exception("Hangup")
-            
-            # Asterisk шлет 8000 Гц. Gemini ждет 16000 Гц.
-            # ratecv делает плавное конвертирование, сохраняя состояние (self.in_state)
-            resampled, self.in_state = audioop.ratecv(data, 2, 1, 8000, 16000, self.in_state)
-            return resampled
+            data = await self.receive_bytes()
+            # Pipecat ждет стандартизированный ASGI-словарь
+            return {"type": "websocket.receive", "bytes": data}
         except Exception:
             self.client_state = WebSocketState.DISCONNECTED
-            raise
+            return {"type": "websocket.disconnect", "code": 1000}
 
     async def send_bytes(self, data):
-        """Звук от ИИ (Gemini -> Asterisk)"""
+        """Отправка звука в трубку (Gemini 24k -> Asterisk 8k)"""
         if self.client_state != WebSocketState.CONNECTED:
             return
         try:
-            # Gemini отдает 24000 Гц. Asterisk играет в 8000 Гц.
             resampled, self.out_state = audioop.ratecv(data, 2, 1, 24000, 8000, self.out_state)
             
             header = b'\x10' + len(resampled).to_bytes(2, byteorder='big')
@@ -181,6 +184,7 @@ class AsteriskWSAdapter:
             await self.writer.drain()
         except Exception:
             pass
+
 
 
 
