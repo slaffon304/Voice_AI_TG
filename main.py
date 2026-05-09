@@ -123,12 +123,25 @@ class AudioSocketWriter(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, OutputAudioRawFrame):
             try:
-                # 0x10 = Audio Payload
-                header = b'\x10' + len(frame.audio).to_bytes(2, byteorder='big')
-                self._writer.write(header + frame.audio)
+                # Gemini выдает 24000 Гц. Asterisk ждет 16000 Гц. Делаем даунсемплинг.
+                import numpy as np
+                ai_chunk = np.frombuffer(frame.audio, dtype=np.int16)
+                num_samples = int(len(ai_chunk) * 16000 / 24000)
+                x = np.arange(len(ai_chunk))
+                x_new = np.linspace(0, len(ai_chunk) - 1, num_samples)
+                resampled_chunk = np.interp(x_new, x, ai_chunk).astype(np.int16)
+                resampled_bytes = resampled_chunk.tobytes()
+
+                # 0x10 = Audio Payload, длина 2 байта (big-endian)
+                header = b'\x10' + len(resampled_bytes).to_bytes(2, byteorder='big')
+                self._writer.write(header + resampled_bytes)
                 await self._writer.drain()
             except Exception:
                 pass
+        
+        # КРИТИЧЕСКИ ВАЖНО: пропускаем фреймы дальше по пайплайну!
+        await self.push_frame(frame, direction)
+
         return frame
 
 app = FastAPI()
@@ -453,17 +466,20 @@ async def handle_asterisk_conn(reader, writer):
         runner = PipelineRunner()
 
         # ИСПРАВЛЕННОЕ ЧТЕНИЕ АУДИО
-        async def read_audio_from_socket():
+                async def read_audio_from_socket():
             try:
                 while True:
+                    # Читаем 3 байта заголовка AudioSocket
                     pkt_header = await reader.readexactly(3)
                     payload_type = pkt_header[0]
                     payload_len = int.from_bytes(pkt_header[1:], byteorder='big')
                     payload = await reader.readexactly(payload_len)
                     
                     if payload_type == 0x10:
+                        # Звук от Asterisk
                         await task.queue_frames([InputAudioRawFrame(payload, 16000, 1)])
                     elif payload_type == 0x00:
+                        # Клиент бросил трубку
                         print("📞 Asterisk a închis conexiunea (Hangup).", flush=True)
                         break
             except asyncio.IncompleteReadError:
@@ -473,10 +489,11 @@ async def handle_asterisk_conn(reader, writer):
             finally:
                 await task.queue_frames([EndFrame()])
 
+
         try:
             # СИСТЕМНОЕ ПРИВЕТСТВИЕ (Бот начинает первым)
             context.add_message({
-                "role": "system", 
+                "role": "user", 
                 "content": "Clientul s-a conectat. Salută-l imediat și prezintă-te. REGULĂ STRICTĂ: Vorbește în limba clientului. Dacă primul lui cuvânt e prea scurt sau neclar, începe dialogul în Română."
             })
             await task.queue_frames([LLMRunFrame()])
