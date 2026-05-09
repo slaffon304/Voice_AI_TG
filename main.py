@@ -16,7 +16,7 @@ from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame, LLMRunFrame, EndFrame
+from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame, LLMRunFrame, EndFrame, CancelFrame, InterruptionFrame
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
@@ -114,11 +114,13 @@ class UserAudioCatcher(FrameProcessor):
         
         if isinstance(frame, InputAudioRawFrame):
             self.mixer.add_user_audio(frame)
-        elif isinstance(frame, UserStartedSpeakingFrame):
-            # Как только юзер начал говорить — стираем всё, что бот "не договорил"
+        # Ловим реальные фреймы перебивания от Gemini Live
+        elif isinstance(frame, (CancelFrame, InterruptionFrame)):
+            print("🔥 ПЕРЕБИВАНИЕ: Очищаем фантомное аудио ИИ из записи 🔥", flush=True)
             self.mixer.clear_ai_buffer()
             
         await self.push_frame(frame, direction)
+
 
 
 class AIAudioCatcher(FrameProcessor):
@@ -187,16 +189,23 @@ class AsteriskWSAdapter:
 
     async def send_bytes(self, data):
         """Отправка звука в трубку (Gemini 24k -> Asterisk 8k)"""
+        from starlette.websockets import WebSocketState
         if self.client_state != WebSocketState.CONNECTED:
             return
         try:
-            resampled, self.out_state = audioop.ratecv(data, 2, 1, 24000, 8000, self.out_state)
+            import audioop
+            # Снижаем громкость на 25%, чтобы убрать перегруз (клиппинг) на шипящих
+            softened_data = audioop.mul(data, 2, 0.75)
+            
+            # Сжимаем уже смягченный звук
+            resampled, self.out_state = audioop.ratecv(softened_data, 2, 1, 24000, 8000, self.out_state)
             
             header = b'\x10' + len(resampled).to_bytes(2, byteorder='big')
             self.writer.write(header + resampled)
             await self.writer.drain()
         except Exception:
             pass
+
 
 
 
