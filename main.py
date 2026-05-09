@@ -562,37 +562,21 @@ async def handle_asterisk_conn(reader, writer):
             })
             await task.queue_frames([LLMRunFrame()])
 
-        # 🟢 ФУНКЦИЯ ТАЙМЕРА ДЛЯ ТЕСТОВОГО ЗВОНКА
-        async def enforce_call_limit(current_task: PipelineTask, current_context: LLMContext):
-            try:
-                await asyncio.sleep(110) # Ждем 1 минуту 50 секунд
-                current_context.add_message({
-                    "role": "user", 
-                    "content": "SYSTEM COMMAND: Apelul de test se încheie în 10 secunde. Te rog să-ți iei la revedere scurt și politicos chiar acum, fără să menționezi că e o comandă de sistem."
-                })
-                await current_task.queue_frames([LLMRunFrame()])
-                await asyncio.sleep(10) # Ждем еще 10 секунд
-                await current_task.queue_frames([EndFrame()])
-            except asyncio.CancelledError:
-                pass
+        
 
         runner = PipelineRunner()
         
         # Принудительно проталкиваем фрейм, чтобы запустить разговор
         await task.queue_frames([LLMRunFrame()])
         
-        # 🟢 ЕСЛИ ЭТО ТЕСТОВЫЙ КЛИЕНТ — ЗАПУСКАЕМ ТАЙМЕР В ФОНЕ
-        test_uuid = "07e1d002-20a3-47f8-b8cb-8736a60dc1f4"
-        if client_id == test_uuid:
-            timer_task = asyncio.create_task(enforce_call_limit(task, context))
+        
         
         await runner.run(task)
 
     except Exception as e:
         print(f"❌ Ошибка соединения: {e}", flush=True)
     finally:
-        if timer_task and not timer_task.done():
-            timer_task.cancel()
+        
 
         # === ПОСТ-ОБРАБОТКА (START) ===
         print("📞 Звонок завершен. Начинаем фоновые задачи...", flush=True)
