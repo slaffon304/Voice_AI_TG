@@ -11,6 +11,7 @@ import numpy as np
 from google import genai
 from supabase import create_client, Client
 from starlette.websockets import WebSocketState
+from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame, LLMRunFrame, EndFrame, UserStartedSpeakingFrame
 
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -49,6 +50,12 @@ class RawPCMFrameSerializer(FrameSerializer):
 # УМНЫЙ МИКШЕР "НА ЛЕТУ" (С РЕСЕМПЛИНГОМ)
 # ==========================================
 class AudioMixer:
+    def clear_ai_buffer(self):
+        """Очищает невоспроизведенный голос бота при перебивании"""
+        self.ai_buffer = np.array([], dtype=np.int16)
+
+
+    
     def __init__(self, output_path: str):
         self.output_path = output_path
         self._wav_file = None
@@ -104,9 +111,15 @@ class UserAudioCatcher(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+        
         if isinstance(frame, InputAudioRawFrame):
             self.mixer.add_user_audio(frame)
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            # Как только юзер начал говорить — стираем всё, что бот "не договорил"
+            self.mixer.clear_ai_buffer()
+            
         await self.push_frame(frame, direction)
+
 
 class AIAudioCatcher(FrameProcessor):
     def __init__(self, mixer: AudioMixer):
