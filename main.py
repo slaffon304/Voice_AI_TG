@@ -466,7 +466,7 @@ async def handle_asterisk_conn(reader, writer):
         runner = PipelineRunner()
 
         # ИСПРАВЛЕННОЕ ЧТЕНИЕ АУДИО
-                async def read_audio_from_socket():
+        async def read_audio_from_socket():
             try:
                 while True:
                     # Читаем 3 байта заголовка AudioSocket
