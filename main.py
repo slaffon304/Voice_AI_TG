@@ -277,11 +277,17 @@ async def handle_asterisk_conn(reader, writer):
     timer_task = None
     
     try:
-        # Извлекаем client_id (UUID) из AudioSocket соединения
+                # Извлекаем client_id (UUID) из AudioSocket соединения
         header = await reader.readexactly(3)
         id_len = int.from_bytes(header[1:], byteorder='big')
         uuid_bytes = await reader.readexactly(id_len)
-        client_id = uuid_bytes.decode('ascii').strip()
+        
+        # Конвертируем сырые 16 байт обратно в строку формата UUID
+        if id_len == 16:
+            client_id = str(uuid.UUID(bytes=uuid_bytes))
+        else:
+            client_id = uuid_bytes.decode('utf-8', errors='ignore').strip()
+
         print(f"🆔 Получен UUID клиента: {client_id}", flush=True)
 
         if not client_id:
