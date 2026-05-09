@@ -319,9 +319,14 @@ async def handle_asterisk_conn(reader, writer):
     wav_filename = None
 
     try:
-                # Читаем UUID (AudioSocket всегда присылает ровно 16 байт бинарного UUID при подключении)
-        uuid_bytes = await reader.readexactly(16)
+        # Читаем 3 байта заголовка Asterisk
+        header = await reader.readexactly(3)
+        payload_len = int.from_bytes(header[1:], byteorder='big') # Должно быть 16
+        
+        # Теперь читаем чистый бинарный UUID
+        uuid_bytes = await reader.readexactly(payload_len)
         client_id = str(uuid.UUID(bytes=uuid_bytes))
+
 
         print(f"--- ВХОДЯЩИЙ ЗВОНОК | client_id: {client_id} ---", flush=True)
 
