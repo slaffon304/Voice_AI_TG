@@ -195,7 +195,7 @@ class AsteriskWSAdapter:
         try:
             import audioop
             # Снижаем громкость на 25%, чтобы убрать перегруз (клиппинг) на шипящих
-            softened_data = audioop.mul(data, 2, 0.75)
+            softened_data = audioop.mul(data, 2, 0.5)
             
             # Сжимаем уже смягченный звук
             resampled, self.out_state = audioop.ratecv(softened_data, 2, 1, 24000, 8000, self.out_state)
