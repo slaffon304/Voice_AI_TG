@@ -10,6 +10,7 @@ import uuid
 import numpy as np
 from google import genai
 from supabase import create_client, Client
+from starlette.websockets import WebSocketState
 
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -126,11 +127,16 @@ class AsteriskWSAdapter:
     def __init__(self, reader, writer):
         self.reader = reader
         self.writer = writer
+        # Подделываем состояние, чтобы Pipecat думал, что вебсокет подключен
+        self.client_state = WebSocketState.CONNECTED
+        self.application_state = WebSocketState.CONNECTED
 
     async def accept(self): 
         pass
 
     async def close(self, code=1000, reason=""): 
+        self.client_state = WebSocketState.DISCONNECTED
+        self.application_state = WebSocketState.DISCONNECTED
         self.writer.close()
         try:
             await self.writer.wait_closed()
@@ -142,14 +148,19 @@ class AsteriskWSAdapter:
             header = await self.reader.readexactly(3)
             p_len = int.from_bytes(header[1:], byteorder='big')
             data = await self.reader.readexactly(p_len)
-            if header[0] == 0x00: 
+            if header[0] == 0x00:
+                self.client_state = WebSocketState.DISCONNECTED
                 raise Exception("Hangup")
             return data
         except Exception:
+            self.client_state = WebSocketState.DISCONNECTED
             raise
 
     async def send_bytes(self, data):
+        if self.client_state != WebSocketState.CONNECTED:
+            return
         try:
+            import numpy as np
             audio_array = np.frombuffer(data, dtype=np.int16)
             new_len = int(len(audio_array) * 16000 // 24000)
             resampled = np.interp(
@@ -163,6 +174,7 @@ class AsteriskWSAdapter:
             await self.writer.drain()
         except Exception:
             pass
+
 
 
 app = FastAPI()
