@@ -50,11 +50,7 @@ class RawPCMFrameSerializer(FrameSerializer):
 # УМНЫЙ МИКШЕР "НА ЛЕТУ" (С РЕСЕМПЛИНГОМ)
 # ==========================================
 class AudioMixer:
-    def clear_ai_buffer(self):
-        """Очищает невоспроизведенный голос бота при перебивании"""
-        self.ai_buffer = np.array([], dtype=np.int16)
-
-
+    
     
     def __init__(self, output_path: str):
         self.output_path = output_path
@@ -104,22 +100,17 @@ class AudioMixer:
             self._wav_file.close()
             self._wav_file = None
 
-class UserAudioCatcher(FrameProcessor):
+class class UserAudioCatcher(FrameProcessor):
     def __init__(self, mixer: AudioMixer):
         super().__init__()
         self.mixer = mixer
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
-        
         if isinstance(frame, InputAudioRawFrame):
             self.mixer.add_user_audio(frame)
-        # Ловим реальные фреймы перебивания от Gemini Live
-        elif isinstance(frame, (CancelFrame, InterruptionFrame)):
-            print("🔥 ПЕРЕБИВАНИЕ: Очищаем фантомное аудио ИИ из записи 🔥", flush=True)
-            self.mixer.clear_ai_buffer()
-            
         await self.push_frame(frame, direction)
+
 
 
 
@@ -138,19 +129,21 @@ class AIAudioCatcher(FrameProcessor):
 # АДАПТЕР ASTERISK -> WEBSOCKET
 # ==========================================
 import audioop
+import time
+import asyncio
 from starlette.websockets import WebSocketState
 
 class AsteriskWSAdapter:
-    """Обертка для совместимости TCP-сокета Asterisk и FastAPIWebsocketTransport"""
     def __init__(self, reader, writer):
         self.reader = reader
         self.writer = writer
         self.client_state = WebSocketState.CONNECTED
         self.application_state = WebSocketState.CONNECTED
-        
-        # Сохраняем состояние аудио-волны между пакетами
         self.in_state = None
         self.out_state = None
+        
+        # Таймер для синхронизации скорости речи
+        self.next_send_time = time.time()
 
     async def accept(self): 
         pass
@@ -165,50 +158,60 @@ class AsteriskWSAdapter:
             pass
 
     async def receive_bytes(self):
-        """Чтение сырого звука и ресемплинг (Asterisk 8k -> Gemini 16k)"""
-        header = await self.reader.readexactly(3)
-        p_len = int.from_bytes(header[1:], byteorder='big')
-        data = await self.reader.readexactly(p_len)
-        
-        if header[0] == 0x00: 
+        """Звук от клиента (Asterisk -> ИИ)"""
+        try:
+            header = await self.reader.readexactly(3)
+            p_len = int.from_bytes(header[1:], byteorder='big')
+            data = await self.reader.readexactly(p_len)
+            if header[0] == 0x00: 
+                self.client_state = WebSocketState.DISCONNECTED
+                raise Exception("Hangup")
+            
+            resampled, self.in_state = audioop.ratecv(data, 2, 1, 8000, 16000, self.in_state)
+            return resampled
+        except Exception:
             self.client_state = WebSocketState.DISCONNECTED
-            raise Exception("Hangup")
-        
-        resampled, self.in_state = audioop.ratecv(data, 2, 1, 8000, 16000, self.in_state)
-        return resampled
+            raise
 
     async def receive(self):
-        """Главный метод, который вызывает Pipecat для прослушивания"""
         try:
             data = await self.receive_bytes()
-            # Pipecat ждет стандартизированный ASGI-словарь
             return {"type": "websocket.receive", "bytes": data}
         except Exception:
             self.client_state = WebSocketState.DISCONNECTED
             return {"type": "websocket.disconnect", "code": 1000}
 
     async def send_bytes(self, data):
-        """Отправка звука в трубку (Gemini 24k -> Asterisk 8k)"""
-        from starlette.websockets import WebSocketState
+        """Звук от ИИ (Gemini -> Asterisk) с контролем скорости"""
         if self.client_state != WebSocketState.CONNECTED:
             return
         try:
-            import audioop
-            # Снижаем громкость на 25%, чтобы убрать перегруз (клиппинг) на шипящих
+            # 1. Убираем шипение (снижаем амплитуду перед сжатием)
             softened_data = audioop.mul(data, 2, 0.5)
             
-            # Сжимаем уже смягченный звук
+            # 2. Сжимаем до 8000 Гц для телефонии
             resampled, self.out_state = audioop.ratecv(softened_data, 2, 1, 24000, 8000, self.out_state)
             
+            # 3. PACING: Удерживаем звук, чтобы он шел строго в реальном времени
+            audio_duration = len(resampled) / 16000.0  # Длина аудио в секундах
+            now = time.time()
+            
+            if self.next_send_time < now:
+                self.next_send_time = now
+                
+            sleep_time = self.next_send_time - now
+            # Оставляем минимальный зазор 50мс для бесперебойного потока
+            if sleep_time > 0.05:
+                await asyncio.sleep(sleep_time - 0.05)
+                
+            self.next_send_time += audio_duration
+
+            # Отправляем в сокет
             header = b'\x10' + len(resampled).to_bytes(2, byteorder='big')
             self.writer.write(header + resampled)
             await self.writer.drain()
         except Exception:
             pass
-
-
-
-
 
 
 
