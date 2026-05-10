@@ -50,7 +50,10 @@ class RawPCMFrameSerializer(FrameSerializer):
 # УМНЫЙ МИКШЕР "НА ЛЕТУ" (С РЕСЕМПЛИНГОМ)
 # ==========================================
 class AudioMixer:
-    
+    def clear_ai_buffer(self):
+        """Очищает невоспроизведенное будущее ИИ при перебивании"""
+        self.ai_buffer = np.array([], dtype=np.int16)
+
     
     def __init__(self, output_path: str):
         self.output_path = output_path
@@ -107,8 +110,13 @@ class UserAudioCatcher(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+        
         if isinstance(frame, InputAudioRawFrame):
             self.mixer.add_user_audio(frame)
+        # Ловим сигнал перебивания и стираем фантомные слова из записи
+        elif isinstance(frame, (CancelFrame, InterruptionFrame)):
+            self.mixer.clear_ai_buffer()
+            
         await self.push_frame(frame, direction)
 
 
