@@ -100,7 +100,7 @@ class AudioMixer:
             self._wav_file.close()
             self._wav_file = None
 
-class class UserAudioCatcher(FrameProcessor):
+class UserAudioCatcher(FrameProcessor):
     def __init__(self, mixer: AudioMixer):
         super().__init__()
         self.mixer = mixer
