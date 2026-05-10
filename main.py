@@ -357,15 +357,26 @@ async def send_final_report_to_n8n(client_id: str, transcript: str, summary: str
 
 # --- 2. ЭНДПОИНТ ДЛЯ ASTERISK (GET UUID) ---
 @app.get("/get_uuid")
-async def get_client_uuid(sip_login: str):
+async def get_client_uuid(sip_login: str = None, sip_login_gsm: str = None):
+    # Защита: если Asterisk дернул эндпоинт вообще без параметров
+    if not sip_login and not sip_login_gsm:
+         return Response(content="error", media_type="text/plain")
+
     clean_url = SUPABASE_URL.replace("/rest/v1", "").rstrip("/")
-    url = f"{clean_url}/rest/v1/saas_clients?sip_login=eq.{sip_login}&select=id"
+    
+    # Меняем фильтр к Supabase в зависимости от входящего канала
+    if sip_login_gsm:
+        url = f"{clean_url}/rest/v1/saas_clients?sip_login_gsm=eq.{sip_login_gsm}&select=id"
+    else:
+        url = f"{clean_url}/rest/v1/saas_clients?sip_login=eq.{sip_login}&select=id"
+
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(url, headers=headers)
             data = resp.json()
-            return Response(content=str(data[0].get("id")) if data else "not_found", media_type="text/plain")
+            return Response(content=str(data[0].get("id")) if data and isinstance(data, list) else "not_found", media_type="text/plain")
         except Exception: 
             return Response(content="error", media_type="text/plain")
 
