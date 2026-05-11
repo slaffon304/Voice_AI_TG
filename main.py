@@ -413,8 +413,8 @@ class InterruptionRecoveryProcessor(FrameProcessor):
             pass
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        # Обязательно пропускаем фрейм дальше по цепочке
-        async def process_frame(self, frame: Frame, direction: FrameDirection):
+        
+        
         # Жестко проталкиваем фрейм дальше по трубе
         await self.push_frame(frame, direction)
         
@@ -621,7 +621,7 @@ async def handle_asterisk_conn(reader, writer):
         ai_catcher = AIAudioCatcher(audio_mixer)
 
         # --- ЗАПУСК ПАЙПЛАЙНА ---
-        recovery_processor = InterruptionRecoveryProcessor(context)
+        
 
         pipeline = Pipeline([
             transport.input(), 
@@ -629,6 +629,7 @@ async def handle_asterisk_conn(reader, writer):
             user_catcher,         
             context_aggregator.user(), 
             llm, 
+            recovery_processor = InterruptionRecoveryProcessor(context)
             ai_catcher,           
             transport.output(), 
             context_aggregator.assistant()
