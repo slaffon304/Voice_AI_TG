@@ -414,7 +414,12 @@ class InterruptionRecoveryProcessor(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         # Обязательно пропускаем фрейм дальше по цепочке
-        await super().process_frame(frame, direction)
+        async def process_frame(self, frame: Frame, direction: FrameDirection):
+        # Жестко проталкиваем фрейм дальше по трубе
+        await self.push_frame(frame, direction)
+        
+        if isinstance(frame, InterruptionFrame):
+            # ... остальной код таймера
 
         # Ловим момент перебивания (Barge-in)
         if isinstance(frame, InterruptionFrame):
