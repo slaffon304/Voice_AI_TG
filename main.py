@@ -395,6 +395,22 @@ class InterruptionRecoveryProcessor(FrameProcessor):
             pass
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
+        # 1. ОБЯЗАТЕЛЬНО вызываем super() для внутренней регистрации StartFrame в Pipecat
+        await super().process_frame(frame, direction)
+        
+        # 2. Наша логика таймера
+        if isinstance(frame, InterruptionFrame):
+            self.is_interrupted = True
+            if self.recovery_task:
+                self.recovery_task.cancel()
+            self.recovery_task = asyncio.create_task(self._recovery_timer())
+            
+        elif isinstance(frame, (OutputAudioRawFrame, UserStartedSpeakingFrame)):
+            if self.recovery_task:
+                self.recovery_task.cancel()
+            self.is_interrupted = False
+
+        # 3. Проталкиваем аудио и другие фреймы дальше
         await self.push_frame(frame, direction)
         
         if isinstance(frame, InterruptionFrame):
