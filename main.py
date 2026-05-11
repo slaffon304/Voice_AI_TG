@@ -439,7 +439,7 @@ class InterruptionRecoveryProcessor(FrameProcessor):
         audio_mixer = None
         wav_filename = None
 
-        try:
+    try:
         # Читаем 3 байта заголовка Asterisk
         header = await reader.readexactly(3)
         payload_len = int.from_bytes(header[1:], byteorder='big') # Должно быть 16
