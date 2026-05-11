@@ -580,10 +580,17 @@ async def handle_asterisk_conn(reader, writer):
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, client):
             context.add_message({
-                "role": "system", 
-                "content": "Clientul s-a conectat. Salută-l imediat și prezintă-te ca Grigorii. REGULĂ STRICTĂ: Vorbește în limba clientului. Dacă primul lui cuvânt e prea scurt sau neclar, începe dialogul în Română."
-            })
-            await task.queue_frames([LLMRunFrame()])
+    "role": "system", 
+    "content": (
+        "Clientul s-a conectat. REGULĂ STRICTĂ PENTRU PRIMA FRAZĂ: "
+        "Nu improviza. Prima ta replică TREBUIE să fie EXACT aceasta, cuvânt cu cuvânt: "
+        "'Bună ziua. Pentru a asigura calitatea serviciilor, acest apel este înregistrat. "
+        "Sunt Grigorii, asistentul digital Lab Upgrade. Cu ce vă pot ajuta?' "
+        "După ce spui asta, oprește-te și așteaptă răspunsul clientului."
+    )
+})
+        await task.queue_frames([LLMRunFrame()])
+
 
         
 
