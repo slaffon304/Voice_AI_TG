@@ -640,7 +640,7 @@ class InterruptionRecoveryProcessor(FrameProcessor):
         recovery_processor.task = task
 
         
-                runner = PipelineRunner()
+        runner = PipelineRunner()
         
         # Добавляем жесткое приветствие с названием компании
         company_name = client_data.get("company_name") or "companiei noastre"
