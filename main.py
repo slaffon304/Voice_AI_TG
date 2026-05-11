@@ -54,7 +54,6 @@ class AudioMixer:
         """Очищает невоспроизведенное будущее ИИ при перебивании"""
         self.ai_buffer = np.array([], dtype=np.int16)
 
-    
     def __init__(self, output_path: str):
         self.output_path = output_path
         self._wav_file = None
@@ -119,9 +118,6 @@ class UserAudioCatcher(FrameProcessor):
             
         await self.push_frame(frame, direction)
 
-
-
-
 class AIAudioCatcher(FrameProcessor):
     def __init__(self, mixer: AudioMixer):
         super().__init__()
@@ -138,8 +134,6 @@ class AIAudioCatcher(FrameProcessor):
 # ==========================================
 import audioop
 import time
-import asyncio
-from starlette.websockets import WebSocketState
 
 class AsteriskWSAdapter:
     def __init__(self, reader, writer):
@@ -220,8 +214,6 @@ class AsteriskWSAdapter:
             await self.writer.drain()
         except Exception:
             pass
-
-
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -364,7 +356,6 @@ async def get_client_uuid(sip_login: str = None, sip_login_gsm: str = None):
 
     clean_url = SUPABASE_URL.replace("/rest/v1", "").rstrip("/")
     
-    # Меняем фильтр к Supabase в зависимости от входящего канала
     if sip_login_gsm:
         url = f"{clean_url}/rest/v1/saas_clients?sip_login_gsm=eq.{sip_login_gsm}&select=id"
     else:
@@ -393,7 +384,7 @@ class InterruptionRecoveryProcessor(FrameProcessor):
         try:
             await asyncio.sleep(4.0) 
             if self.is_interrupted and self.task:
-                print("⏳ [UX] Сработал таймер: тишина после перебивания. Возвращаем бота в диалог.", flush=True)
+                print("⏳ [UX] Сработал таймер: тишина după întrerupere. Возвращаем бота în dialog.", flush=True)
                 self.context.add_message({
                     "role": "system",
                     "content": "SYSTEM COMMAND: The user interrupted you but then went silent. Softly and elegantly take the initiative back. Say something like: 'Scuzați, cred că nu v-am auzit clar. Să continui de unde am rămas?'"
@@ -404,48 +395,21 @@ class InterruptionRecoveryProcessor(FrameProcessor):
             pass
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        # Жестко проталкиваем фрейм дальше по трубе (замена super().process_frame)
         await self.push_frame(frame, direction)
         
-        # Бот услышал перебивание - запускаем таймер
         if isinstance(frame, InterruptionFrame):
             self.is_interrupted = True
             if self.recovery_task:
                 self.recovery_task.cancel()
             self.recovery_task = asyncio.create_task(self._recovery_timer())
             
-        # Бот сам начал говорить (или человек заговорил) - отменяем таймер
-        elif isinstance(frame, OutputAudioRawFrame) or isinstance(frame, UserStartedSpeakingFrame):
+        elif isinstance(frame, (OutputAudioRawFrame, UserStartedSpeakingFrame)):
             if self.recovery_task:
                 self.recovery_task.cancel()
             self.is_interrupted = False
 
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        
-        
-        # Жестко проталкиваем фрейм дальше по трубе
-        await self.push_frame(frame, direction)
-        
-        if isinstance(frame, InterruptionFrame):
-            # ... остальной код таймера
 
-        # Ловим момент перебивания (Barge-in)
-        if isinstance(frame, InterruptionFrame):
-            self.is_interrupted = True
-            # Если старый таймер еще тикает - убиваем его
-            if self.recovery_task:
-                self.recovery_task.cancel()
-            # Запускаем новый отсчет 4 секунд
-            self.recovery_task = asyncio.create_task(self._recovery_timer())
-
-        # Ловим момент, когда клиент снова начал говорить
-        elif isinstance(frame, UserStartedSpeakingFrame):
-            # Отменяем таймер спасения, клиент сам продолжает диалог
-            if self.recovery_task:
-                self.recovery_task.cancel()
-            self.is_interrupted = False
-
-            # --- 3. ГЛАВНЫЙ ОБРАБОТЧИК ASTERISK (ЗАМЕНА WEBSOCKET) ---
+# --- 3. ГЛАВНЫЙ ОБРАБОТЧИК ASTERISK (ЗАМЕНА WEBSOCKET) ---
 async def handle_asterisk_conn(reader, writer):
     print(f"--- ВХОДЯЩИЙ ЗВОНОК ---", flush=True)
     timer_task = None
@@ -453,14 +417,10 @@ async def handle_asterisk_conn(reader, writer):
     wav_filename = None
 
     try:
-        # Читаем 3 байта заголовка Asterisk
         header = await reader.readexactly(3)
-        payload_len = int.from_bytes(header[1:], byteorder='big') # Должно быть 16
-        
-        # Теперь читаем чистый бинарный UUID
+        payload_len = int.from_bytes(header[1:], byteorder='big') 
         uuid_bytes = await reader.readexactly(payload_len)
         client_id = str(uuid.UUID(bytes=uuid_bytes))
-
 
         print(f"--- ВХОДЯЩИЙ ЗВОНОК | client_id: {client_id} ---", flush=True)
 
@@ -485,10 +445,8 @@ async def handle_asterisk_conn(reader, writer):
 
         print("🟢 TOATE VERIFICĂRILE AU TRECUT! Ridicăm apelul.", flush=True)
         
-        # Подключаем наш Адаптер (обманываем Pipecat)
         fake_websocket = AsteriskWSAdapter(reader, writer)
 
-        # --- ПОДГОТОВКА СИСТЕМНОГО ПРОМПТА ---
         raw_prompt = client_data.get("system_message", "Ești un asistent virtual.")
         tz = pytz.timezone('Europe/Chisinau')
         current_time = datetime.datetime.now(tz).strftime('%A, %d %B %Y, %H:%M')
@@ -511,7 +469,6 @@ async def handle_asterisk_conn(reader, writer):
 
         system_prompt += behavior_rules
 
-        # --- ОПРЕДЕЛЕНИЕ ИНСТРУМЕНТОВ (TOOLS) ---
         tools = [
             {
                 "function_declarations": [
@@ -550,7 +507,6 @@ async def handle_asterisk_conn(reader, writer):
             }
         ]
 
-        # --- НАСТРОЙКА СЕРВИСОВ PIPECAT ---
         transport = FastAPIWebsocketTransport(
             websocket=fake_websocket,
             params=FastAPIWebsocketParams(
@@ -571,7 +527,6 @@ async def handle_asterisk_conn(reader, writer):
             )
         )
 
-        # --- РЕАЛИЗАЦИЯ ЛОГИКИ ИНСТРУМЕНТОВ ---
         async def process_save_lead(params: FunctionCallParams):
             tg_chat_id = client_data.get("tg_chat_id_notify", "")
             company_name = client_data.get("company_name", "Necunoscut")
@@ -585,7 +540,7 @@ async def handle_asterisk_conn(reader, writer):
                     response.raise_for_status()
                     await params.result_callback(response.json())
                 except asyncio.CancelledError:
-                    print("⚠️ Вызов save_lead прерван (клиент перебил бота). Защита активирована.", flush=True)
+                    print("⚠️ Вызов save_lead прерван. Защита активирована.", flush=True)
                     try:
                         await params.result_callback({"status": "cancelled", "message": "Client interrupted. Await client input."})
                     except Exception: pass
@@ -610,7 +565,7 @@ async def handle_asterisk_conn(reader, writer):
                     response.raise_for_status()
                     await params.result_callback(response.json())
                 except asyncio.CancelledError:
-                    print("⚠️ Вызов Booking_tool прерван (клиент перебил бота). Защита активирована.", flush=True)
+                    print("⚠️ Вызов Booking_tool прерван. Защита активирована.", flush=True)
                     try:
                         await params.result_callback({"status": "cancelled", "message": "Client interrupted the tool call. Stop and listen."})
                     except Exception: pass
@@ -629,15 +584,14 @@ async def handle_asterisk_conn(reader, writer):
         ai_catcher = AIAudioCatcher(audio_mixer)
 
         # --- ЗАПУСК ПАЙПЛАЙНА ---
-        
+        recovery_processor = InterruptionRecoveryProcessor(context)
 
         pipeline = Pipeline([
             transport.input(), 
-            recovery_processor,   
             user_catcher,         
             context_aggregator.user(), 
             llm, 
-            recovery_processor = InterruptionRecoveryProcessor(context)
+            recovery_processor, 
             ai_catcher,           
             transport.output(), 
             context_aggregator.assistant()
@@ -652,11 +606,10 @@ async def handle_asterisk_conn(reader, writer):
         context.add_message({
             "role": "user", 
             "content": (
-                "Clientul s-a conectat. REGULĂ STRICTĂ PENTRU PRIMA FRAZĂ: "
-                "Nu improviza. Prima ta replică TREBUIE să fie EXACT aceasta, cuvânt cu cuvânt: "
+                "SYSTEM EVENT: Clientul s-a conectat. "
+                "ROSTEȘTE ACUM EXACT ACEASTĂ FRAZĂ, cuvânt cu cuvânt. Nu adăuga nimic altceva: "
                 f"'Bună ziua. Pentru a asigura calitatea serviciilor, acest apel poate fi înregistrat. "
                 f"Sunt Grigorii, asistentul digital al {company_name}. Cu ce vă pot ajuta?' "
-                "După ce spui asta, oprește-te și așteaptă răspunsul clientului."
             )
         })
         
