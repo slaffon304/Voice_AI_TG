@@ -385,32 +385,40 @@ class InterruptionRecoveryProcessor(FrameProcessor):
     def __init__(self, context):
         super().__init__()
         self.context = context
-        self.task = None # Сюда мы передадим PipelineTask чуть позже
+        self.task = None 
         self.is_interrupted = False
         self.recovery_task = None
 
     async def _recovery_timer(self):
         try:
-            # Ждем 4 секунды тишины после перебивания
             await asyncio.sleep(4.0) 
-            
-            # Если таймер не отменили новым голосом, значит висит мертвая тишина
             if self.is_interrupted and self.task:
                 print("⏳ [UX] Сработал таймер: тишина после перебивания. Возвращаем бота в диалог.", flush=True)
-                
-                # Закидываем системный пинок в контекст
                 self.context.add_message({
                     "role": "system",
-                    "content": "SYSTEM COMMAND: The user interrupted you but then went silent. Politely and briefly ask if they are still there or if you should continue. Use the user's language."
+                    "content": "SYSTEM COMMAND: The user interrupted you but then went silent. Softly and elegantly take the initiative back. Say something like: 'Scuzați, cred că nu v-am auzit clar. Să continui de unde am rămas?'"
                 })
-                # Принудительно заставляем ИИ ответить
                 await self.task.queue_frames([LLMRunFrame()])
-                
-                # Сбрасываем флаг
                 self.is_interrupted = False
         except asyncio.CancelledError:
-            # Таймер отменили, все ок
             pass
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        # Жестко проталкиваем фрейм дальше по трубе (замена super().process_frame)
+        await self.push_frame(frame, direction)
+        
+        # Бот услышал перебивание - запускаем таймер
+        if isinstance(frame, InterruptionFrame):
+            self.is_interrupted = True
+            if self.recovery_task:
+                self.recovery_task.cancel()
+            self.recovery_task = asyncio.create_task(self._recovery_timer())
+            
+        # Бот сам начал говорить (или человек заговорил) - отменяем таймер
+        elif isinstance(frame, OutputAudioRawFrame) or isinstance(frame, UserStartedSpeakingFrame):
+            if self.recovery_task:
+                self.recovery_task.cancel()
+            self.is_interrupted = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         
