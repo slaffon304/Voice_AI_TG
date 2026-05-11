@@ -432,14 +432,14 @@ class InterruptionRecoveryProcessor(FrameProcessor):
                 self.recovery_task.cancel()
             self.is_interrupted = False
 
-# --- 3. ГЛАВНЫЙ ОБРАБОТЧИК ASTERISK (ЗАМЕНА WEBSOCKET) ---
+    # --- 3. ГЛАВНЫЙ ОБРАБОТЧИК ASTERISK (ЗАМЕНА WEBSOCKET) ---
     async def handle_asterisk_conn(reader, writer):
         print(f"--- ВХОДЯЩИЙ ЗВОНОК ---", flush=True)
-    timer_task = None
-    audio_mixer = None
-    wav_filename = None
+        timer_task = None
+        audio_mixer = None
+        wav_filename = None
 
-    try:
+        try:
         # Читаем 3 байта заголовка Asterisk
         header = await reader.readexactly(3)
         payload_len = int.from_bytes(header[1:], byteorder='big') # Должно быть 16
@@ -640,14 +640,26 @@ class InterruptionRecoveryProcessor(FrameProcessor):
         recovery_processor.task = task
 
         
-        runner = PipelineRunner()
+                runner = PipelineRunner()
+        
+        # Добавляем жесткое приветствие с названием компании
+        company_name = client_data.get("company_name") or "companiei noastre"
+        context.add_message({
+            "role": "system", 
+            "content": (
+                "Clientul s-a conectat. REGULĂ STRICTĂ PENTRU PRIMA FRAZĂ: "
+                "Nu improviza. Prima ta replică TREBUIE să fie EXACT aceasta, cuvânt cu cuvânt: "
+                f"'Bună ziua. Pentru a asigura calitatea serviciilor, acest apel poate fi înregistrat. "
+                f"Sunt Grigorii, asistentul digital al {company_name}. Cu ce vă pot ajuta?' "
+                "După ce spui asta, oprește-te și așteaptă răspunsul clientului."
+            )
+        })
         
         # Принудительно проталкиваем фрейм, чтобы запустить разговор
         await task.queue_frames([LLMRunFrame()])
         
-        
-        
         await runner.run(task)
+
 
     except Exception as e:
         print(f"❌ Ошибка соединения: {e}", flush=True)
@@ -673,27 +685,9 @@ class InterruptionRecoveryProcessor(FrameProcessor):
             audio_url = await upload_audio_to_supabase(client_id, wav_filename)
             await send_final_report_to_n8n(client_id, full_transcript, summary, audio_url)
 
-        if wav_filena:        # Увеличиваем idle_timeout до 60 секунд, чтобы бот не вешал трубку при паузах
-        task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True, idle_timeout=20.0))
-
-        @transport.event_handler("on_client_connected")
-        async def on_client_connected(transport, client):
-            # Достаем имя компании. Если в базе пусто, ставим заглушку
-            company_name = client_data.get("company_name") or "companiei noastre"
-            
-            context.add_message({
-                "role": "system", 
-                "content": (
-                    "Clientul s-a conectat. REGULĂ STRICTĂ PENTRU PRIMA FRAZĂ: "
-                    "Nu improviza. Prima ta replică TREBUIE să fie EXACT aceasta, cuvânt cu cuvânt: "
-                    f"'Bună ziua. Pentru a asigura calitatea serviciilor, acest apel poate fi înregistrat. "
-                    f"Sunt Grigorii, asistentul digital al {company_name}. Cu ce vă pot ajuta?' "
-                    "După ce spui asta, oprește-te și așteaptă răspunsul clientului."
-                )
-            })
-            await task.queue_frames([LLMRunFrame()])
-me and os.path.exists(wav_filename):
+                if wav_filename and os.path.exists(wav_filename):
             os.remove(wav_filename)
+
             
         print("✅ Пост-обработка завершена успешно.", flush=True)
         writer.close()
