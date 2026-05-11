@@ -434,7 +434,7 @@ class InterruptionRecoveryProcessor(FrameProcessor):
 
 # --- 3. ГЛАВНЫЙ ОБРАБОТЧИК ASTERISK (ЗАМЕНА WEBSOCKET) ---
     async def handle_asterisk_conn(reader, writer):
-    print(f"--- ВХОДЯЩИЙ ЗВОНОК ---", flush=True)
+        print(f"--- ВХОДЯЩИЙ ЗВОНОК ---", flush=True)
     timer_task = None
     audio_mixer = None
     wav_filename = None
