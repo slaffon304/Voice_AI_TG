@@ -634,7 +634,7 @@ class InterruptionRecoveryProcessor(FrameProcessor):
         ])
 
         # 3. Создаем задачу (с увеличенным таймаутом, чтобы не сбросило звонок)
-        task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True, idle_timeout=60.0))
+        task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True, idle_timeout=20.0))
         
         # 4. Передаем задачу внутрь обработчика, чтобы он мог вызывать LLMRunFrame()
         recovery_processor.task = task
@@ -673,7 +673,7 @@ class InterruptionRecoveryProcessor(FrameProcessor):
             audio_url = await upload_audio_to_supabase(client_id, wav_filename)
             await send_final_report_to_n8n(client_id, full_transcript, summary, audio_url)
 
-        if wav_filena        # Увеличиваем idle_timeout до 60 секунд, чтобы бот не вешал трубку при паузах
+        if wav_filena:        # Увеличиваем idle_timeout до 60 секунд, чтобы бот не вешал трубку при паузах
         task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True, idle_timeout=20.0))
 
         @transport.event_handler("on_client_connected")
