@@ -380,8 +380,60 @@ async def get_client_uuid(sip_login: str = None, sip_login_gsm: str = None):
         except Exception: 
             return Response(content="error", media_type="text/plain")
 
+
+class InterruptionRecoveryProcessor(FrameProcessor):
+    def __init__(self, context):
+        super().__init__()
+        self.context = context
+        self.task = None # Сюда мы передадим PipelineTask чуть позже
+        self.is_interrupted = False
+        self.recovery_task = None
+
+    async def _recovery_timer(self):
+        try:
+            # Ждем 4 секунды тишины после перебивания
+            await asyncio.sleep(4.0) 
+            
+            # Если таймер не отменили новым голосом, значит висит мертвая тишина
+            if self.is_interrupted and self.task:
+                print("⏳ [UX] Сработал таймер: тишина после перебивания. Возвращаем бота в диалог.", flush=True)
+                
+                # Закидываем системный пинок в контекст
+                self.context.add_message({
+                    "role": "system",
+                    "content": "SYSTEM COMMAND: The user interrupted you but then went silent. Politely and briefly ask if they are still there or if you should continue. Use the user's language."
+                })
+                # Принудительно заставляем ИИ ответить
+                await self.task.queue_frames([LLMRunFrame()])
+                
+                # Сбрасываем флаг
+                self.is_interrupted = False
+        except asyncio.CancelledError:
+            # Таймер отменили, все ок
+            pass
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        # Обязательно пропускаем фрейм дальше по цепочке
+        await super().process_frame(frame, direction)
+
+        # Ловим момент перебивания (Barge-in)
+        if isinstance(frame, InterruptionFrame):
+            self.is_interrupted = True
+            # Если старый таймер еще тикает - убиваем его
+            if self.recovery_task:
+                self.recovery_task.cancel()
+            # Запускаем новый отсчет 4 секунд
+            self.recovery_task = asyncio.create_task(self._recovery_timer())
+
+        # Ловим момент, когда клиент снова начал говорить
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            # Отменяем таймер спасения, клиент сам продолжает диалог
+            if self.recovery_task:
+                self.recovery_task.cancel()
+            self.is_interrupted = False
+
 # --- 3. ГЛАВНЫЙ ОБРАБОТЧИК ASTERISK (ЗАМЕНА WEBSOCKET) ---
-async def handle_asterisk_conn(reader, writer):
+    async def handle_asterisk_conn(reader, writer):
     print(f"--- ВХОДЯЩИЙ ЗВОНОК ---", flush=True)
     timer_task = None
     audio_mixer = None
@@ -566,34 +618,28 @@ async def handle_asterisk_conn(reader, writer):
         ai_catcher = AIAudioCatcher(audio_mixer)
 
         # --- ЗАПУСК ПАЙПЛАЙНА ---
+                # 1. Инициализируем наш умный обработчик перебиваний
+        recovery_processor = InterruptionRecoveryProcessor(context)
+
+        # 2. Вставляем его в пайплайн (сразу после аудиовхода)
         pipeline = Pipeline([
             transport.input(), 
-            user_catcher,         # <--- Слушает 16кГц микрофон
+            recovery_processor,   # <--- Наш наблюдатель слушает все события
+            user_catcher,         
             context_aggregator.user(), 
             llm, 
-            ai_catcher,           # <--- Слушает 24кГц ответы Gemini
+            ai_catcher,           
             transport.output(), 
             context_aggregator.assistant()
         ])
-        task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
 
-        @transport.event_handler("on_client_connected")
-        async def on_client_connected(transport, client):
-            context.add_message({
-    "role": "system", 
-    "content": (
-        "Clientul s-a conectat. REGULĂ STRICTĂ PENTRU PRIMA FRAZĂ: "
-        "Nu improviza. Prima ta replică TREBUIE să fie EXACT aceasta, cuvânt cu cuvânt: "
-        "'Bună ziua. Pentru a asigura calitatea serviciilor, acest apel este înregistrat. "
-        "Sunt Grigorii, asistentul digital Lab Upgrade. Cu ce vă pot ajuta?' "
-        "După ce spui asta, oprește-te și așteaptă răspunsul clientului."
-    )
-})
-        await task.queue_frames([LLMRunFrame()])
-
+        # 3. Создаем задачу (с увеличенным таймаутом, чтобы не сбросило звонок)
+        task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True, idle_timeout=60.0))
+        
+        # 4. Передаем задачу внутрь обработчика, чтобы он мог вызывать LLMRunFrame()
+        recovery_processor.task = task
 
         
-
         runner = PipelineRunner()
         
         # Принудительно проталкиваем фрейм, чтобы запустить разговор
@@ -627,7 +673,26 @@ async def handle_asterisk_conn(reader, writer):
             audio_url = await upload_audio_to_supabase(client_id, wav_filename)
             await send_final_report_to_n8n(client_id, full_transcript, summary, audio_url)
 
-        if wav_filename and os.path.exists(wav_filename):
+        if wav_filena        # Увеличиваем idle_timeout до 60 секунд, чтобы бот не вешал трубку при паузах
+        task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True, idle_timeout=20.0))
+
+        @transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, client):
+            # Достаем имя компании. Если в базе пусто, ставим заглушку
+            company_name = client_data.get("company_name") or "companiei noastre"
+            
+            context.add_message({
+                "role": "system", 
+                "content": (
+                    "Clientul s-a conectat. REGULĂ STRICTĂ PENTRU PRIMA FRAZĂ: "
+                    "Nu improviza. Prima ta replică TREBUIE să fie EXACT aceasta, cuvânt cu cuvânt: "
+                    f"'Bună ziua. Pentru a asigura calitatea serviciilor, acest apel poate fi înregistrat. "
+                    f"Sunt Grigorii, asistentul digital al {company_name}. Cu ce vă pot ajuta?' "
+                    "După ce spui asta, oprește-te și așteaptă răspunsul clientului."
+                )
+            })
+            await task.queue_frames([LLMRunFrame()])
+me and os.path.exists(wav_filename):
             os.remove(wav_filename)
             
         print("✅ Пост-обработка завершена успешно.", flush=True)
