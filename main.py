@@ -685,7 +685,7 @@ class InterruptionRecoveryProcessor(FrameProcessor):
             audio_url = await upload_audio_to_supabase(client_id, wav_filename)
             await send_final_report_to_n8n(client_id, full_transcript, summary, audio_url)
 
-                if wav_filename and os.path.exists(wav_filename):
+        if wav_filename and os.path.exists(wav_filename):
             os.remove(wav_filename)
 
             
