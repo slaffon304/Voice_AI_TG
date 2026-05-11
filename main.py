@@ -432,14 +432,14 @@ class InterruptionRecoveryProcessor(FrameProcessor):
                 self.recovery_task.cancel()
             self.is_interrupted = False
 
-    # --- 3. ГЛАВНЫЙ ОБРАБОТЧИК ASTERISK (ЗАМЕНА WEBSOCKET) ---
-    async def handle_asterisk_conn(reader, writer):
-        print(f"--- ВХОДЯЩИЙ ЗВОНОК ---", flush=True)
-        timer_task = None
-        audio_mixer = None
-        wav_filename = None
+            # --- 3. ГЛАВНЫЙ ОБРАБОТЧИК ASTERISK (ЗАМЕНА WEBSOCKET) ---
+async def handle_asterisk_conn(reader, writer):
+    print(f"--- ВХОДЯЩИЙ ЗВОНОК ---", flush=True)
+    timer_task = None
+    audio_mixer = None
+    wav_filename = None
 
-        try:
+    try:
         # Читаем 3 байта заголовка Asterisk
         header = await reader.readexactly(3)
         payload_len = int.from_bytes(header[1:], byteorder='big') # Должно быть 16
@@ -547,7 +547,6 @@ class InterruptionRecoveryProcessor(FrameProcessor):
         context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
         context_aggregator = LLMContextAggregatorPair(context=context)
 
-        # 🟢 ЗДЕСЬ ТВОЯ ТОЧНАЯ КОНФИГУРАЦИЯ GEMINI 3.1
         llm = GeminiLiveLLMService(
             api_key=os.getenv("GEMINI_API_KEY"),
             tools=tools,
@@ -607,24 +606,20 @@ class InterruptionRecoveryProcessor(FrameProcessor):
                     await send_tg_alert(tg_chat_id, error_msg)
                     await params.result_callback({"status": "error", "message": f"Sistemul de rezervări nu răspunde: {str(e)}"})
 
-        # Регистрируем инструменты
         llm.register_function("save_lead", process_save_lead)
         llm.register_function("Booking_tool", process_booking_tool)
 
-        # 🟢 Инициализируем наш умный микшер
         wav_filename = f"record_{client_id}_{uuid.uuid4().hex[:8]}.wav"
         audio_mixer = AudioMixer(wav_filename)
         user_catcher = UserAudioCatcher(audio_mixer)
         ai_catcher = AIAudioCatcher(audio_mixer)
 
         # --- ЗАПУСК ПАЙПЛАЙНА ---
-                # 1. Инициализируем наш умный обработчик перебиваний
         recovery_processor = InterruptionRecoveryProcessor(context)
 
-        # 2. Вставляем его в пайплайн (сразу после аудиовхода)
         pipeline = Pipeline([
             transport.input(), 
-            recovery_processor,   # <--- Наш наблюдатель слушает все события
+            recovery_processor,   
             user_catcher,         
             context_aggregator.user(), 
             llm, 
@@ -633,16 +628,11 @@ class InterruptionRecoveryProcessor(FrameProcessor):
             context_aggregator.assistant()
         ])
 
-        # 3. Создаем задачу (с увеличенным таймаутом, чтобы не сбросило звонок)
         task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True, idle_timeout=20.0))
-        
-        # 4. Передаем задачу внутрь обработчика, чтобы он мог вызывать LLMRunFrame()
         recovery_processor.task = task
-
         
         runner = PipelineRunner()
         
-        # Добавляем жесткое приветствие с названием компании
         company_name = client_data.get("company_name") or "companiei noastre"
         context.add_message({
             "role": "system", 
@@ -655,18 +645,12 @@ class InterruptionRecoveryProcessor(FrameProcessor):
             )
         })
         
-        # Принудительно проталкиваем фрейм, чтобы запустить разговор
         await task.queue_frames([LLMRunFrame()])
-        
         await runner.run(task)
-
 
     except Exception as e:
         print(f"❌ Ошибка соединения: {e}", flush=True)
     finally:
-        
-
-        # === ПОСТ-ОБРАБОТКА (START) ===
         print("📞 Звонок завершен. Начинаем фоновые задачи...", flush=True)
 
         if audio_mixer:
@@ -687,15 +671,12 @@ class InterruptionRecoveryProcessor(FrameProcessor):
 
         if wav_filename and os.path.exists(wav_filename):
             os.remove(wav_filename)
-
             
         print("✅ Пост-обработка завершена успешно.", flush=True)
         writer.close()
 
-
 @app.on_event("startup")
 async def startup_event():
-    # Запускаем TCP-сервер Asterisk на порту 8085
     server = await asyncio.start_server(handle_asterisk_conn, '0.0.0.0', 8085)
     print(f"🚀 AudioSocket сервер запущен на порту 8085", flush=True)
     asyncio.create_task(server.serve_forever())
