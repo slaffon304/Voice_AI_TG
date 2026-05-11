@@ -636,7 +636,7 @@ async def handle_asterisk_conn(reader, writer):
         
         company_name = client_data.get("company_name") or "companiei noastre"
         context.add_message({
-            "role": "system", 
+            "role": "user", 
             "content": (
                 "Clientul s-a conectat. REGULĂ STRICTĂ PENTRU PRIMA FRAZĂ: "
                 "Nu improviza. Prima ta replică TREBUIE să fie EXACT aceasta, cuvânt cu cuvânt: "
