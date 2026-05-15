@@ -1,4 +1,4 @@
-pipecat-ai[google]
+pipecat-ai[google]==1.1.0
 fastapi
 uvicorn[standard]
 websockets
