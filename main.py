@@ -20,8 +20,9 @@ from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from google.genai import types
+from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, GeminiVADParams
 
-from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
@@ -540,9 +541,14 @@ async def handle_asterisk_conn(reader, writer):
             settings=GeminiLiveLLMService.Settings(
                 model="gemini-3.1-flash-live-preview",
                 voice="Enceladus",
-                system_instruction=system_prompt
+                system_instruction=system_prompt,
+                vad=GeminiVADParams(
+                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW, # Игнорируем шумы сотовой сети
+                    silence_duration_ms=1000 # Даем клиенту 1 секунду на паузы между словами
+                )
             )
         )
+
 
         async def process_save_lead(params: FunctionCallParams):
             tg_chat_id = client_data.get("tg_chat_id_notify", "")
