@@ -226,7 +226,9 @@ async def get_client_data(client_id: str):
         return None
 
     clean_url = SUPABASE_URL.replace("/rest/v1", "").rstrip("/")
-    url = f"{clean_url}/rest/v1/saas_clients?id=eq.{client_id}&select=company_name,business_context,tone,bot_goal,subscription_status_assistent,system_message,tg_chat_id_notify,google_calendar_id"
+    
+    # Запрашиваем saas_projects через JOIN
+    url = f"{clean_url}/rest/v1/saas_clients?id=eq.{client_id}&select=company_name,business_context,tone,bot_goal,subscription_status_assistent,system_message,saas_projects(tg_chat_id_notify,google_calendar_id)"
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
 
     async with httpx.AsyncClient() as client:
@@ -237,8 +239,19 @@ async def get_client_data(client_id: str):
             data = response.json()
             
             if len(data) > 0:
-                print(f"✅ Supabase a returnat datele companiei: {data[0].get('company_name')}", flush=True)
-                return data[0]
+                client_record = data[0]
+                
+                # Распаковка из списка проектов
+                projects = client_record.get('saas_projects', [])
+                if projects and len(projects) > 0:
+                    client_record['tg_chat_id_notify'] = projects[0].get('tg_chat_id_notify')
+                    client_record['google_calendar_id'] = projects[0].get('google_calendar_id')
+                else:
+                    client_record['tg_chat_id_notify'] = None
+                    client_record['google_calendar_id'] = None
+
+                print(f"✅ Supabase a returnat datele companiei: {client_record.get('company_name')}", flush=True)
+                return client_record
                 
             print(f"⚠️ ОШИБКА: Supabase a răspuns 200 OK, dar a returnat o listă goală. ID-ul {client_id} nu există.", flush=True)
             return None
@@ -351,25 +364,31 @@ async def send_final_report_to_n8n(client_id: str, transcript: str, summary: str
 # --- 2. ЭНДПОИНТ ДЛЯ ASTERISK (GET UUID) ---
 @app.get("/get_uuid")
 async def get_client_uuid(sip_login: str = None, sip_login_gsm: str = None):
-    # Защита: если Asterisk дернул эндпоинт вообще без параметров
+    # Защита: если Asterisk дернул эндпоинт без параметров
     if not sip_login and not sip_login_gsm:
          return Response(content="error", media_type="text/plain")
 
     clean_url = SUPABASE_URL.replace("/rest/v1", "").rstrip("/")
     
-    if sip_login_gsm:
-        url = f"{clean_url}/rest/v1/saas_clients?sip_login_gsm=eq.{sip_login_gsm}&select=id"
-    else:
-        url = f"{clean_url}/rest/v1/saas_clients?sip_login=eq.{sip_login}&select=id"
-
+    # Определяем универсальный идентификатор из параметров
+    identifier = sip_login_gsm if sip_login_gsm else sip_login
+    
+    # Ищем client_id в новой таблице bot_channels
+    url = f"{clean_url}/rest/v1/bot_channels?identifier=eq.{identifier}&select=client_id"
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
     
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
             data = resp.json()
-            return Response(content=str(data[0].get("id")) if data and isinstance(data, list) else "not_found", media_type="text/plain")
-        except Exception: 
+            
+            if data and isinstance(data, list) and len(data) > 0:
+                return Response(content=str(data[0].get("client_id")), media_type="text/plain")
+                
+            return Response(content="not_found", media_type="text/plain")
+        except Exception as e: 
+            print(f"❌ Ошибка в get_client_uuid: {e}", flush=True)
             return Response(content="error", media_type="text/plain")
 
 
