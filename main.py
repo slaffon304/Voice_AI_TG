@@ -342,14 +342,17 @@ async def upload_audio_to_supabase(client_id: str, filepath: str) -> str | None:
         print(f"❌ Ошибка при отправке файла в Supabase Storage: {e}", flush=True)
         return None
 
-async def send_final_report_to_n8n(client_id: str, transcript: str, summary: str, audio_url: str):
+async def send_final_report_to_n8n(client_id: str, transcript: str, summary: str, audio_url: str, system_instructions_length: int):
     """Отправляет итоговый отчет в n8n webhook."""
     payload = {
         "client_id": client_id,
         "transcript": transcript,
         "summary": summary,
-        "audio_url": audio_url
+        "audio_url": audio_url,
+        "system_instructions_length": system_instructions_length
     }
+    
+
     async with httpx.AsyncClient() as http_client:
         try:
             await http_client.post(
@@ -451,6 +454,8 @@ async def handle_asterisk_conn(reader, writer):
     timer_task = None
     audio_mixer = None
     wav_filename = None
+    system_instructions_length = 0 # <-- ОБЪЯВЛЯЕМ ЗДЕСЬ
+
 
     try:
         header = await reader.readexactly(3)
@@ -543,6 +548,10 @@ async def handle_asterisk_conn(reader, writer):
                 ]
             }
         ]
+        import json
+        full_system_text = system_prompt + json.dumps(tools)
+        system_instructions_length = len(full_system_text) # <-- СЧИТАЕМ СИМВОЛЫ
+
 
         transport = FastAPIWebsocketTransport(
             websocket=fake_websocket,
@@ -677,7 +686,8 @@ async def handle_asterisk_conn(reader, writer):
 
             summary = await generate_summary(full_transcript)
             audio_url = await upload_audio_to_supabase(client_id, wav_filename)
-            await send_final_report_to_n8n(client_id, full_transcript, summary, audio_url)
+            await send_final_report_to_n8n(client_id, full_transcript, summary, audio_url, system_instructions_length)
+
 
         if wav_filename and os.path.exists(wav_filename):
             os.remove(wav_filename)
