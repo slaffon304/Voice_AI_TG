@@ -235,7 +235,14 @@ async def get_client_data(client_id: str):
         try:
             print(f"🔄 Отправляем запрос к Supabase pentru ID: {client_id}...", flush=True)
             response = await client.get(url, headers=headers)
+            
+            # --- ДОБАВИТЬ ЭТИ ДВЕ СТРОКИ ---
+            if response.status_code != 200:
+                print(f"❌ ПОДРОБНОСТИ ОТ SUPABASE: {response.text}", flush=True)
+            # -------------------------------
+                
             response.raise_for_status()
+
             data = response.json()
             
             if len(data) > 0:
