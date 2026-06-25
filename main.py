@@ -356,7 +356,8 @@ async def send_final_report_to_n8n(client_id: str, transcript: str, summary: str
         "transcript": transcript,
         "summary": summary,
         "audio_url": audio_url,
-        "system_instructions_length": system_instructions_length
+        "system_instructions_length": system_instructions_length,
+        "platform": "gsm"
     }
     
 
