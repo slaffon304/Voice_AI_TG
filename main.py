@@ -524,7 +524,7 @@ async def handle_asterisk_conn(reader, writer):
                 "function_declarations": [
                     {
                         "name": "save_lead",
-                        "description": "Salvează datele de contact și motivul apelului în CRM.",
+                        "description": "Salvează datele de contact și motivul apelului în CRM. Dacă sunt date dela Booking_tool, include si pe ele.",
                         "parameters": {
                             "type": "object",
                             "properties": {
