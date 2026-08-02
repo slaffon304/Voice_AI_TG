@@ -515,7 +515,8 @@ async def handle_asterisk_conn(reader, writer):
     2. PAUZELE: Dacă pui o întrebare de confirmare (ex: "Corect?", "Sunteți de acord?", "Verific?"), OPREȘTE-TE imediat din vorbit și așteaptă răspunsul clientului. NU continua fraza și NU apela nicio funcție până nu auzi răspunsul.
     3. FĂRĂ HALUCINAȚII LA ID-URI: Pentru acțiunile 'reschedule' sau 'cancel', folosește STRICT event_id real returnat de webhook-ul 'lookup'. ESTE STRICT INTERZIS să inventezi ID-uri de test precum "event_123456". Dacă nu ai primit încă ID-ul real de la sistem, AȘTEAPTĂ! Nu apela 'reschedule' în orb.
     4. REACȚIA LA ÎNTRERUPERI: Dacă ești întrerupt de client cu un sunet scurt ("Da", "Aha") sau zgomot, iar apoi tace: NU întreba sec "Sunteți aici?" sau "Vă ascult?". Fii elegant și contextual. Spune cu o voce caldă: "Scuzați, cred că nu v-am auzit bine. Să continui de unde am rămas?" sau "Cred că s-a întrerupt puțin, revin la ideea anterioară?".
-    """
+    5. TRIMITEREA SMS: Când clientul cere adresa, detalii sau confirmarea programării prin SMS, folosește funcția 'send_sms'. Întreabă sau confirmă numărul de telefon înainte de a trimite, dacă nu ești sigur de el. Nu adăuga emoticoane în textul SMS. 
+     """
 
         system_prompt += behavior_rules
 
@@ -551,6 +552,29 @@ async def handle_asterisk_conn(reader, writer):
                                 "event_id": {"type": "string", "description": "ID-ul REAL al evenimentului obținut exclusiv din acțiunea 'lookup'."}
                             },
                             "required": ["action"]
+                        }
+                    },
+                    {
+                        "name": "send_sms",
+                        "description": "Trimite un SMS clientului cu informații utile (adresă, confirmarea programării, link sau rezumatul discuției). Apelează doar când clientul cere sau acceptă să primească informația prin SMS.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "phone": {
+                                    "type": "string", 
+                                    "description": "Numărul de telefon al clientului"
+                                },
+                                "message": {
+                                    "type": "string", 
+                                    "description": "Textul scurt al mesajului SMS (fără emoticoane, maxim 160 caractere)"
+                                },
+                                "purpose": {
+                                    "type": "string",
+                                    "enum": ["address", "booking_confirmation", "info", "other"],
+                                    "description": "Scopul trimiterii SMS-ului"
+                                }
+                            },
+                            "required": ["phone", "message"]
                         }
                     }
                 ]
@@ -634,8 +658,48 @@ async def handle_asterisk_conn(reader, writer):
                     await send_tg_alert(tg_chat_id, error_msg)
                     await params.result_callback({"status": "error", "message": f"Sistemul de rezervări nu răspunde: {str(e)}"})
 
+        async def process_send_sms(params: FunctionCallParams):
+            tg_chat_id = client_data.get("tg_chat_id_notify", "")
+            company_name = client_data.get("company_name", "Necunoscut")
+            
+            async with httpx.AsyncClient() as http_client:
+                try:
+                    response = await http_client.post(
+                        f"https://n8n.labupgrade.in/webhook/send_sms?client_id={client_id}&tg_chat_id={tg_chat_id}",
+                        json=params.arguments,
+                        timeout=5.0
+                    )
+                    response.raise_for_status()
+                    await params.result_callback({
+                        "status": "success", 
+                        "message": "SMS-ul a fost trimis cu succes către client."
+                    })
+                except asyncio.CancelledError:
+                    print("⚠️ Вызов send_sms прерван. Защита активирована.", flush=True)
+                    try:
+                        await params.result_callback({
+                            "status": "cancelled", 
+                            "message": "Client interrupted the tool call."
+                        })
+                    except Exception: 
+                        pass
+                    raise
+                except Exception as e:
+                    error_msg = (
+                        f"⚠️ <b>Eroare API (send_sms)</b>\n"
+                        f"🏢 Companie: {company_name}\n"
+                        f"🔧 Detalii eroare: <code>{str(e)}</code>\n"
+                        f"N8N nu a putut trimite SMS-ul!"
+                    )
+                    await send_tg_alert(tg_chat_id, error_msg)
+                    await params.result_callback({
+                        "status": "error", 
+                        "message": f"Eroare la trimiterea SMS: {str(e)}"
+                    })
+
         llm.register_function("save_lead", process_save_lead)
         llm.register_function("Booking_tool", process_booking_tool)
+        llm.register_function("send_sms", process_send_sms)
 
         wav_filename = f"record_{client_id}_{uuid.uuid4().hex[:8]}.wav"
         audio_mixer = AudioMixer(wav_filename)
