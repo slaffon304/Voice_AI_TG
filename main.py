@@ -402,6 +402,71 @@ async def get_client_uuid(sip_login: str = None, sip_login_gsm: str = None):
             print(f"❌ Ошибка в get_client_uuid: {e}", flush=True)
             return Response(content="error", media_type="text/plain")
 
+from pydantic import BaseModel
+
+# Кэш активных исходящих звонков: call_uuid -> dict с данными клиента
+OUTBOUND_CALLS_CACHE = {}
+
+class OutboundCallRequest(BaseModel):
+    client_id: str
+    target_phone: str
+    client_name: str = "client"
+    call_purpose: str = "Confirmarea programării"
+    custom_context: str = ""
+
+@app.post("/api/dial")
+async def initiate_outbound_call(req: OutboundCallRequest):
+    # 1. Генерируем уникальный UUID для AudioSocket
+    call_uuid = str(uuid.uuid4())
+    
+    # 2. Сохраняем контекст звонка в память
+    OUTBOUND_CALLS_CACHE[call_uuid] = {
+        "client_id": req.client_id,
+        "target_phone": req.target_phone,
+        "client_name": req.client_name,
+        "call_purpose": req.call_purpose,
+        "custom_context": req.custom_context
+    }
+    
+    print(f"📞 [OUTBOUND] Создана задача звонка {call_uuid} -> {req.target_phone} ({req.client_name})", flush=True)
+    
+    # 3. Отправляем HTTP POST в Asterisk ARI
+    # Используем IP сервера и наш созданный логин/пароль asterisk:labupgrade_ari_pass
+    ari_url = "http://187.77.69.233:8088/ari/channels"
+    
+    payload = {
+        "endpoint": f"PJSIP/{req.target_phone}@moldcell_endpoint",
+        "extension": "s",
+        "context": "outbound-ai",
+        "priority": 1,
+        "variables": {
+            "CALL_UUID": call_uuid
+        }
+    }
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(
+                ari_url, 
+                json=payload, 
+                auth=("asterisk", "labupgrade_ari_pass"),
+                timeout=10.0
+            )
+            if resp.status_code not in (200, 201):
+                print(f"❌ ОШИБКА ASTERISK ARI: {resp.text}", flush=True)
+                OUTBOUND_CALLS_CACHE.pop(call_uuid, None)
+                return {"status": "error", "details": resp.text}
+                
+            return {
+                "status": "dialing", 
+                "call_uuid": call_uuid, 
+                "target": req.target_phone
+            }
+        except Exception as e:
+            OUTBOUND_CALLS_CACHE.pop(call_uuid, None)
+            print(f"❌ ОШИБКА СОЕДИНЕНИЯ С ARI: {e}", flush=True)
+            return {"status": "error", "message": str(e)}
+
 
 class InterruptionRecoveryProcessor(FrameProcessor):
     def __init__(self, context):
@@ -726,14 +791,39 @@ async def handle_asterisk_conn(reader, writer):
         runner = PipelineRunner()
         
         company_name = client_data.get("company_name") or "companiei noastre"
-        context.add_message({
-            "role": "user", 
-            "content": (
+        
+        # --- ПРОВЕРЯЕМ: ИСХОДЯЩИЙ ЭТО ЗВОНОК ИЛИ ВХОДЯЩИЙ ---
+        if client_id in OUTBOUND_CALLS_CACHE:
+            outbound_info = OUTBOUND_CALLS_CACHE.pop(client_id)
+            client_name = outbound_info.get("client_name", "")
+            purpose = outbound_info.get("call_purpose", "")
+            custom_context = outbound_info.get("custom_context", "")
+            
+            # Добавляем в системный промпт цель исходящего звонка
+            context.add_message({
+                "role": "system",
+                "content": f"ATENȚIE: Acesta este un apel DE IEȘIRE (Outbound call). Scopul apelului: {purpose}. Detalii: {custom_context}."
+            })
+            
+            # Инициативное приветствие Григора
+            greeting_prompt = (
+                "SYSTEM EVENT: Clientul a răspuns la apelul de ieșire. "
+                "ROSTEȘTE ACUM EXACT ACEASTĂ FRAZĂ, cuvânt cu cuvânt. Nu adăuga nimic altceva: "
+                f"'Bună ziua, {client_name}! Vă deranjez de la {company_name}, sunt asistentul digital Grigorii. "
+                f"Vă sun cu privire la {purpose}. Vă este comod să vorbim puțin?' "
+            )
+        else:
+            # Стандартное приветствие для ВХОДЯЩИХ звонков
+            greeting_prompt = (
                 "SYSTEM EVENT: Clientul s-a conectat. "
                 "ROSTEȘTE ACUM EXACT ACEASTĂ FRAZĂ, cuvânt cu cuvânt. Nu adăuga nimic altceva: "
                 f"'Bună ziua. Pentru a asigura calitatea serviciilor, acest apel poate fi înregistrat. "
                 f"Sunt Grigorii, asistentul digital al {company_name}. Cu ce vă pot ajuta?' "
             )
+
+        context.add_message({
+            "role": "user", 
+            "content": greeting_prompt
         })
         
         await task.queue_frames([LLMRunFrame()])
