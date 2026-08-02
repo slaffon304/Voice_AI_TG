@@ -436,6 +436,7 @@ async def initiate_outbound_call(req: OutboundCallRequest):
     
     payload = {
         "endpoint": f"PJSIP/{req.target_phone}@moldcell_endpoint",
+        "callerId": "078001079",
         "extension": "s",
         "context": "outbound-ai",
         "priority": 1,
