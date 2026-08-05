@@ -155,7 +155,7 @@ class AIAudioCatcher(FrameProcessor):
 
 
 # ==========================================
-# АДАПТЕР ASTERISK -> WEBSOCKET
+# АДАПТЕР ASTERISK -> WEBSOCKET (С ПЛАВНЫМ PACING)
 # ==========================================
 class AsteriskWSAdapter:
     def __init__(self, reader, writer):
@@ -166,7 +166,7 @@ class AsteriskWSAdapter:
         self.in_state = None
         self.out_state = None
 
-        # Таймер для синхронизации скорости речи
+        # Оптимизированный таймер без накопления погрешности
         self.next_send_time = time.time()
 
     async def accept(self):
@@ -208,33 +208,33 @@ class AsteriskWSAdapter:
             return {"type": "websocket.disconnect", "code": 1000}
 
     async def send_bytes(self, data):
-        """Звук от ИИ (Gemini -> Asterisk) с контролем скорости"""
+        """Плавная отправка (Pacing) без заиканий для RTP-канала"""
         if self.client_state != WebSocketState.CONNECTED:
             return
         try:
-            # 1. Убираем шипение (снижаем амплитуду перед сжатием)
-            softened_data = audioop.mul(data, 2, 0.5)
+            # 1. Мягкое снижение амплитуды (защита от клиппинга)
+            softened_data = audioop.mul(data, 2, 0.75)
 
-            # 2. Сжимаем до 8000 Гц для телефонии
+            # 2. Ресемплинг 24000 -> 8000 Гц
             resampled, self.out_state = audioop.ratecv(
                 softened_data, 2, 1, 24000, 8000, self.out_state
             )
 
-            # 3. PACING: Удерживаем звук, чтобы он шел строго в реальном времени
-            audio_duration = len(resampled) / 16000.0  # Длина аудио в секундах
+            # 3. Точный расчет длительности чанка (16000 байт/сек для 8kHz 16bit)
+            audio_duration = len(resampled) / 16000.0
             now = time.time()
 
+            # Если бот молчал и таймер отстал — сбрасываем к текущему времени
             if self.next_send_time < now:
                 self.next_send_time = now
 
             sleep_time = self.next_send_time - now
-            # Оставляем минимальный зазор 50мс для бесперебойного потока
-            if sleep_time > 0.05:
-                await asyncio.sleep(sleep_time - 0.05)
+            if sleep_time > 0.01:
+                await asyncio.sleep(sleep_time)
 
             self.next_send_time += audio_duration
 
-            # Отправляем в сокет
+            # Отправка в AudioSocket
             header = b"\x10" + len(resampled).to_bytes(2, byteorder="big")
             self.writer.write(header + resampled)
             await self.writer.drain()
@@ -833,8 +833,8 @@ async def handle_asterisk_conn(reader, writer):
                 voice="Enceladus",
                 system_instruction=system_prompt,
                 vad=GeminiVADParams(
-                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,  # Игнорируем шумы сотовой сети
-                    silence_duration_ms=1000,  # Даем клиенту 1 секунду на паузы между словами
+                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+                    silence_duration_ms=1000,
                 ),
             ),
         )
