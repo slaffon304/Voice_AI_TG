@@ -70,12 +70,13 @@ class RawPCMFrameSerializer(FrameSerializer):
 # ==========================================
 class AudioMixer:
     def clear_ai_buffer(self):
+        """Очищает невоспроизведенное будущее ИИ при перебивании"""
         self.ai_buffer = np.array([], dtype=np.int16)
 
     def __init__(self, output_path: str):
         self.output_path = output_path
         self._wav_file = None
-        self.target_rate = 24000
+        self.target_rate = 24000  # Gemini отдает 24 кГц
         self.ai_buffer = np.array([], dtype=np.int16)
 
     def add_ai_audio(self, frame: OutputAudioRawFrame):
@@ -84,7 +85,9 @@ class AudioMixer:
 
     def add_user_audio(self, frame: InputAudioRawFrame):
         self._init_wav()
+
         user_chunk = np.frombuffer(frame.audio, dtype=np.int16)
+
         num_samples = int(
             len(user_chunk) * (self.target_rate / frame.sample_rate)
         )
@@ -129,10 +132,13 @@ class UserAudioCatcher(FrameProcessor):
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
+
         if isinstance(frame, InputAudioRawFrame):
             self.mixer.add_user_audio(frame)
+        # Ловим сигнал перебивания и стираем фантомные слова из записи
         elif isinstance(frame, (CancelFrame, InterruptionFrame)):
             self.mixer.clear_ai_buffer()
+
         await self.push_frame(frame, direction)
 
 
@@ -159,6 +165,8 @@ class AsteriskWSAdapter:
         self.application_state = WebSocketState.CONNECTED
         self.in_state = None
         self.out_state = None
+
+        # Оптимизированный таймер без накопления погрешности
         self.next_send_time = time.time()
 
     async def accept(self):
@@ -174,6 +182,7 @@ class AsteriskWSAdapter:
             pass
 
     async def receive_bytes(self):
+        """Звук от клиента (Asterisk -> ИИ)"""
         try:
             header = await self.reader.readexactly(3)
             p_len = int.from_bytes(header[1:], byteorder="big")
@@ -199,16 +208,23 @@ class AsteriskWSAdapter:
             return {"type": "websocket.disconnect", "code": 1000}
 
     async def send_bytes(self, data):
+        """Плавная отправка (Pacing) без заиканий для RTP-канала"""
         if self.client_state != WebSocketState.CONNECTED:
             return
         try:
+            # 1. Мягкое снижение амплитуды (защита от клиппинга)
             softened_data = audioop.mul(data, 2, 0.75)
+
+            # 2. Ресемплинг 24000 -> 8000 Гц
             resampled, self.out_state = audioop.ratecv(
                 softened_data, 2, 1, 24000, 8000, self.out_state
             )
+
+            # 3. Точный расчет длительности чанка (16000 байт/сек для 8kHz 16bit)
             audio_duration = len(resampled) / 16000.0
             now = time.time()
 
+            # Если бот молчал и таймер отстал — сбрасываем к текущему времени
             if self.next_send_time < now:
                 self.next_send_time = now
 
@@ -217,6 +233,8 @@ class AsteriskWSAdapter:
                 await asyncio.sleep(sleep_time)
 
             self.next_send_time += audio_duration
+
+            # Отправка в AudioSocket
             header = b"\x10" + len(resampled).to_bytes(2, byteorder="big")
             self.writer.write(header + resampled)
             await self.writer.drain()
@@ -232,43 +250,69 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Кэш активных исходящих звонков: call_uuid -> dict с данными клиента
 OUTBOUND_CALLS_CACHE = {}
 
 
 # --- 1. ФУНКЦИИ БАЗЫ ДАННЫХ И УВЕДОМЛЕНИЙ ---
 async def get_client_data(client_id: str):
     if not SUPABASE_URL or not SUPABASE_KEY:
-        print("❌ ОШИБКА: В переменных окружения отсутствуют ключи SUPABASE_URL sau SUPABASE_KEY.", flush=True)
+        print(
+            "❌ ОШИБКА: В переменных окружения отсутствуют ключи SUPABASE_URL sau SUPABASE_KEY.",
+            flush=True,
+        )
         return None
 
     clean_url = SUPABASE_URL.replace("/rest/v1", "").rstrip("/")
+
+    # Запрашиваем saas_projects через JOIN
     url = f"{clean_url}/rest/v1/saas_clients?id=eq.{client_id}&select=company_name,business_context,tone,bot_goal,subscription_status_assistent,system_message,saas_projects(tg_chat_id_notify,google_calendar_id)"
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+    }
 
     async with httpx.AsyncClient() as client:
         try:
-            print(f"🔄 Отправляем запрос к Supabase pentru ID: {client_id}...", flush=True)
+            print(
+                f"🔄 Отправляем запрос к Supabase pentru ID: {client_id}...",
+                flush=True,
+            )
             response = await client.get(url, headers=headers)
+
             if response.status_code != 200:
                 print(f"❌ ПОДРОБНОСТИ ОТ SUPABASE: {response.text}", flush=True)
 
             response.raise_for_status()
+
             data = response.json()
 
             if len(data) > 0:
                 client_record = data[0]
+
+                # Распаковка из списка проектов
                 projects = client_record.get("saas_projects", [])
                 if projects and len(projects) > 0:
-                    client_record["tg_chat_id_notify"] = projects[0].get("tg_chat_id_notify")
-                    client_record["google_calendar_id"] = projects[0].get("google_calendar_id")
+                    client_record["tg_chat_id_notify"] = projects[0].get(
+                        "tg_chat_id_notify"
+                    )
+                    client_record["google_calendar_id"] = projects[0].get(
+                        "google_calendar_id"
+                    )
                 else:
                     client_record["tg_chat_id_notify"] = None
                     client_record["google_calendar_id"] = None
 
-                print(f"✅ Supabase a returnat datele companiei: {client_record.get('company_name')}", flush=True)
+                print(
+                    f"✅ Supabase a returnat datele companiei: {client_record.get('company_name')}",
+                    flush=True,
+                )
                 return client_record
 
-            print(f"⚠️ ОШИБКА: Supabase a răspuns 200 OK, dar a returnat o listă goală. ID-ul {client_id} nu există.", flush=True)
+            print(
+                f"⚠️ ОШИБКА: Supabase a răspuns 200 OK, dar a returnat o listă goală. ID-ul {client_id} nu există.",
+                flush=True,
+            )
             return None
         except Exception as e:
             print(f"❌ ОШИБКА СВЯЗИ С SUPABASE: {e}", flush=True)
@@ -276,8 +320,12 @@ async def get_client_data(client_id: str):
 
 
 async def send_tg_alert(chat_id: str, message: str):
+    """Отправляет уведомление об ошибке в ТГ клиенту (или администратору)"""
     if not TG_BOT_TOKEN or not chat_id:
-        print("⚠️ Notificare TG anulată: lipsește token-ul sau chat_id-ul.", flush=True)
+        print(
+            "⚠️ Notificare TG anulată: lipsește token-ul sau chat_id-ul.",
+            flush=True,
+        )
         return
 
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
@@ -286,17 +334,22 @@ async def send_tg_alert(chat_id: str, message: str):
     async with httpx.AsyncClient() as client:
         try:
             await client.post(url, json=payload, timeout=5.0)
-            print(f"📲 Alerta TG a fost trimisă cu succes la {chat_id}.", flush=True)
+            print(
+                f"📲 Alerta TG a fost trimisă cu succes la {chat_id}.",
+                flush=True,
+            )
         except Exception as e:
             print(f"❌ EROARE la trimiterea alertei TG: {e}", flush=True)
 
 
 async def generate_summary(transcript: str) -> str:
+    """Генерирует саммари с анализом в формате JSON."""
     if not transcript or len(transcript.strip()) < 10:
         return "{}"
 
     try:
         client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
         prompt = (
             "Analizează transcriptul. Returnează un obiect JSON valid "
             "(fără formatare markdown, doar JSON pur) cu următoarele chei:\n"
@@ -317,19 +370,29 @@ async def generate_summary(transcript: str) -> str:
             ),
         )
         return response.text
+
     except Exception as e:
         print(f"❌ Ошибка генерации саммари: {e}", flush=True)
         return "{}"
 
 
 async def upload_audio_to_supabase(client_id: str, filepath: str) -> str | None:
-    print(f"🎧 Начинаем сохранение аудио. Проверяем файл: {filepath}", flush=True)
+    print(
+        f"🎧 Начинаем сохранение аудио. Проверяем файл: {filepath}", flush=True
+    )
+
     if not SUPABASE_URL or not SUPABASE_KEY:
-        print("❌ ОШИБКА АУДИО: Не найден SUPABASE_URL или SUPABASE_KEY", flush=True)
+        print(
+            "❌ ОШИБКА АУДИО: Не найден SUPABASE_URL или SUPABASE_KEY",
+            flush=True,
+        )
         return None
 
     if not os.path.exists(filepath):
-        print(f"❌ ОШИБКА АУДИО: Файл {filepath} не создался на диске!", flush=True)
+        print(
+            f"❌ ОШИБКА АУДИО: Файл {filepath} не создался на диске!",
+            flush=True,
+        )
         return None
 
     try:
@@ -346,7 +409,9 @@ async def upload_audio_to_supabase(client_id: str, filepath: str) -> str | None:
                     file=f,
                     file_options={"content-type": "audio/wav"},
                 )
-            return supabase.storage.from_(bucket_name).get_public_url(storage_path)
+            return supabase.storage.from_(bucket_name).get_public_url(
+                storage_path
+            )
 
         audio_url = await asyncio.to_thread(_upload)
         print(f"✅ Аудио успешно загружено в Supabase: {audio_url}", flush=True)
@@ -366,12 +431,12 @@ async def send_final_report_to_n8n(
     audio_url: str,
     system_instructions_length: int,
 ):
-    """Отправляет итоговый отчет в n8n webhook с явным именем, телефоном и статусом."""
+    """Отправляет итоговый отчет в n8n webhook."""
     payload = {
         "client_id": client_id,
         "end_client_name": end_client_name,
         "end_client_phone": end_client_phone,
-        "status": status,  # "completed" | "short_call"
+        "status": status,
         "transcript": transcript,
         "summary": summary,
         "audio_url": audio_url,
@@ -386,28 +451,44 @@ async def send_final_report_to_n8n(
                 json=payload,
                 timeout=10.0,
             )
-            print(f"✅ Отчет успешно отправлен в n8n (status={status})", flush=True)
+            print("✅ Отчет успешно отправлен в n8n", flush=True)
         except Exception as e:
-            print(f"❌ Ошибка отправки финального отчета в n8n: {e}", flush=True)
+            print(
+                f"❌ Ошибка отправки финального отчета в n8n: {e}", flush=True
+            )
 
 
+# --- 2. ЭНДПОИНТ ДЛЯ ASTERISK (GET UUID) ---
 @app.get("/get_uuid")
 async def get_client_uuid(sip_login: str = None, sip_login_gsm: str = None):
+    # Защита: если Asterisk дернул эндпоинт без параметров
     if not sip_login and not sip_login_gsm:
         return Response(content="error", media_type="text/plain")
 
     clean_url = SUPABASE_URL.replace("/rest/v1", "").rstrip("/")
+
+    # Определяем универсальный идентификатор из параметров
     identifier = sip_login_gsm if sip_login_gsm else sip_login
+
+    # Ищем client_id в новой таблице bot_channels
     url = f"{clean_url}/rest/v1/bot_channels?identifier=eq.{identifier}&select=client_id"
-    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+    }
 
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             data = resp.json()
+
             if data and isinstance(data, list) and len(data) > 0:
-                return Response(content=str(data[0].get("client_id")), media_type="text/plain")
+                return Response(
+                    content=str(data[0].get("client_id")),
+                    media_type="text/plain",
+                )
+
             return Response(content="not_found", media_type="text/plain")
         except Exception as e:
             print(f"❌ Ошибка в get_client_uuid: {e}", flush=True)
@@ -424,7 +505,10 @@ class OutboundCallRequest(BaseModel):
 
 @app.post("/api/dial")
 async def initiate_outbound_call(req: OutboundCallRequest):
+    # 1. Генерируем уникальный UUID для AudioSocket
     call_uuid = str(uuid.uuid4())
+
+    # 2. Сохраняем контекст звонка в память
     OUTBOUND_CALLS_CACHE[call_uuid] = {
         "client_id": req.client_id,
         "target_phone": req.target_phone,
@@ -433,9 +517,14 @@ async def initiate_outbound_call(req: OutboundCallRequest):
         "custom_context": req.custom_context,
     }
 
-    print(f"📞 [OUTBOUND] Создана задача звонка {call_uuid} -> {req.target_phone} ({req.client_name})", flush=True)
+    print(
+        f"📞 [OUTBOUND] Создана задача звонка {call_uuid} -> {req.target_phone} ({req.client_name})",
+        flush=True,
+    )
 
+    # 3. Отправляем HTTP POST в Asterisk ARI
     ari_url = "http://187.77.69.233:8088/ari/channels"
+
     payload = {
         "endpoint": f"PJSIP/{req.target_phone}@moldcell_endpoint",
         "extension": "s",
@@ -457,7 +546,11 @@ async def initiate_outbound_call(req: OutboundCallRequest):
                 OUTBOUND_CALLS_CACHE.pop(call_uuid, None)
                 return {"status": "error", "details": resp.text}
 
-            return {"status": "dialing", "call_uuid": call_uuid, "target": req.target_phone}
+            return {
+                "status": "dialing",
+                "call_uuid": call_uuid,
+                "target": req.target_phone,
+            }
         except Exception as e:
             OUTBOUND_CALLS_CACHE.pop(call_uuid, None)
             print(f"❌ ОШИБКА СОЕДИНЕНИЯ С ARI: {e}", flush=True)
@@ -476,7 +569,10 @@ class InterruptionRecoveryProcessor(FrameProcessor):
         try:
             await asyncio.sleep(4.0)
             if self.is_interrupted and self.task:
-                print("⏳ [UX] Сработал таймер: тишина după întrerupere. Возвращаем бота în dialog.", flush=True)
+                print(
+                    "⏳ [UX] Сработал таймер: тишина după întrerupere. Возвращаем бота în dialog.",
+                    flush=True,
+                )
                 self.context.add_message(
                     {
                         "role": "system",
@@ -489,20 +585,28 @@ class InterruptionRecoveryProcessor(FrameProcessor):
             pass
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
+        # 1. ОБЯЗАТЕЛЬНО вызываем super() для внутренней регистрации StartFrame в Pipecat
         await super().process_frame(frame, direction)
+
+        # 2. Наша логика таймера
         if isinstance(frame, InterruptionFrame):
             self.is_interrupted = True
             if self.recovery_task:
                 self.recovery_task.cancel()
             self.recovery_task = asyncio.create_task(self._recovery_timer())
-        elif isinstance(frame, (OutputAudioRawFrame, UserStartedSpeakingFrame)):
+
+        elif isinstance(
+            frame, (OutputAudioRawFrame, UserStartedSpeakingFrame)
+        ):
             if self.recovery_task:
                 self.recovery_task.cancel()
             self.is_interrupted = False
+
+        # 3. Проталкиваем аудио и другие фреймы дальше
         await self.push_frame(frame, direction)
 
 
-# --- 3. ГЛАВНЫЙ ОБРАБОТЧИК ASTERISK ---
+# --- 3. ГЛАВНЫЙ ОБРАБОТЧИК ASTERISK (ЗАМЕНА WEBSOCKET) ---
 async def handle_asterisk_conn(reader, writer):
     print("--- ВХОДЯЩИЙ ЗВОНОК ---", flush=True)
     audio_mixer = None
@@ -518,13 +622,17 @@ async def handle_asterisk_conn(reader, writer):
         uuid_bytes = await reader.readexactly(payload_len)
         session_uuid = str(uuid.UUID(bytes=uuid_bytes))
 
-        print(f"--- ВХОДЯЩИЙ/ИСХОДЯЩИЙ ЗВОНОК | UUID сессии: {session_uuid} ---", flush=True)
+        print(
+            f"--- ВХОДЯЩИЙ/ИСХОДЯЩИЙ ЗВОНОК | UUID сессии: {session_uuid} ---",
+            flush=True,
+        )
 
         if not session_uuid:
             print("❌ ОТКАЗ (403): UUID lipsește din URL.", flush=True)
             writer.close()
             return
 
+        # --- ДИНАМИЧЕСКОЕ ОПРЕДЕЛЕНИЕ ТИПА ЗВОНКА И НАСТОЯЩЕГО CLIENT_ID ---
         is_outbound = False
         outbound_info = {}
 
@@ -534,18 +642,30 @@ async def handle_asterisk_conn(reader, writer):
             client_id = outbound_info.get("client_id")
             target_phone = outbound_info.get("target_phone", "Necunoscut")
             client_name = outbound_info.get("client_name", "Necunoscut")
-            print(f"📞 [OUTBOUND] Настоящий client_id: {client_id}, Имя: {client_name}, Тел: {target_phone}", flush=True)
+            print(
+                f"📞 [OUTBOUND] Распознана задача исходящего звонка. Настоящий client_id: {client_id}",
+                flush=True,
+            )
         else:
             client_id = session_uuid
             print(f"📞 [INBOUND] Входящий звонок. client_id: {client_id}", flush=True)
 
         client_data = await get_client_data(client_id)
         if not client_data:
-            print(f"❌ ОТКАЗ (403): get_client_data a returnat None pentru client_id={client_id}.", flush=True)
+            print(
+                f"❌ ОТКАЗ (403): get_client_data a returnat None pentru client_id={client_id}. Închidem conexiunea.",
+                flush=True,
+            )
             writer.close()
             return
 
-        sub_status = str(client_data.get("subscription_status_assistent", "")).strip().lower()
+        sub_status = (
+            str(client_data.get("subscription_status_assistent", ""))
+            .strip()
+            .lower()
+        )
+        print(f"🔍 Statutul abonamentului: '{sub_status}'", flush=True)
+
         if sub_status == "false":
             print("❌ ОТКАЗ (403): Abonamentul este inactiv (false).", flush=True)
             writer.close()
@@ -554,17 +674,35 @@ async def handle_asterisk_conn(reader, writer):
         print("🟢 TOATE VERIFICĂRILE AU TRECUT! Ridicăm apelul.", flush=True)
 
         fake_websocket = AsteriskWSAdapter(reader, writer)
-        raw_prompt = client_data.get("system_message", "Ești un asistent virtual.")
+
+        raw_prompt = client_data.get(
+            "system_message", "Ești un asistent virtual."
+        )
         tz = pytz.timezone("Europe/Chisinau")
-        current_time = datetime.datetime.now(tz).strftime("%A, %d %B %Y, %H:%M")
+        current_time = datetime.datetime.now(tz).strftime(
+            "%A, %d %B %Y, %H:%M"
+        )
         office_status = "Open"
 
-        system_prompt = raw_prompt.replace("{company_name}", client_data.get("company_name") or "Compania noastră")
-        system_prompt = system_prompt.replace("{business_context}", client_data.get("business_context") or "")
-        system_prompt = system_prompt.replace("{bot_goal}", client_data.get("bot_goal") or "")
-        system_prompt = system_prompt.replace("{tone}", client_data.get("tone") or "friendly")
-        system_prompt = system_prompt.replace("{current_datetime}", current_time or "")
-        system_prompt = system_prompt.replace("{office_status}", office_status or "")
+        system_prompt = raw_prompt.replace(
+            "{company_name}",
+            client_data.get("company_name") or "Compania noastră",
+        )
+        system_prompt = system_prompt.replace(
+            "{business_context}", client_data.get("business_context") or ""
+        )
+        system_prompt = system_prompt.replace(
+            "{bot_goal}", client_data.get("bot_goal") or ""
+        )
+        system_prompt = system_prompt.replace(
+            "{tone}", client_data.get("tone") or "friendly"
+        )
+        system_prompt = system_prompt.replace(
+            "{current_datetime}", current_time or ""
+        )
+        system_prompt = system_prompt.replace(
+            "{office_status}", office_status or ""
+        )
 
         behavior_rules = """
     \n\nREGULI STRICTE DE CONVERSAȚIE (URMEAZĂ-LE CU STRICTEȚE):
@@ -590,9 +728,16 @@ async def handle_asterisk_conn(reader, writer):
                                 "client_name": {"type": "string"},
                                 "client_phone": {"type": "string"},
                                 "request_summary": {"type": "string"},
-                                "event_id": {"type": "string", "description": "ID-ul evenimentului din calendar (dacă a fost creat)"},
+                                "event_id": {
+                                    "type": "string",
+                                    "description": "ID-ul evenimentului din calendar (dacă a fost creat)",
+                                },
                             },
-                            "required": ["client_name", "client_phone", "request_summary"],
+                            "required": [
+                                "client_name",
+                                "client_phone",
+                                "request_summary",
+                            ],
                         },
                     },
                     {
@@ -601,26 +746,69 @@ async def handle_asterisk_conn(reader, writer):
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                "action": {"type": "string", "enum": ["check", "book", "lookup", "reschedule", "cancel"], "description": "Tipul acțiunii"},
-                                "phone": {"type": "string", "description": "Telefonul clientului"},
-                                "client_name": {"type": "string", "description": "Numele clientului (obligatoriu pentru 'book')"},
-                                "request_summary": {"type": "string", "description": "Motivul programării sau scurtă descriere (ex: 'Consultație automatizare')"},
-                                "start_time": {"type": "string", "description": "ISO 8601 start"},
-                                "end_time": {"type": "string", "description": "ISO 8601 end"},
-                                "event_id": {"type": "string", "description": "ID-ul REAL al evenimentului obținut exclusiv din acțiunea 'lookup'."},
+                                "action": {
+                                    "type": "string",
+                                    "enum": [
+                                        "check",
+                                        "book",
+                                        "lookup",
+                                        "reschedule",
+                                        "cancel",
+                                    ],
+                                    "description": "Tipul acțiunii",
+                                },
+                                "phone": {
+                                    "type": "string",
+                                    "description": "Telefonul clientului",
+                                },
+                                "client_name": {
+                                    "type": "string",
+                                    "description": "Numele clientului (obligatoriu pentru 'book')",
+                                },
+                                "request_summary": {
+                                    "type": "string",
+                                    "description": "Motivul programării sau scurtă descriere (ex: 'Consultație automatizare')",
+                                },
+                                "start_time": {
+                                    "type": "string",
+                                    "description": "ISO 8601 start",
+                                },
+                                "end_time": {
+                                    "type": "string",
+                                    "description": "ISO 8601 end",
+                                },
+                                "event_id": {
+                                    "type": "string",
+                                    "description": "ID-ul REAL al evenimentului obținut exclusiv din acțiunea 'lookup'.",
+                                },
                             },
                             "required": ["action"],
                         },
                     },
                     {
                         "name": "send_sms",
-                        "description": "Trimite un SMS clientului cu informații utile.",
+                        "description": "Trimite un SMS clientului cu informații utile (adresă, confirmarea programării, link sau rezumatul discuției). Apelează doar când clientul cere sau acceptă să primească informația prin SMS.",
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                "phone": {"type": "string", "description": "Numărul de telefon al clientului"},
-                                "message": {"type": "string", "description": "Textul scurt al mesajului SMS"},
-                                "purpose": {"type": "string", "enum": ["address", "booking_confirmation", "info", "other"], "description": "Scopul trimiterii SMS-ului"},
+                                "phone": {
+                                    "type": "string",
+                                    "description": "Numărul de telefon al clientului",
+                                },
+                                "message": {
+                                    "type": "string",
+                                    "description": "Textul scurt al mesajului SMS (fără emoticoane, maxim 160 caractere)",
+                                },
+                                "purpose": {
+                                    "type": "string",
+                                    "enum": [
+                                        "address",
+                                        "booking_confirmation",
+                                        "info",
+                                        "other",
+                                    ],
+                                    "description": "Scopul trimiterii SMS-ului",
+                                },
                             },
                             "required": ["phone", "message"],
                         },
@@ -642,7 +830,9 @@ async def handle_asterisk_conn(reader, writer):
             ),
         )
 
-        context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
+        context = LLMContext(
+            messages=[{"role": "system", "content": system_prompt}]
+        )
         context_aggregator = LLMContextAggregatorPair(context=context)
 
         llm = GeminiLiveLLMService(
@@ -653,8 +843,8 @@ async def handle_asterisk_conn(reader, writer):
                 voice="Enceladus",
                 system_instruction=system_prompt,
                 vad=GeminiVADParams(
-                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
-                    silence_duration_ms=1000,
+                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,  # Игнорируем шумы сотовой сети
+                    silence_duration_ms=1000,  # Даем клиенту 1 секунду на паузы между словами
                 ),
             ),
         )
@@ -672,20 +862,32 @@ async def handle_asterisk_conn(reader, writer):
                     response.raise_for_status()
                     await params.result_callback(response.json())
                 except asyncio.CancelledError:
+                    print(
+                        "⚠️ Вызов save_lead прерван. Защита активирована.",
+                        flush=True,
+                    )
                     try:
-                        await params.result_callback({"status": "cancelled", "message": "Client interrupted. Await client input."})
+                        await params.result_callback(
+                            {
+                                "status": "cancelled",
+                                "message": "Client interrupted. Await client input.",
+                            }
+                        )
                     except Exception:
                         pass
                     raise
                 except Exception as e:
                     error_msg = f"⚠️ <b>Eroare API (save_lead)</b>\n🏢 Companie: {company_name}\n🔧 Detalii eroare: <code>{str(e)}</code>\nN8N nu a putut salva lead-ul!"
                     await send_tg_alert(tg_chat_id, error_msg)
-                    await params.result_callback({"error": f"Eroare CRM: {str(e)}"})
+                    await params.result_callback(
+                        {"error": f"Eroare CRM: {str(e)}"}
+                    )
 
         async def process_booking_tool(params: FunctionCallParams):
             cal_id = client_data.get("google_calendar_id", "")
             tg_chat_id = client_data.get("tg_chat_id_notify", "")
             company_name = client_data.get("company_name", "Necunoscut")
+
             async with httpx.AsyncClient() as http_client:
                 try:
                     response = await http_client.post(
@@ -696,19 +898,34 @@ async def handle_asterisk_conn(reader, writer):
                     response.raise_for_status()
                     await params.result_callback(response.json())
                 except asyncio.CancelledError:
+                    print(
+                        "⚠️ Вызов Booking_tool прерван. Защита активирована.",
+                        flush=True,
+                    )
                     try:
-                        await params.result_callback({"status": "cancelled", "message": "Client interrupted the tool call. Stop and listen."})
+                        await params.result_callback(
+                            {
+                                "status": "cancelled",
+                                "message": "Client interrupted the tool call. Stop and listen.",
+                            }
+                        )
                     except Exception:
                         pass
                     raise
                 except Exception as e:
                     error_msg = f"⚠️ <b>Eroare API (Booking_tool)</b>\n🏢 Companie: {company_name}\n🔧 Detalii eroare: <code>{str(e)}</code>\nN8N nu a procesat rezervarea!"
                     await send_tg_alert(tg_chat_id, error_msg)
-                    await params.result_callback({"status": "error", "message": f"Sistemul de rezervări nu răspunde: {str(e)}"})
+                    await params.result_callback(
+                        {
+                            "status": "error",
+                            "message": f"Sistemul de rezervări nu răspunde: {str(e)}",
+                        }
+                    )
 
         async def process_send_sms(params: FunctionCallParams):
             tg_chat_id = client_data.get("tg_chat_id_notify", "")
             company_name = client_data.get("company_name", "Necunoscut")
+
             async with httpx.AsyncClient() as http_client:
                 try:
                     response = await http_client.post(
@@ -717,17 +934,41 @@ async def handle_asterisk_conn(reader, writer):
                         timeout=5.0,
                     )
                     response.raise_for_status()
-                    await params.result_callback({"status": "success", "message": "SMS-ul a fost trimis cu succes către client."})
+                    await params.result_callback(
+                        {
+                            "status": "success",
+                            "message": "SMS-ul a fost trimis cu succes către client.",
+                        }
+                    )
                 except asyncio.CancelledError:
+                    print(
+                        "⚠️ Вызов send_sms прерван. Защита активирована.",
+                        flush=True,
+                    )
                     try:
-                        await params.result_callback({"status": "cancelled", "message": "Client interrupted the tool call."})
+                        await params.result_callback(
+                            {
+                                "status": "cancelled",
+                                "message": "Client interrupted the tool call.",
+                            }
+                        )
                     except Exception:
                         pass
                     raise
                 except Exception as e:
-                    error_msg = f"⚠️ <b>Eroare API (send_sms)</b>\n🏢 Companie: {company_name}\n🔧 Detalii eroare: <code>{str(e)}</code>\nN8N nu a putut trimite SMS-ul!"
+                    error_msg = (
+                        f"⚠️ <b>Eroare API (send_sms)</b>\n"
+                        f"🏢 Companie: {company_name}\n"
+                        f"🔧 Detalii eroare: <code>{str(e)}</code>\n"
+                        f"N8N nu a putut trimite SMS-ul!"
+                    )
                     await send_tg_alert(tg_chat_id, error_msg)
-                    await params.result_callback({"status": "error", "message": f"Eroare la trimiterea SMS: {str(e)}"})
+                    await params.result_callback(
+                        {
+                            "status": "error",
+                            "message": f"Eroare la trimiterea SMS: {str(e)}",
+                        }
+                    )
 
         llm.register_function("save_lead", process_save_lead)
         llm.register_function("Booking_tool", process_booking_tool)
@@ -738,6 +979,7 @@ async def handle_asterisk_conn(reader, writer):
         user_catcher = UserAudioCatcher(audio_mixer)
         ai_catcher = AIAudioCatcher(audio_mixer)
 
+        # --- ЗАПУСК ПАЙПЛАЙНА ---
         recovery_processor = InterruptionRecoveryProcessor(context)
 
         pipeline = Pipeline(
@@ -755,17 +997,24 @@ async def handle_asterisk_conn(reader, writer):
 
         task = PipelineTask(
             pipeline,
-            params=PipelineParams(allow_interruptions=True, idle_timeout=20.0),
+            params=PipelineParams(
+                allow_interruptions=True, idle_timeout=20.0
+            ),
         )
         recovery_processor.task = task
+
         runner = PipelineRunner()
 
         company_name = client_data.get("company_name") or "companiei noastre"
 
+        # --- НАСТРОЙКА ПРИВЕТСТВИЯ В ЗАВИСИМОСТИ ОТ ТИПА ЗВОНКА ---
         if is_outbound:
-            purpose = outbound_info.get("call_purpose", "Confirmarea programării")
+            purpose = outbound_info.get(
+                "call_purpose", "Confirmarea programării"
+            )
             custom_context = outbound_info.get("custom_context", "")
 
+            # Добавляем в системный промпт цель исходящего звонка
             context.add_message(
                 {
                     "role": "system",
@@ -773,6 +1022,7 @@ async def handle_asterisk_conn(reader, writer):
                 }
             )
 
+            # Инициативное приветствие Григора
             greeting_prompt = (
                 "SYSTEM EVENT: Clientul a răspuns la apelul de ieșire. "
                 "ROSTEȘTE ACUM EXACT ACEASTĂ FRAZĂ, cuvânt cu cuvânt. Nu adăuga nimic altceva: "
@@ -780,6 +1030,7 @@ async def handle_asterisk_conn(reader, writer):
                 f"Vă sun cu privire la {purpose}. Vă este comod să vorbim puțin?' "
             )
         else:
+            # Стандартное приветствие для ВХОДЯЩИХ звонков
             greeting_prompt = (
                 "SYSTEM EVENT: Clientul s-a conectat. "
                 "ROSTEȘTE ACUM EXACT ACEASTĂ FRAZĂ, cuvânt cu cuvânt. Nu adăuga nimic altceva: "
@@ -802,28 +1053,35 @@ async def handle_asterisk_conn(reader, writer):
 
         if "context" in locals() and client_id:
             messages = context.messages
-            
+
             # --- ЗАЩИТА ОТ КОРОТКИХ ЗВОНКОВ: Считаем реальные ответы пользователя ---
             user_replies = [
-                m["content"] for m in messages 
-                if m.get("role") == "user" and "SYSTEM EVENT:" not in m.get("content", "")
+                m["content"]
+                for m in messages
+                if m.get("role") == "user"
+                and "SYSTEM EVENT:" not in m.get("content", "")
             ]
 
             full_transcript = ""
             for msg in messages:
-                if msg.get("role") in ["user", "assistant"] and msg.get("content"):
+                if msg.get("role") in ["user", "assistant"] and msg.get(
+                    "content"
+                ):
                     if "SYSTEM COMMAND:" not in msg["content"]:
                         role = "Client" if msg["role"] == "user" else "AI"
                         full_transcript += f"{role}: {msg['content']}\n"
 
             # ЕСЛИ ПОЛЬЗОВАТЕЛЬ НИЧЕГО НЕ ОТВЕТИЛ (или сбросил сразу):
             if len(user_replies) == 0:
-                print("⚠️ [ФИЛЬТР] Короткий звонок без ответа пользователя. Пропускаем Gemini.", flush=True)
+                print(
+                    "⚠️ [ФИЛЬТР] Короткий звонок без ответа пользователя. Пропускаем Gemini.",
+                    flush=True,
+                )
                 await send_final_report_to_n8n(
                     client_id=client_id,
                     end_client_name=client_name,
                     end_client_phone=target_phone,
-                    status="short_call",  # <-- Статус для n8n
+                    status="short_call",  # Статус для фильтра в n8n
                     transcript=full_transcript,
                     summary="{}",
                     audio_url="",
@@ -832,12 +1090,14 @@ async def handle_asterisk_conn(reader, writer):
             else:
                 # НОРМАЛЬНЫЙ ЗВОНОК С ДИАЛОГОМ:
                 summary = await generate_summary(full_transcript)
-                audio_url = await upload_audio_to_supabase(client_id, wav_filename)
+                audio_url = await upload_audio_to_supabase(
+                    client_id, wav_filename
+                )
                 await send_final_report_to_n8n(
                     client_id=client_id,
                     end_client_name=client_name,
                     end_client_phone=target_phone,
-                    status="completed",  # <-- Статус для n8n
+                    status="completed",  # Статус для фильтра в n8n
                     transcript=full_transcript,
                     summary=summary,
                     audio_url=audio_url,
