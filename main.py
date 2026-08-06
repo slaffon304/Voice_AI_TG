@@ -363,7 +363,7 @@ async def generate_summary(transcript: str) -> str:
         )
 
         response = await client.aio.models.generate_content(
-            model="gemini-2.5-pro",
+            model="gemini-3.6-flash",
             contents=prompt,
             config=genai.types.GenerateContentConfig(
                 response_mime_type="application/json",
