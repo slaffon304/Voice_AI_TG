@@ -535,7 +535,8 @@ async def get_client_uuid(
     sip_login_gsm: str = None,
     phone: str = None,
     ani: str = None,
-    from_hdr: str = None
+    from_hdr: str = None,
+    all_id: str = None
 ):
     if not sip_login and not sip_login_gsm:
         return Response(content="error", media_type="text/plain")
@@ -558,8 +559,8 @@ async def get_client_uuid(
             if data and isinstance(data, list) and len(data) > 0:
                 client_id_str = str(data[0].get("client_id"))
                 
-                # --- ИЗВЛЕКАЕМ НАСТОЯЩИЙ НОМЕР КЛИЕНТА (ИЗ FROM_HDR ИЛИ ANI) ---
-                real_phone = extract_real_phone(from_hdr, ani, phone)
+                # --- ИЗВЛЕКАЕМ НАСТОЯЩИЙ НОМЕР КЛИЕНТА (ИЗ ANI ИЛИ ALL_ID) ---
+                real_phone = extract_real_phone(ani, all_id, from_hdr, phone)
                 if real_phone != "Necunoscut":
                     INBOUND_CALLS_CACHE[client_id_str] = real_phone
                     print(f"📲 [INBOUND CACHE] Определен реальный номер {real_phone} pentru clinica {client_id_str}", flush=True)
