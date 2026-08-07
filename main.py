@@ -323,7 +323,7 @@ async def get_client_data(client_id: str):
 
 
 async def lookup_inbound_client_in_kommo(caller_phone: str) -> dict:
-    """Прямой поиск входящего номера в Kommo API (с защитой от невидимых символов în .env)"""
+    """Прямой поиск входящего номера в Kommo API (по последним 8 цифрам для 100% совпадения)"""
     if not KOMMO_SUBDOMAIN or not KOMMO_ACCESS_TOKEN or caller_phone == "Necunoscut":
         return {}
 
@@ -334,17 +334,20 @@ async def lookup_inbound_client_in_kommo(caller_phone: str) -> dict:
     if len(clean_phone) < 6:
         return {}
 
+    # Берём последние 8 цифр (например, 68536483), чтобы найти контакт как при записи 068536483, так и +37368536483
+    search_query = clean_phone[-8:] if len(clean_phone) >= 8 else clean_phone
+
     url = f"https://{subdomain}.kommo.com/api/v4/contacts"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
     params = {
-        "query": clean_phone,
+        "query": search_query,
         "with": "leads"
     }
 
-    print(f"🔍 [INBOUND KOMMO] Прямой поиск номера {clean_phone} în CRM...", flush=True)
+    print(f"🔍 [INBOUND KOMMO] Прямой поиск номера {search_query} (из {caller_phone}) в CRM...", flush=True)
 
     async with httpx.AsyncClient() as http_client:
         try:
@@ -379,7 +382,7 @@ async def lookup_inbound_client_in_kommo(caller_phone: str) -> dict:
                         "contact_id": contact.get("id")
                     }
             elif resp.status_code == 204:
-                print(f"ℹ️ [INBOUND KOMMO] Номер {clean_phone} nu a fost găsit în CRM (nou lead).", flush=True)
+                print(f"ℹ️ [INBOUND KOMMO] Номер {search_query} не найден в CRM (новый лид).", flush=True)
                 
         except httpx.TimeoutException:
             print("⚠️ [INBOUND KOMMO] Таймаут запроса к Kommo (>2.5с). Включаем Fallback.", flush=True)
@@ -555,8 +558,8 @@ async def get_client_uuid(
             if data and isinstance(data, list) and len(data) > 0:
                 client_id_str = str(data[0].get("client_id"))
                 
-                # --- ОПРЕДЕЛЯЕМ НАСТОЯЩИЙ НОМЕР КЛИЕНТА ---
-                real_phone = extract_real_phone(ani, from_hdr, phone)
+                # --- ИЗВЛЕКАЕМ НАСТОЯЩИЙ НОМЕР КЛИЕНТА (ИЗ FROM_HDR ИЛИ ANI) ---
+                real_phone = extract_real_phone(from_hdr, ani, phone)
                 if real_phone != "Necunoscut":
                     INBOUND_CALLS_CACHE[client_id_str] = real_phone
                     print(f"📲 [INBOUND CACHE] Определен реальный номер {real_phone} pentru clinica {client_id_str}", flush=True)
