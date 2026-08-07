@@ -137,7 +137,6 @@ class UserAudioCatcher(FrameProcessor):
 
         if isinstance(frame, InputAudioRawFrame):
             self.mixer.add_user_audio(frame)
-        # Ловим сигнал перебивания и стираем фантомные слова из записи
         elif isinstance(frame, (CancelFrame, InterruptionFrame)):
             self.mixer.clear_ai_buffer()
 
@@ -167,8 +166,6 @@ class AsteriskWSAdapter:
         self.application_state = WebSocketState.CONNECTED
         self.in_state = None
         self.out_state = None
-
-        # Оптимизированный таймер без накопления погрешности
         self.next_send_time = time.time()
 
     async def accept(self):
@@ -184,7 +181,6 @@ class AsteriskWSAdapter:
             pass
 
     async def receive_bytes(self):
-        """Звук от клиента (Asterisk -> ИИ)"""
         try:
             header = await self.reader.readexactly(3)
             p_len = int.from_bytes(header[1:], byteorder="big")
@@ -210,23 +206,17 @@ class AsteriskWSAdapter:
             return {"type": "websocket.disconnect", "code": 1000}
 
     async def send_bytes(self, data):
-        """Плавная отправка (Pacing) без заиканий для RTP-канала"""
         if self.client_state != WebSocketState.CONNECTED:
             return
         try:
-            # 1. Мягкое снижение амплитуды (защита от клиппинга)
             softened_data = audioop.mul(data, 2, 0.75)
-
-            # 2. Ресемплинг 24000 -> 8000 Гц
             resampled, self.out_state = audioop.ratecv(
                 softened_data, 2, 1, 24000, 8000, self.out_state
             )
 
-            # 3. Точный расчет длительности чанка (16000 байт/сек для 8kHz 16bit)
             audio_duration = len(resampled) / 16000.0
             now = time.time()
 
-            # Если бот молчал и таймер отстал — сбрасываем к текущему времени
             if self.next_send_time < now:
                 self.next_send_time = now
 
@@ -236,7 +226,6 @@ class AsteriskWSAdapter:
 
             self.next_send_time += audio_duration
 
-            # Отправка в AudioSocket
             header = b"\x10" + len(resampled).to_bytes(2, byteorder="big")
             self.writer.write(header + resampled)
             await self.writer.drain()
@@ -252,8 +241,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Кэш активных исходящих звонков: call_uuid -> dict с данными клиента
+# Кэш активных исходящих звонков: call_uuid -> dict
 OUTBOUND_CALLS_CACHE = {}
+
+# Кэш входящих номеров: client_id -> caller_phone
+INBOUND_CALLS_CACHE = {}
 
 
 # --- 1. ФУНКЦИИ БАЗЫ ДАННЫХ, CRM И УВЕДОМЛЕНИЙ ---
@@ -267,7 +259,6 @@ async def get_client_data(client_id: str):
 
     clean_url = SUPABASE_URL.replace("/rest/v1", "").rstrip("/")
 
-    # Запрашиваем saas_projects через JOIN
     url = f"{clean_url}/rest/v1/saas_clients?id=eq.{client_id}&select=company_name,business_context,tone,bot_goal,subscription_status_assistent,system_message,saas_projects(tg_chat_id_notify,google_calendar_id)"
     headers = {
         "apikey": SUPABASE_KEY,
@@ -286,13 +277,10 @@ async def get_client_data(client_id: str):
                 print(f"❌ ПОДРОБНОСТИ ОТ SUPABASE: {response.text}", flush=True)
 
             response.raise_for_status()
-
             data = response.json()
 
             if len(data) > 0:
                 client_record = data[0]
-
-                # Распаковка из списка проектов
                 projects = client_record.get("saas_projects", [])
                 if projects and len(projects) > 0:
                     client_record["tg_chat_id_notify"] = projects[0].get(
@@ -322,7 +310,7 @@ async def get_client_data(client_id: str):
 
 
 async def lookup_inbound_client_in_kommo(caller_phone: str) -> dict:
-    """Прямой поиск входящего номера в Kommo API (без посредников в виде n8n)"""
+    """Прямой поиск входящего номера в Kommo API (без посредников)"""
     if not KOMMO_SUBDOMAIN or not KOMMO_ACCESS_TOKEN or caller_phone == "Necunoscut":
         return {}
 
@@ -386,7 +374,6 @@ async def lookup_inbound_client_in_kommo(caller_phone: str) -> dict:
 
 
 async def send_tg_alert(chat_id: str, message: str):
-    """Отправляет уведомление об ошибке в ТГ клиенту (или администратору)"""
     if not TG_BOT_TOKEN or not chat_id:
         print(
             "⚠️ Notificare TG anulată: lipsește token-ul sau chat_id-ul.",
@@ -409,7 +396,6 @@ async def send_tg_alert(chat_id: str, message: str):
 
 
 async def generate_summary(transcript: str) -> str:
-    """Генерирует саммари с анализом в формате JSON."""
     if not transcript or len(transcript.strip()) < 10:
         return "{}"
 
@@ -497,7 +483,6 @@ async def send_final_report_to_n8n(
     audio_url: str,
     system_instructions_length: int,
 ):
-    """Отправляет итоговый отчет в n8n webhook."""
     payload = {
         "client_id": client_id,
         "end_client_name": end_client_name,
@@ -526,17 +511,17 @@ async def send_final_report_to_n8n(
 
 # --- 2. ЭНДПОИНТ ДЛЯ ASTERISK (GET UUID) ---
 @app.get("/get_uuid")
-async def get_client_uuid(sip_login: str = None, sip_login_gsm: str = None):
-    # Защита: если Asterisk дернул эндпоинт без параметров
+async def get_client_uuid(
+    sip_login: str = None, 
+    sip_login_gsm: str = None,
+    phone: str = None
+):
     if not sip_login and not sip_login_gsm:
         return Response(content="error", media_type="text/plain")
 
     clean_url = SUPABASE_URL.replace("/rest/v1", "").rstrip("/")
-
-    # Определяем универсальный идентификатор из параметров
     identifier = sip_login_gsm if sip_login_gsm else sip_login
 
-    # Ищем client_id в новой таблице bot_channels
     url = f"{clean_url}/rest/v1/bot_channels?identifier=eq.{identifier}&select=client_id"
     headers = {
         "apikey": SUPABASE_KEY,
@@ -550,8 +535,15 @@ async def get_client_uuid(sip_login: str = None, sip_login_gsm: str = None):
             data = resp.json()
 
             if data and isinstance(data, list) and len(data) > 0:
+                client_id_str = str(data[0].get("client_id"))
+                
+                # --- СОХРАНЯЕМ НОМЕР ЗВОНЯЩЕГО В КЭШ ---
+                if phone:
+                    INBOUND_CALLS_CACHE[client_id_str] = phone
+                    print(f"📲 [INBOUND CACHE] Запомнили номер {phone} для клиники {client_id_str}", flush=True)
+
                 return Response(
-                    content=str(data[0].get("client_id")),
+                    content=client_id_str,
                     media_type="text/plain",
                 )
 
@@ -572,10 +564,8 @@ class OutboundCallRequest(BaseModel):
 
 @app.post("/api/dial")
 async def initiate_outbound_call(req: OutboundCallRequest):
-    # 1. Генерируем уникальный UUID для AudioSocket
     call_uuid = str(uuid.uuid4())
 
-    # 2. Сохраняем контекст звонка в память с учетом языка
     OUTBOUND_CALLS_CACHE[call_uuid] = {
         "client_id": req.client_id,
         "target_phone": req.target_phone,
@@ -590,7 +580,6 @@ async def initiate_outbound_call(req: OutboundCallRequest):
         flush=True,
     )
 
-    # 3. Отправляем HTTP POST в Asterisk ARI
     ari_url = "http://187.77.69.233:8088/ari/channels"
 
     payload = {
@@ -653,10 +642,8 @@ class InterruptionRecoveryProcessor(FrameProcessor):
             pass
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        # 1. ОБЯЗАТЕЛЬНО вызываем super() для внутренней регистрации StartFrame в Pipecat
         await super().process_frame(frame, direction)
 
-        # 2. Наша логика таймера
         if isinstance(frame, InterruptionFrame):
             self.is_interrupted = True
             if self.recovery_task:
@@ -670,7 +657,6 @@ class InterruptionRecoveryProcessor(FrameProcessor):
                 self.recovery_task.cancel()
             self.is_interrupted = False
 
-        # 3. Проталкиваем аудио и другие фреймы дальше
         await self.push_frame(frame, direction)
 
 
@@ -701,7 +687,6 @@ async def handle_asterisk_conn(reader, writer):
             writer.close()
             return
 
-        # --- ДИНАМИЧЕСКОЕ ОПРЕДЕЛЕНИЕ ТИПА ЗВОНКА И НАСТОЯЩЕГО CLIENT_ID ---
         is_outbound = False
         outbound_info = {}
         inbound_crm_data = {}
@@ -719,9 +704,11 @@ async def handle_asterisk_conn(reader, writer):
             )
         else:
             client_id = session_uuid
-            print(f"📞 [INBOUND] Входящий звонок. client_id: {client_id}", flush=True)
             
-            # --- ПРЯМОЙ ЗАПРОС В KOMMO CRM БЕЗ N8N ---
+            # --- ДОСТАЕМ НОМЕР ИЗ КЭША И ИЩЕМ В KOMMO ---
+            target_phone = INBOUND_CALLS_CACHE.pop(client_id, "Necunoscut")
+            print(f"📞 [INBOUND] Входящий звонок. client_id: {client_id}, номер: {target_phone}", flush=True)
+            
             inbound_crm_data = await lookup_inbound_client_in_kommo(target_phone)
             if inbound_crm_data.get("found"):
                 client_name = inbound_crm_data.get("name") or "client"
@@ -921,8 +908,8 @@ async def handle_asterisk_conn(reader, writer):
                 voice="Enceladus",
                 system_instruction=system_prompt,
                 vad=GeminiVADParams(
-                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,  # Игнорируем шумы сотовой сети
-                    silence_duration_ms=1000,  # Даем клиенту 1 секунду на паузы между словами
+                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+                    silence_duration_ms=1000,
                 ),
             ),
         )
@@ -1057,7 +1044,6 @@ async def handle_asterisk_conn(reader, writer):
         user_catcher = UserAudioCatcher(audio_mixer)
         ai_catcher = AIAudioCatcher(audio_mixer)
 
-        # --- ЗАПУСК ПАЙПЛАЙНА ---
         recovery_processor = InterruptionRecoveryProcessor(context)
 
         pipeline = Pipeline(
@@ -1085,7 +1071,6 @@ async def handle_asterisk_conn(reader, writer):
 
         company_name = client_data.get("company_name") or "Compania noastră"
 
-        # --- НАСТРОЙКА ПРИВЕТСТВИЯ В ЗАВИСИМОСТИ ОТ ТИПА ЗВОНКА И ЯЗЫКА ---
         if is_outbound:
             purpose = outbound_info.get(
                 "call_purpose", "Confirmarea programării"
@@ -1112,7 +1097,6 @@ async def handle_asterisk_conn(reader, writer):
                     f"'Bună ziua, {client_name}! Stomatologia {company_name}. Vă reamintesc de programarea de mâine: {purpose}. Rămâne valabil?' "
                 )
         else:
-            # Приветствие для ВХОДЯЩИХ звонков (с учетом данных из Kommo)
             if inbound_crm_data.get("found"):
                 if lang == "ru":
                     greeting_prompt = (
