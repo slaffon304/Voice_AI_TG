@@ -310,17 +310,21 @@ async def get_client_data(client_id: str):
 
 
 async def lookup_inbound_client_in_kommo(caller_phone: str) -> dict:
-    """Прямой поиск входящего номера в Kommo API (без посредников)"""
+    """Прямой поиск входящего номера в Kommo API (с защитой от невидимых символов в .env)"""
     if not KOMMO_SUBDOMAIN or not KOMMO_ACCESS_TOKEN or caller_phone == "Necunoscut":
         return {}
 
-    clean_phone = "".join(filter(str.isdigit, caller_phone))
+    # Очищаем subdomain и токен от любых невидимых Unicode-символов (\u200e и др.), попавших при копировании в .env
+    subdomain = KOMMO_SUBDOMAIN.encode("ascii", "ignore").decode("ascii").strip()
+    token = KOMMO_ACCESS_TOKEN.encode("ascii", "ignore").decode("ascii").strip()
+
+    clean_phone = "".join(filter(str.isdigit, str(caller_phone)))
     if len(clean_phone) < 6:
         return {}
 
-    url = f"https://{KOMMO_SUBDOMAIN}.kommo.com/api/v4/contacts"
+    url = f"https://{subdomain}.kommo.com/api/v4/contacts"
     headers = {
-        "Authorization": f"Bearer {KOMMO_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
     params = {
