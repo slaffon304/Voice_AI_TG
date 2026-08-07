@@ -45,14 +45,12 @@ import pytz
 from starlette.websockets import WebSocketState
 from supabase import Client, create_client
 
-# Ключи доступа и URL вебхуков из переменных окружения
+# Ключи доступа и переменные окружения
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
-N8N_INBOUND_LOOKUP_URL = os.getenv(
-    "N8N_INBOUND_LOOKUP_URL",
-    "https://n8n.labupgrade.in/webhook/inbound-lookup"
-)
+KOMMO_SUBDOMAIN = os.getenv("KOMMO_SUBDOMAIN")
+KOMMO_ACCESS_TOKEN = os.getenv("KOMMO_ACCESS_TOKEN")
 
 
 class RawPCMFrameSerializer(FrameSerializer):
@@ -323,35 +321,68 @@ async def get_client_data(client_id: str):
             return None
 
 
-async def lookup_inbound_client_in_crm(client_id: str, caller_phone: str) -> dict:
-    """Проверяет номер входящего звонка в Kommo через вебхук n8n перед ответом"""
-    if not N8N_INBOUND_LOOKUP_URL or caller_phone == "Necunoscut":
+async def lookup_inbound_client_in_kommo(caller_phone: str) -> dict:
+    """Прямой поиск входящего номера в Kommo API (без посредников в виде n8n)"""
+    if not KOMMO_SUBDOMAIN or not KOMMO_ACCESS_TOKEN or caller_phone == "Necunoscut":
         return {}
 
-    print(
-        f"🔍 [INBOUND CRM] Проверяем номер {caller_phone} в Kommo для клиники {client_id}...",
-        flush=True,
-    )
+    clean_phone = "".join(filter(str.isdigit, caller_phone))
+    if len(clean_phone) < 6:
+        return {}
+
+    url = f"https://{KOMMO_SUBDOMAIN}.kommo.com/api/v4/contacts"
+    headers = {
+        "Authorization": f"Bearer {KOMMO_ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    params = {
+        "query": clean_phone,
+        "with": "leads"
+    }
+
+    print(f"🔍 [INBOUND KOMMO] Прямой поиск номера {clean_phone} в CRM...", flush=True)
+
     async with httpx.AsyncClient() as http_client:
         try:
-            resp = await http_client.get(
-                N8N_INBOUND_LOOKUP_URL,
-                params={"client_id": client_id, "phone": caller_phone},
-                timeout=3.0,
-            )
+            resp = await http_client.get(url, headers=headers, params=params, timeout=2.5)
+            
             if resp.status_code == 200:
-                crm_data = resp.json()
-                print(
-                    f"✅ [INBOUND CRM] Результат из Kommo: {crm_data}",
-                    flush=True,
-                )
-                return crm_data
+                data = resp.json()
+                contacts = data.get("_embedded", {}).get("contacts", [])
+                
+                if contacts and len(contacts) > 0:
+                    contact = contacts[0]
+                    client_name = contact.get("name") or "client"
+                    
+                    lang = "ro"
+                    custom_fields = contact.get("custom_fields_values") or []
+                    for f in custom_fields:
+                        code = str(f.get("field_code") or "").upper()
+                        name = str(f.get("field_name") or "").lower()
+                        if code == "LANG" or "язык" in name or "limba" in name or "lang" in name:
+                            val = str(f.get("values", [{}])[0].get("value", "")).lower()
+                            if "ru" in val or "рус" in val:
+                                lang = "ru"
+                            elif "ro" in val or "rom" in val or "md" in val:
+                                lang = "ro"
+                            break
+
+                    print(f"✅ [INBOUND KOMMO] Найден клиент: {client_name} (lang: {lang})", flush=True)
+                    return {
+                        "found": True,
+                        "name": client_name,
+                        "lang": lang,
+                        "contact_id": contact.get("id")
+                    }
+            elif resp.status_code == 204:
+                print(f"ℹ️ [INBOUND KOMMO] Номер {clean_phone} не найден в базе (новый лид).", flush=True)
+                
+        except httpx.TimeoutException:
+            print("⚠️ [INBOUND KOMMO] Таймаут запроса к Kommo (>2.5с). Включаем Fallback.", flush=True)
         except Exception as e:
-            print(
-                f"⚠️ Ошибка запроса входящего контекста из n8n: {e}",
-                flush=True,
-            )
-    return {}
+            print(f"⚠️ [INBOUND KOMMO] Ошибка запроса к Kommo API: {e}", flush=True)
+
+    return {"found": False}
 
 
 async def send_tg_alert(chat_id: str, message: str):
@@ -689,8 +720,9 @@ async def handle_asterisk_conn(reader, writer):
         else:
             client_id = session_uuid
             print(f"📞 [INBOUND] Входящий звонок. client_id: {client_id}", flush=True)
-            # Перед ответом на входящий запрашиваем CRM в n8n по номеру телефона
-            inbound_crm_data = await lookup_inbound_client_in_crm(client_id, target_phone)
+            
+            # --- ПРЯМОЙ ЗАПРОС В KOMMO CRM БЕЗ N8N ---
+            inbound_crm_data = await lookup_inbound_client_in_kommo(target_phone)
             if inbound_crm_data.get("found"):
                 client_name = inbound_crm_data.get("name") or "client"
                 lang = str(inbound_crm_data.get("lang", "ro")).lower().strip()
@@ -1060,7 +1092,6 @@ async def handle_asterisk_conn(reader, writer):
             )
             custom_context = outbound_info.get("custom_context", "")
 
-            # Добавляем в системный промпт цель исходящего звонка
             context.add_message(
                 {
                     "role": "system",
@@ -1068,7 +1099,6 @@ async def handle_asterisk_conn(reader, writer):
                 }
             )
 
-            # Инициативное приветствие Григора по снайперскому стандарту и на нужном языке
             if lang == "ru":
                 greeting_prompt = (
                     "SYSTEM EVENT: Клиент ответил на исходящий звонок. "
@@ -1082,24 +1112,21 @@ async def handle_asterisk_conn(reader, writer):
                     f"'Bună ziua, {client_name}! Stomatologia {company_name}. Vă reamintesc de programarea de mâine: {purpose}. Rămâne valabil?' "
                 )
         else:
-            # Приветствие для ВХОДЯЩИХ звонков (с учетом данных из CRM)
+            # Приветствие для ВХОДЯЩИХ звонков (с учетом данных из Kommo)
             if inbound_crm_data.get("found"):
-                stage = inbound_crm_data.get("stage", "")
-                appointment = inbound_crm_data.get("time", "")
                 if lang == "ru":
                     greeting_prompt = (
                         "SYSTEM EVENT: Клиент подключился на входящую линию. "
                         "ПРОИЗНЕСИ СЕЙЧАС РОВНО ЭТУ ФРАЗУ, слово в слово. Ничего не добавляй от себя: "
-                        f"'Здравствуйте, {client_name}! Клиника {company_name}. Вы звоните по поводу записи {appointment} или у вас другой вопрос?' "
+                        f"'Здравствуйте, {client_name}! Клиника {company_name}. Вы звоните по поводу записи или у вас другой вопрос?' "
                     )
                 else:
                     greeting_prompt = (
                         "SYSTEM EVENT: Clientul s-a conectat pe linia de intrare. "
                         "ROSTEȘTE ACUM EXACT ACEASTĂ FRAZĂ, cuvânt cu cuvânt. Nu adăuga nimic altceva: "
-                        f"'Bună ziua, {client_name}! Clinica {company_name}. Sunați în legătură cu programarea {appointment} sau aveți altă întrebare?' "
+                        f"'Bună ziua, {client_name}! Clinica {company_name}. Sunați în legătură cu programarea sau aveți altă întrebare?' "
                     )
             else:
-                # Стандартное приветствие для неизвестного номера
                 if lang == "ru":
                     greeting_prompt = (
                         "SYSTEM EVENT: Клиент подключился. "
@@ -1129,7 +1156,6 @@ async def handle_asterisk_conn(reader, writer):
         if "context" in locals() and client_id:
             messages = context.messages
 
-            # --- ЗАЩИТА ОТ КОРОТКИХ ЗВОНКОВ: Считаем реальные ответы пользователя ---
             user_replies = [
                 m["content"]
                 for m in messages
@@ -1146,7 +1172,6 @@ async def handle_asterisk_conn(reader, writer):
                         role = "Client" if msg["role"] == "user" else "AI"
                         full_transcript += f"{role}: {msg['content']}\n"
 
-            # ЕСЛИ ПОЛЬЗОВАТЕЛЬ НИЧЕГО НЕ ОТВЕТИЛ (или сбросил сразу):
             if len(user_replies) == 0:
                 print(
                     "⚠️ [ФИЛЬТР] Короткий звонок без ответа пользователя. Пропускаем Gemini.",
@@ -1156,14 +1181,13 @@ async def handle_asterisk_conn(reader, writer):
                     client_id=client_id,
                     end_client_name=client_name,
                     end_client_phone=target_phone,
-                    status="short_call",  # Статус для фильтра в n8n
+                    status="short_call",
                     transcript=full_transcript,
                     summary="{}",
                     audio_url="",
                     system_instructions_length=system_instructions_length,
                 )
             else:
-                # НОРМАЛЬНЫЙ ЗВОНОК С ДИАЛОГОМ:
                 summary = await generate_summary(full_transcript)
                 audio_url = await upload_audio_to_supabase(
                     client_id, wav_filename
@@ -1172,7 +1196,7 @@ async def handle_asterisk_conn(reader, writer):
                     client_id=client_id,
                     end_client_name=client_name,
                     end_client_phone=target_phone,
-                    status="completed",  # Статус для фильтра в n8n
+                    status="completed",
                     transcript=full_transcript,
                     summary=summary,
                     audio_url=audio_url,
