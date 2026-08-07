@@ -45,10 +45,14 @@ import pytz
 from starlette.websockets import WebSocketState
 from supabase import Client, create_client
 
-# Ключи доступа
+# Ключи доступа и URL вебхуков из переменных окружения
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
+N8N_INBOUND_LOOKUP_URL = os.getenv(
+    "N8N_INBOUND_LOOKUP_URL",
+    "https://n8n.labupgrade.in/webhook/inbound-lookup"
+)
 
 
 class RawPCMFrameSerializer(FrameSerializer):
@@ -254,7 +258,7 @@ app.add_middleware(
 OUTBOUND_CALLS_CACHE = {}
 
 
-# --- 1. ФУНКЦИИ БАЗЫ ДАННЫХ И УВЕДОМЛЕНИЙ ---
+# --- 1. ФУНКЦИИ БАЗЫ ДАННЫХ, CRM И УВЕДОМЛЕНИЙ ---
 async def get_client_data(client_id: str):
     if not SUPABASE_URL or not SUPABASE_KEY:
         print(
@@ -317,6 +321,37 @@ async def get_client_data(client_id: str):
         except Exception as e:
             print(f"❌ ОШИБКА СВЯЗИ С SUPABASE: {e}", flush=True)
             return None
+
+
+async def lookup_inbound_client_in_crm(client_id: str, caller_phone: str) -> dict:
+    """Проверяет номер входящего звонка в Kommo через вебхук n8n перед ответом"""
+    if not N8N_INBOUND_LOOKUP_URL or caller_phone == "Necunoscut":
+        return {}
+
+    print(
+        f"🔍 [INBOUND CRM] Проверяем номер {caller_phone} в Kommo для клиники {client_id}...",
+        flush=True,
+    )
+    async with httpx.AsyncClient() as http_client:
+        try:
+            resp = await http_client.get(
+                N8N_INBOUND_LOOKUP_URL,
+                params={"client_id": client_id, "phone": caller_phone},
+                timeout=3.0,
+            )
+            if resp.status_code == 200:
+                crm_data = resp.json()
+                print(
+                    f"✅ [INBOUND CRM] Результат из Kommo: {crm_data}",
+                    flush=True,
+                )
+                return crm_data
+        except Exception as e:
+            print(
+                f"⚠️ Ошибка запроса входящего контекста из n8n: {e}",
+                flush=True,
+            )
+    return {}
 
 
 async def send_tg_alert(chat_id: str, message: str):
@@ -501,6 +536,7 @@ class OutboundCallRequest(BaseModel):
     client_name: str = "client"
     call_purpose: str = "Confirmarea programării"
     custom_context: str = ""
+    lang: str = "ro"
 
 
 @app.post("/api/dial")
@@ -508,17 +544,18 @@ async def initiate_outbound_call(req: OutboundCallRequest):
     # 1. Генерируем уникальный UUID для AudioSocket
     call_uuid = str(uuid.uuid4())
 
-    # 2. Сохраняем контекст звонка в память
+    # 2. Сохраняем контекст звонка в память с учетом языка
     OUTBOUND_CALLS_CACHE[call_uuid] = {
         "client_id": req.client_id,
         "target_phone": req.target_phone,
         "client_name": req.client_name,
         "call_purpose": req.call_purpose,
         "custom_context": req.custom_context,
+        "lang": req.lang.lower().strip(),
     }
 
     print(
-        f"📞 [OUTBOUND] Создана задача звонка {call_uuid} -> {req.target_phone} ({req.client_name})",
+        f"📞 [OUTBOUND] Создана задача звонка {call_uuid} -> {req.target_phone} ({req.client_name}, lang={req.lang})",
         flush=True,
     )
 
@@ -576,7 +613,7 @@ class InterruptionRecoveryProcessor(FrameProcessor):
                 self.context.add_message(
                     {
                         "role": "system",
-                        "content": "SYSTEM COMMAND: The user interrupted you but then went silent. Softly and elegantly take the initiative back. Say something like: 'Scuzați, cred că nu v-am auzit clar. Să continui de unde am rămas?'",
+                        "content": "SYSTEM COMMAND: The user interrupted you but then went silent. Softly and concisely take the initiative back: 'Scuzați, cred că s-a întrerupt. Să continui?'",
                     }
                 )
                 await self.task.queue_frames([LLMRunFrame()])
@@ -614,7 +651,8 @@ async def handle_asterisk_conn(reader, writer):
     system_instructions_length = 0
     client_id = None
     target_phone = "Necunoscut"
-    client_name = "Necunoscut"
+    client_name = "client"
+    lang = "ro"
 
     try:
         header = await reader.readexactly(3)
@@ -635,20 +673,27 @@ async def handle_asterisk_conn(reader, writer):
         # --- ДИНАМИЧЕСКОЕ ОПРЕДЕЛЕНИЕ ТИПА ЗВОНКА И НАСТОЯЩЕГО CLIENT_ID ---
         is_outbound = False
         outbound_info = {}
+        inbound_crm_data = {}
 
         if session_uuid in OUTBOUND_CALLS_CACHE:
             is_outbound = True
             outbound_info = OUTBOUND_CALLS_CACHE.pop(session_uuid)
             client_id = outbound_info.get("client_id")
             target_phone = outbound_info.get("target_phone", "Necunoscut")
-            client_name = outbound_info.get("client_name", "Necunoscut")
+            client_name = outbound_info.get("client_name", "client")
+            lang = outbound_info.get("lang", "ro").lower()
             print(
-                f"📞 [OUTBOUND] Распознана задача исходящего звонка. Настоящий client_id: {client_id}",
+                f"📞 [OUTBOUND] Распознана задача исходящего звонка. Настоящий client_id: {client_id}, lang: {lang}",
                 flush=True,
             )
         else:
             client_id = session_uuid
             print(f"📞 [INBOUND] Входящий звонок. client_id: {client_id}", flush=True)
+            # Перед ответом на входящий запрашиваем CRM в n8n по номеру телефона
+            inbound_crm_data = await lookup_inbound_client_in_crm(client_id, target_phone)
+            if inbound_crm_data.get("found"):
+                client_name = inbound_crm_data.get("name") or "client"
+                lang = str(inbound_crm_data.get("lang", "ro")).lower().strip()
 
         client_data = await get_client_data(client_id)
         if not client_data:
@@ -704,14 +749,15 @@ async def handle_asterisk_conn(reader, writer):
             "{office_status}", office_status or ""
         )
 
-        behavior_rules = """
+        behavior_rules = f"""
     \n\nREGULI STRICTE DE CONVERSAȚIE (URMEAZĂ-LE CU STRICTEȚE):
-    0. STILUL TĂU DE CONVERSAȚIE: Vorbește harizmatic, prietenos și emoțional. Folosește narativă și accent limbei in care răspunzi.
-    1. LIMBA: Răspunde MEREU în limba clientului. Dacă primul cuvânt este scurt, distorsionat sau nu ești sigur de limbă (ex: se aude doar zgomot sau un scurt "alo"/"bună"), folosește IMPLICIT limba Română.
-    2. PAUZELE: Dacă pui o întrebare de confirmare (ex: "Corect?", "Sunteți de acord?", "Verific?"), OPREȘTE-TE imediat din vorbit și așteaptă răspunsul clientului. NU continua fraza și NU apela nicio funcție până nu auzi răspunsul.
-    3. FĂRĂ HALUCINAȚII LA ID-URI: Pentru acțiunile 'reschedule' sau 'cancel', folosește STRICT event_id real returnat de webhook-ul 'lookup'. ESTE STRICT INTERZIS să inventezi ID-uri de test precum "event_123456". Dacă nu ai primit încă ID-ul real de la sistem, AȘTEAPTĂ! Nu apela 'reschedule' în orb.
-    4. REACȚIA LA ÎNTRERUPERI: Dacă ești întrerupt de client cu un sunet scurt ("Da", "Aha") sau zgomot, iar apoi tace: NU întreba sec "Sunteți aici?" sau "Vă ascult?". Fii elegant și contextual. Spune cu o voce caldă: "Scuzați, cred că nu v-am auzit bine. Să continui de unde am rămas?" sau "Cred că s-a întrerupt puțin, revin la ideea anterioară?".
-    5. TRIMITEREA SMS: Când clientul cere adresa, detalii sau confirmarea programării prin SMS, folosește funcția 'send_sms'. Întreabă sau confirmă numărul de telefon înainte de a trimite, dacă nu ești sigur de el. Nu adăuga emoticoane în textul SMS. 
+    0. STILUL TĂU DE CONVERSAȚIE (SNIPER STANDARD): Vorbește EXTREM de scurt, clar și strict la subiect (1 scurtă propoziție per replică). ESTE STRICT INTERZIS să folosești formule lungi de politețe, să îți ceri scuze ("vă deranjez", "scuzați") sau să întrebi dacă este comod de vorbit.
+    1. LIMBA (CRITIC): Vei conduce dialogul STRICT în limba setată pentru acest apel ('{lang}'). Dacă limba este 'ru', vorbește pur în rusă. Dacă limba este 'ro', vorbește pur în română. Nu schimba limba decât dacă clientul ți se adresează clar în altă limbă.
+    2. REGULA PENTRU CONFIRMAREA PROGRAMĂRII: Imediat ce clientul confirmă programarea cu "Da" / "Да" / "Sigur", NU repeta detaliile programării! Spune DOAR o scurtă frază de rămas-bun ("Perfect, vă așteptăm mâine! O zi frumoasă!" sau "Отлично, ждём вас завтра! Хорошего дня!") și oprește-te complet din vorbit.
+    3. PAUZELE: Dacă pui o întrebare de confirmare, OPREȘTE-TE imediat din vorbit și așteaptă răspunsul clientului. NU continua fraza.
+    4. FĂRĂ HALUCINAȚII LA ID-URI: Pentru acțiunile 'reschedule' sau 'cancel', folosește STRICT event_id real returnat de webhook-ul 'lookup'. ESTE STRICT INTERZIS să inventezi ID-uri de test.
+    5. REACȚIA LA ÎNTRERUPERI: Dacă ești întrerupt de client, revino scurt la subiect fără formulări lungi.
+    6. TRIMITEREA SMS: Când clientul cere adresa, detalii sau confirmarea programării prin SMS, folosește funcția 'send_sms'. Nu adăuga emoticoane în textul SMS. 
      """
 
         system_prompt += behavior_rules
@@ -1005,9 +1051,9 @@ async def handle_asterisk_conn(reader, writer):
 
         runner = PipelineRunner()
 
-        company_name = client_data.get("company_name") or "companiei noastre"
+        company_name = client_data.get("company_name") or "Compania noastră"
 
-        # --- НАСТРОЙКА ПРИВЕТСТВИЯ В ЗАВИСИМОСТИ ОТ ТИПА ЗВОНКА ---
+        # --- НАСТРОЙКА ПРИВЕТСТВИЯ В ЗАВИСИМОСТИ ОТ ТИПА ЗВОНКА И ЯЗЫКА ---
         if is_outbound:
             purpose = outbound_info.get(
                 "call_purpose", "Confirmarea programării"
@@ -1022,21 +1068,50 @@ async def handle_asterisk_conn(reader, writer):
                 }
             )
 
-            # Инициативное приветствие Григора
-            greeting_prompt = (
-                "SYSTEM EVENT: Clientul a răspuns la apelul de ieșire. "
-                "ROSTEȘTE ACUM EXACT ACEASTĂ FRAZĂ, cuvânt cu cuvânt. Nu adăuga nimic altceva: "
-                f"'Bună ziua, {client_name}! Vă deranjez de la {company_name}, sunt asistentul digital Grigorii. "
-                f"Vă sun cu privire la {purpose}. Vă este comod să vorbim puțin?' "
-            )
+            # Инициативное приветствие Григора по снайперскому стандарту и на нужном языке
+            if lang == "ru":
+                greeting_prompt = (
+                    "SYSTEM EVENT: Клиент ответил на исходящий звонок. "
+                    "ПРОИЗНЕСИ СЕЙЧАС РОВНО ЭТУ ФРАЗУ, слово в слово. Ничего не добавляй от себя, не извиняйся и не спрашивай удобно ли говорить: "
+                    f"'Здравствуйте, {client_name}! Стоматология {company_name}. Напоминаю о записи на завтра: {purpose}. Всё в силе?' "
+                )
+            else:
+                greeting_prompt = (
+                    "SYSTEM EVENT: Clientul a răspuns la apelul de ieșire. "
+                    "ROSTEȘTE ACUM EXACT ACEASTĂ FRAZĂ, cuvânt cu cuvânt. Nu adăuga nimic altceva, nu îți cere scuze și nu întreba dacă e comod: "
+                    f"'Bună ziua, {client_name}! Stomatologia {company_name}. Vă reamintesc de programarea de mâine: {purpose}. Rămâne valabil?' "
+                )
         else:
-            # Стандартное приветствие для ВХОДЯЩИХ звонков
-            greeting_prompt = (
-                "SYSTEM EVENT: Clientul s-a conectat. "
-                "ROSTEȘTE ACUM EXACT ACEASTĂ FRAZĂ, cuvânt cu cuvânt. Nu adăuga nimic altceva: "
-                f"'Bună ziua. Pentru a asigura calitatea serviciilor, acest apel poate fi înregistrat. "
-                f"Sunt Grigorii, asistentul digital al {company_name}. Cu ce vă pot ajuta?' "
-            )
+            # Приветствие для ВХОДЯЩИХ звонков (с учетом данных из CRM)
+            if inbound_crm_data.get("found"):
+                stage = inbound_crm_data.get("stage", "")
+                appointment = inbound_crm_data.get("time", "")
+                if lang == "ru":
+                    greeting_prompt = (
+                        "SYSTEM EVENT: Клиент подключился на входящую линию. "
+                        "ПРОИЗНЕСИ СЕЙЧАС РОВНО ЭТУ ФРАЗУ, слово в слово. Ничего не добавляй от себя: "
+                        f"'Здравствуйте, {client_name}! Клиника {company_name}. Вы звоните по поводу записи {appointment} или у вас другой вопрос?' "
+                    )
+                else:
+                    greeting_prompt = (
+                        "SYSTEM EVENT: Clientul s-a conectat pe linia de intrare. "
+                        "ROSTEȘTE ACUM EXACT ACEASTĂ FRAZĂ, cuvânt cu cuvânt. Nu adăuga nimic altceva: "
+                        f"'Bună ziua, {client_name}! Clinica {company_name}. Sunați în legătură cu programarea {appointment} sau aveți altă întrebare?' "
+                    )
+            else:
+                # Стандартное приветствие для неизвестного номера
+                if lang == "ru":
+                    greeting_prompt = (
+                        "SYSTEM EVENT: Клиент подключился. "
+                        "ПРОИЗНЕСИ СЕЙЧАС РОВНО ЭТУ ФРАЗУ, слово в слово. Ничего не добавляй от себя: "
+                        f"'Здравствуйте! Клиника {company_name}. Чем могу помочь?' "
+                    )
+                else:
+                    greeting_prompt = (
+                        "SYSTEM EVENT: Clientul s-a conectat. "
+                        "ROSTEȘTE ACUM EXACT ACEASTĂ FRAZĂ, cuvânt cu cuvânt. Nu adăuga nimic altceva: "
+                        f"'Bună ziua! Clinica {company_name}. Cu ce vă pot ajuta?' "
+                    )
 
         context.add_message({"role": "user", "content": greeting_prompt})
 
