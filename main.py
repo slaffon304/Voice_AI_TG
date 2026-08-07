@@ -3,6 +3,7 @@ import audioop
 import datetime
 import json
 import os
+import re
 import time
 import uuid
 import wave
@@ -248,6 +249,18 @@ OUTBOUND_CALLS_CACHE = {}
 INBOUND_CALLS_CACHE = {}
 
 
+def extract_real_phone(*args, ignore_trunk="78001079"):
+    """Ищет реальный номер клиента (8-15 цифр) в заголовках, игнорируя номер шлюза/SIM-карты"""
+    for val in args:
+        if not val:
+            continue
+        matches = re.findall(r"\d{8,15}", str(val))
+        for num in matches:
+            if ignore_trunk not in num and num != "078001079":
+                return num
+    return "Necunoscut"
+
+
 # --- 1. ФУНКЦИИ БАЗЫ ДАННЫХ, CRM И УВЕДОМЛЕНИЙ ---
 async def get_client_data(client_id: str):
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -310,11 +323,10 @@ async def get_client_data(client_id: str):
 
 
 async def lookup_inbound_client_in_kommo(caller_phone: str) -> dict:
-    """Прямой поиск входящего номера в Kommo API (с защитой от невидимых символов в .env)"""
+    """Прямой поиск входящего номера в Kommo API (с защитой от невидимых символов în .env)"""
     if not KOMMO_SUBDOMAIN or not KOMMO_ACCESS_TOKEN or caller_phone == "Necunoscut":
         return {}
 
-    # Очищаем subdomain и токен от любых невидимых Unicode-символов (\u200e и др.), попавших при копировании в .env
     subdomain = KOMMO_SUBDOMAIN.encode("ascii", "ignore").decode("ascii").strip()
     token = KOMMO_ACCESS_TOKEN.encode("ascii", "ignore").decode("ascii").strip()
 
@@ -332,7 +344,7 @@ async def lookup_inbound_client_in_kommo(caller_phone: str) -> dict:
         "with": "leads"
     }
 
-    print(f"🔍 [INBOUND KOMMO] Прямой поиск номера {clean_phone} в CRM...", flush=True)
+    print(f"🔍 [INBOUND KOMMO] Прямой поиск номера {clean_phone} în CRM...", flush=True)
 
     async with httpx.AsyncClient() as http_client:
         try:
@@ -367,7 +379,7 @@ async def lookup_inbound_client_in_kommo(caller_phone: str) -> dict:
                         "contact_id": contact.get("id")
                     }
             elif resp.status_code == 204:
-                print(f"ℹ️ [INBOUND KOMMO] Номер {clean_phone} не найден в базе (новый лид).", flush=True)
+                print(f"ℹ️ [INBOUND KOMMO] Номер {clean_phone} nu a fost găsit în CRM (nou lead).", flush=True)
                 
         except httpx.TimeoutException:
             print("⚠️ [INBOUND KOMMO] Таймаут запроса к Kommo (>2.5с). Включаем Fallback.", flush=True)
@@ -518,7 +530,9 @@ async def send_final_report_to_n8n(
 async def get_client_uuid(
     sip_login: str = None, 
     sip_login_gsm: str = None,
-    phone: str = None
+    phone: str = None,
+    ani: str = None,
+    from_hdr: str = None
 ):
     if not sip_login and not sip_login_gsm:
         return Response(content="error", media_type="text/plain")
@@ -541,10 +555,11 @@ async def get_client_uuid(
             if data and isinstance(data, list) and len(data) > 0:
                 client_id_str = str(data[0].get("client_id"))
                 
-                # --- СОХРАНЯЕМ НОМЕР ЗВОНЯЩЕГО В КЭШ ---
-                if phone:
-                    INBOUND_CALLS_CACHE[client_id_str] = phone
-                    print(f"📲 [INBOUND CACHE] Запомнили номер {phone} для клиники {client_id_str}", flush=True)
+                # --- ОПРЕДЕЛЯЕМ НАСТОЯЩИЙ НОМЕР КЛИЕНТА ---
+                real_phone = extract_real_phone(ani, from_hdr, phone)
+                if real_phone != "Necunoscut":
+                    INBOUND_CALLS_CACHE[client_id_str] = real_phone
+                    print(f"📲 [INBOUND CACHE] Определен реальный номер {real_phone} pentru clinica {client_id_str}", flush=True)
 
                 return Response(
                     content=client_id_str,
@@ -709,7 +724,6 @@ async def handle_asterisk_conn(reader, writer):
         else:
             client_id = session_uuid
             
-            # --- ДОСТАЕМ НОМЕР ИЗ КЭША И ИЩЕМ В KOMMO ---
             target_phone = INBOUND_CALLS_CACHE.pop(client_id, "Necunoscut")
             print(f"📞 [INBOUND] Входящий звонок. client_id: {client_id}, номер: {target_phone}", flush=True)
             
