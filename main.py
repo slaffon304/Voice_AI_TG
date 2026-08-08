@@ -559,7 +559,7 @@ async def get_client_uuid(
             if data and isinstance(data, list) and len(data) > 0:
                 client_id_str = str(data[0].get("client_id"))
                 
-                # --- ИЗВЛЕКАЕМ НАСТОЯЩИЙ НОМЕР КЛИЕНТА (ИЗ ANI ИЛИ ALL_ID) ---
+                # --- ИЗВЛЕКАЕМ НАСТОЯЩИЙ НОМЕР КЛИЕНТА ---
                 real_phone = extract_real_phone(ani, all_id, from_hdr, phone)
                 if real_phone != "Necunoscut":
                     INBOUND_CALLS_CACHE[client_id_str] = real_phone
@@ -1183,11 +1183,17 @@ async def handle_asterisk_conn(reader, writer):
                     "⚠️ [ФИЛЬТР] Короткий звонок без ответа пользователя. Пропускаем Gemini.",
                     flush=True,
                 )
+                
+                # --- РАЗДЕЛЯЕМ СТАТУС ДЛЯ N8N ---
+                call_status = (
+                    "outbound_short_call" if is_outbound else "inbound_dropped"
+                )
+                
                 await send_final_report_to_n8n(
                     client_id=client_id,
                     end_client_name=client_name,
                     end_client_phone=target_phone,
-                    status="short_call",
+                    status=call_status,
                     transcript=full_transcript,
                     summary="{}",
                     audio_url="",
