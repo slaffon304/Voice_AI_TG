@@ -619,8 +619,8 @@ async def handle_asterisk_conn(reader, writer):
                 voice=voice_model,
                 system_instruction=system_prompt,
                 vad=GeminiVADParams(
-                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
-                    silence_duration_ms=1000,
+                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,  # Меньше ложных срабатываний на шум
+                    silence_duration_ms=1200,  # Даем больше времени на паузу перед тем, как считать, что пользователь заговорил
                 ),
             ),
         )
