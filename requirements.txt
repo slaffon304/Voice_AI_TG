@@ -6,4 +6,4 @@ httpx
 pytz
 supabase
 google-genai
-pip install redis
+redis
