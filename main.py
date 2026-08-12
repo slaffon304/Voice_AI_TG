@@ -358,7 +358,8 @@ class OutboundCallRequest(BaseModel):
     client_name: str = "client"
     call_purpose: str = "Confirmarea programării"
     custom_context: str = ""
-    lang: str = "ro"  # ВОЗВРАЩАЕМ ЯЗЫК
+    lang: str = "ro"
+
 
 @app.post("/api/dial")
 async def initiate_outbound_call(req: OutboundCallRequest):
@@ -369,10 +370,9 @@ async def initiate_outbound_call(req: OutboundCallRequest):
         "client_name": req.client_name,
         "call_purpose": req.call_purpose,
         "custom_context": req.custom_context,
-        "lang": req.lang,  # СОХРАНЯЕМ ЯЗЫК В REDIS
+        "lang": req.lang,
     }
 
-    # Сохраняем стейт в Redis для кластерной отказоустойчивости (TTL 10 минут)
     if redis_client:
         await redis_client.setex(f"call_context:{call_uuid}", 600, json.dumps(call_data))
     else:
@@ -460,6 +460,7 @@ async def handle_asterisk_conn(reader, writer):
     client_id = None
     target_phone = "Necunoscut"
     client_name = "Necunoscut"
+    wav_filename = None
 
     try:
         header = await reader.readexactly(3)
@@ -477,24 +478,20 @@ async def handle_asterisk_conn(reader, writer):
         is_outbound = False
         outbound_info = {}
 
-        # Чтение контекста сессии из Redis
         if redis_client:
             raw_data = await redis_client.get(f"call_context:{session_uuid}")
             if raw_data:
                 is_outbound = True
                 outbound_info = json.loads(raw_data)
-                # Удаляем сессию из кэша после поднятия трубки
                 await redis_client.delete(f"call_context:{session_uuid}")
         
         if is_outbound:
             client_id = outbound_info.get("client_id")
-            call_lang = outbound_info.get("lang", "ro")
             target_phone = outbound_info.get("target_phone", "Necunoscut")
             client_name = outbound_info.get("client_name", "Necunoscut")
             print(f"📞 [OUTBOUND] Распознана задача исходящего звонка. Настоящий client_id: {client_id}", flush=True)
         else:
             client_id = session_uuid
-            call_lang = persona_data.get("language", "ro")
             print(f"📞 [INBOUND] Входящий звонок. client_id: {client_id}", flush=True)
 
         client_data = await get_client_data(client_id)
@@ -511,14 +508,20 @@ async def handle_asterisk_conn(reader, writer):
 
         print("🟢 TOATE VERIFICĂRILE AU TRECUT! Ridicăm apelul.", flush=True)
 
-        # Вытягиваем динамическую Персону бота
+        # СНАЧАЛА вытягиваем динамическую Персону бота из новой таблицы
         persona_data = await get_persona_data(client_id) or {}
+
+        # ТОЛЬКО ТЕПЕРЬ определяем язык для текущего звонка
+        if is_outbound:
+            call_lang = outbound_info.get("lang", "ro")
+        else:
+            call_lang = persona_data.get("language", "ro")
+
         raw_prompt = persona_data.get("system_prompt")
         if not raw_prompt:
             raw_prompt = client_data.get("system_message", "Ești un asistent virtual.")
             
         voice_model = persona_data.get("voice_model", "Enceladus")
-        language = persona_data.get("language", "ro")
 
         tz = pytz.timezone("Europe/Chisinau")
         current_time = datetime.datetime.now(tz).strftime("%A, %d %B %Y, %H:%M")
@@ -532,7 +535,6 @@ async def handle_asterisk_conn(reader, writer):
         system_prompt = system_prompt.replace("{office_status}", office_status)
         system_prompt = system_prompt.replace("{lang}", call_lang)
 
-        # Инструменты динамически сохраняем, пока интеграции активны для всех
         tools = [
             {
                 "function_declarations": [
@@ -697,12 +699,10 @@ async def handle_asterisk_conn(reader, writer):
         llm.register_function("Booking_tool", process_booking_tool)
         llm.register_function("send_sms", process_send_sms)
 
-        # Файл аудио, который Asterisk должен записать через MixMonitor
         wav_filename = f"{ASTERISK_RECORDING_PATH}/{session_uuid}.wav"
 
         recovery_processor = InterruptionRecoveryProcessor(context)
 
-        # Очищенный пайплайн без лишних перехватчиков аудио
         pipeline = Pipeline(
             [
                 transport.input(),
@@ -722,7 +722,6 @@ async def handle_asterisk_conn(reader, writer):
 
         runner = PipelineRunner()
 
-        # Динамические приветствия с учетом языка из базы
         if is_outbound:
             purpose = outbound_info.get("call_purpose", "Confirmarea programării")
             custom_context = outbound_info.get("custom_context", "")
@@ -732,13 +731,13 @@ async def handle_asterisk_conn(reader, writer):
             })
             greeting_prompt = (
                 f"SYSTEM EVENT: Clientul a răspuns la apelul de ieșire. "
-                f"Începe conversația în limba '{language}'. Salută-l pe {client_name} și menționează politicos scopul apelului: {purpose}. "
+                f"Începe conversația în limba '{call_lang}'. Salută-l pe {client_name} și menționează politicos scopul apelului: {purpose}. "
                 "Nu adăuga informații inutile."
             )
         else:
             greeting_prompt = (
                 f"SYSTEM EVENT: Clientul s-a conectat pe linia de intrare. "
-                f"Începe conversația politicos în limba '{language}' și întreabă-l cu ce îl poți ajuta."
+                f"Începe conversația politicos în limba '{call_lang}' și întreabă-l cu ce îl poți ajuta."
             )
 
         context.add_message({"role": "user", "content": greeting_prompt})
@@ -792,7 +791,6 @@ async def handle_asterisk_conn(reader, writer):
                     system_instructions_length=system_instructions_length,
                 )
 
-        # Удаляем аудиофайл только если он был записан и прочитан
         if wav_filename and os.path.exists(wav_filename):
             try:
                 os.remove(wav_filename)
