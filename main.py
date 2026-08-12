@@ -358,7 +358,7 @@ class OutboundCallRequest(BaseModel):
     client_name: str = "client"
     call_purpose: str = "Confirmarea programării"
     custom_context: str = ""
-
+    lang: str = "ro"  # ВОЗВРАЩАЕМ ЯЗЫК
 
 @app.post("/api/dial")
 async def initiate_outbound_call(req: OutboundCallRequest):
@@ -369,6 +369,7 @@ async def initiate_outbound_call(req: OutboundCallRequest):
         "client_name": req.client_name,
         "call_purpose": req.call_purpose,
         "custom_context": req.custom_context,
+        "lang": req.lang,  # СОХРАНЯЕМ ЯЗЫК В REDIS
     }
 
     # Сохраняем стейт в Redis для кластерной отказоустойчивости (TTL 10 минут)
@@ -487,11 +488,13 @@ async def handle_asterisk_conn(reader, writer):
         
         if is_outbound:
             client_id = outbound_info.get("client_id")
+            call_lang = outbound_info.get("lang", "ro")
             target_phone = outbound_info.get("target_phone", "Necunoscut")
             client_name = outbound_info.get("client_name", "Necunoscut")
             print(f"📞 [OUTBOUND] Распознана задача исходящего звонка. Настоящий client_id: {client_id}", flush=True)
         else:
             client_id = session_uuid
+            call_lang = persona_data.get("language", "ro")
             print(f"📞 [INBOUND] Входящий звонок. client_id: {client_id}", flush=True)
 
         client_data = await get_client_data(client_id)
@@ -527,6 +530,7 @@ async def handle_asterisk_conn(reader, writer):
         system_prompt = system_prompt.replace("{tone}", client_data.get("tone") or "friendly")
         system_prompt = system_prompt.replace("{current_datetime}", current_time)
         system_prompt = system_prompt.replace("{office_status}", office_status)
+        system_prompt = system_prompt.replace("{lang}", call_lang)
 
         # Инструменты динамически сохраняем, пока интеграции активны для всех
         tools = [
