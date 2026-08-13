@@ -46,13 +46,6 @@ from supabase import Client, create_client
 import redis.asyncio as redis
 import gc
 
-# Попытка импорта RNNoiseFilter для подавления фонового шума
-try:
-    from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
-    HAS_RNNOISE = True
-except ImportError:
-    HAS_RNNOISE = False
-    print("⚠️ RNNoiseFilter не установлен. Для подавления шумов выполните: pip install 'pipecat-ai[rnnoise]'")
 
 # ==========================================
 # ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
@@ -872,16 +865,14 @@ async def handle_asterisk_conn(reader, writer):
         recovery_processor = InterruptionRecoveryProcessor(context)
 
         # Сборка пайплайна с учетом шумоподавления (если установлено)
-        processors_list = [transport.input()]
-        if HAS_RNNOISE:
-            processors_list.append(RNNoiseFilter())
-        processors_list.extend([
-            context_aggregator.user(),
-            llm,
-            recovery_processor,
-            transport.output(),
-            context_aggregator.assistant(),
-        ])
+        processors_list = [
+    transport.input(),
+    context_aggregator.user(),
+    llm,
+    recovery_processor,
+    transport.output(),
+    context_aggregator.assistant(),
+]
         
         pipeline = Pipeline(processors_list)
 
