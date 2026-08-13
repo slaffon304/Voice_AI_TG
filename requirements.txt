@@ -7,3 +7,4 @@ pytz
 supabase
 google-genai
 redis
+pipecat-ai[rnnoise]
