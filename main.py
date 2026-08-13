@@ -356,6 +356,7 @@ async def send_final_report_to_n8n(
     summary: str,
     audio_url: str,
     system_instructions_length: int,
+    direction: str,
 ):
     payload = {
         "client_id": client_id,
@@ -367,6 +368,7 @@ async def send_final_report_to_n8n(
         "audio_url": audio_url,
         "system_instructions_length": system_instructions_length,
         "platform": "gsm_voice",
+        "direction": direction,
     }
     async with httpx.AsyncClient() as http_client:
         try:
@@ -802,6 +804,7 @@ async def handle_asterisk_conn(reader, writer):
                         summary="{}",
                         audio_url="",
                         system_instructions_length=system_instructions_length,
+                        direction=call_direction,
                     )
                 else:
                     summary = await generate_summary(full_transcript)
@@ -816,6 +819,7 @@ async def handle_asterisk_conn(reader, writer):
                         summary=summary,
                         audio_url=audio_url or "",
                         system_instructions_length=system_instructions_length,
+                        direction=call_direction,
                     )
         except Exception as post_err:
             print(f"❌ ОШИБКА В ПОСТ-ОБРАБОТКЕ: {post_err}", flush=True)
