@@ -772,6 +772,7 @@ async def handle_asterisk_conn(reader, writer):
         print(f"❌ Ошибка соединения: {e}", flush=True)
     finally:
         print("📞 Звонок завершен. Запускаем пост-обработку...", flush=True)
+        call_direction = "outbound" if is_outbound else "inbound"
         
         await asyncio.sleep(0.5)
 
