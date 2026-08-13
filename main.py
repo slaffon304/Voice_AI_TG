@@ -169,7 +169,6 @@ app.add_middleware(
 # ФУНКЦИИ ФОРМАТИРОВАНИЯ ТЕЛЕФОНА
 # ==========================================
 def format_kommo_phone(phone: str) -> str:
-    """Жестко приводит номер к стандарту +373 XXXXXXXX"""
     if not phone or phone == "Necunoscut":
         return "Necunoscut"
         
@@ -250,7 +249,6 @@ async def get_persona_data(client_id: str):
             return None
 
 async def get_caller_memory(client_id: str, phone: str):
-    """Извлекает трехуровневую память и вычисляет контекст времени"""
     default_memory = {"core": "", "short": "", "long": ""}
     if not SUPABASE_URL or not SUPABASE_KEY or not phone or phone == "Necunoscut":
         return default_memory, "first_time"
@@ -290,7 +288,7 @@ async def get_caller_memory(client_id: str, phone: str):
                     
                     return memory, time_context
     except Exception as e:
-        print(f"⚠️ Ошибка Supabase при получении памяти (caller_memories): {e}", flush=True)
+        print(f"⚠️ Ошибка Supabase при получении памяти: {e}", flush=True)
 
     return default_memory, time_context
 
@@ -346,7 +344,7 @@ async def send_tg_alert(chat_id: str, message: str):
 
 async def upload_audio_to_supabase(client_id: str, filepath: str) -> str | None:
     if not SUPABASE_URL or not SUPABASE_KEY or not os.path.exists(filepath):
-        print(f"⚠️ [STORAGE] Файл {filepath} не найден на диске. Asterisk не успел его записать.", flush=True)
+        print(f"⚠️ [STORAGE] Файл {filepath} не найден на диске.", flush=True)
         return None
     try:
         clean_supa_url = SUPABASE_URL.replace("/rest/v1", "").rstrip("/")
@@ -365,11 +363,11 @@ async def upload_audio_to_supabase(client_id: str, filepath: str) -> str | None:
         audio_url = await asyncio.to_thread(_upload)
         return audio_url
     except Exception as e:
-        print(f"❌ [STORAGE] Ошибка загрузки файла {filepath} в Supabase: {e}", flush=True)
+        print(f"❌ [STORAGE] Ошибка загрузки файла {filepath}: {e}", flush=True)
         return None
 
 # ==========================================
-# ИИ-АРХИВАРИУС (Консолидация памяти + Отчет для n8n)
+# ИИ-АРХИВАРИУС (Консолидация памяти + Отчет)
 # ==========================================
 async def run_archivist_and_notify_n8n(
     client_id: str, phone: str, client_name: str, old_memory: dict, chat_history: str, 
@@ -415,7 +413,6 @@ LONG TERM: {old_memory.get('long', 'Нет данных')}
 }}
 """
 
-    # --- ЗАПАСНЫЕ МОДЕЛИ (ФОЛЛБЕК) ---
     fallback_models = [
         'gemini-3.6-flash',
         'gemini-3.1-pro-preview',
@@ -445,7 +442,7 @@ LONG TERM: {old_memory.get('long', 'Нет данных')}
             if attempt < len(fallback_models):
                 await asyncio.sleep(3)
             else:
-                print("❌ [ARCHIVIST] Все запасные модели упали. Отчет уйдет с базовыми данными.", flush=True)
+                print("❌ [ARCHIVIST] Все модели упали. Отчет уйдет с базовыми данными.", flush=True)
                 data = {
                     "core_identity": old_memory.get('core', ''),
                     "short_term_context": old_memory.get('short', ''),
@@ -682,7 +679,6 @@ async def handle_asterisk_conn(reader, writer):
         if not is_outbound and not inbound_crm.get("found"):
             call_lang = persona_data.get("language", "ro")
 
-        # --- ИЗВЛЕЧЕНИЕ ПАМЯТИ ---
         caller_memory, time_context = await get_caller_memory(client_id, target_phone)
 
         raw_prompt = persona_data.get("system_prompt") or client_data.get("system_message", "Ești un asistent virtual.")
@@ -697,13 +693,13 @@ async def handle_asterisk_conn(reader, writer):
         system_prompt = system_prompt.replace("{office_status}", "Open")
         system_prompt = system_prompt.replace("{lang}", call_lang)
 
-        # Инъекция памяти в промпт
         system_prompt += f"\n\n<USER_MEMORY>\n"
         system_prompt += f"CORE: {caller_memory['core']}\n"
         system_prompt += f"RECENT: {caller_memory['short']}\n"
         system_prompt += f"LONG TERM: {caller_memory['long']}\n"
         system_prompt += "</USER_MEMORY>\n"
 
+        # НОВЫЙ ИНСТРУМЕНТ: Завершение звонка (end_call)
         tools = [
             {
                 "function_declarations": [
@@ -745,6 +741,15 @@ async def handle_asterisk_conn(reader, writer):
                             "required": ["phone", "message"],
                         },
                     },
+                    {
+                        "name": "end_call",
+                        "description": "Încheie apelul. Folosește această funcție pentru a pune receptorul atunci când conversația s-a încheiat sau clientul și-a luat rămas bun.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {},
+                            "required": []
+                        }
+                    }
                 ]
             }
         ]
@@ -796,7 +801,7 @@ async def handle_asterisk_conn(reader, writer):
                     except: pass
                     raise
                 except Exception as e:
-                    error_msg = f"⚠️ <b>Eroare API (save_lead)</b>\n🏢 Companie: {comp_name}\n🔧 Detalii eroare: <code>{str(e)}</code>\nN8N nu a putut salva lead-ul!"
+                    error_msg = f"⚠️ <b>Eroare API (save_lead)</b>\n🏢 Companie: {comp_name}\n🔧 Detalii eroare: <code>{str(e)}</code>"
                     await send_tg_alert(tg_chat, error_msg)
                     await params.result_callback({"error": f"Eroare CRM: {str(e)}"})
 
@@ -817,7 +822,7 @@ async def handle_asterisk_conn(reader, writer):
                     except: pass
                     raise
                 except Exception as e:
-                    error_msg = f"⚠️ <b>Eroare API (Booking_tool)</b>\n🏢 Companie: {comp_name}\n🔧 Detalii eroare: <code>{str(e)}</code>\nN8N nu a procesat rezervarea!"
+                    error_msg = f"⚠️ <b>Eroare API (Booking_tool)</b>\n🏢 Companie: {comp_name}\n🔧 Detalii eroare: <code>{str(e)}</code>"
                     await send_tg_alert(tg_chat, error_msg)
                     await params.result_callback({"status": "error", "message": str(e)})
 
@@ -837,13 +842,20 @@ async def handle_asterisk_conn(reader, writer):
                     except: pass
                     raise
                 except Exception as e:
-                    error_msg = f"⚠️ <b>Eroare API (send_sms)</b>\n🏢 Companie: {comp_name}\n🔧 Detalii eroare: <code>{str(e)}</code>\nN8N nu a putut trimite SMS-ul!"
+                    error_msg = f"⚠️ <b>Eroare API (send_sms)</b>\n🏢 Companie: {comp_name}\n🔧 Detalii eroare: <code>{str(e)}</code>"
                     await send_tg_alert(tg_chat, error_msg)
                     await params.result_callback({"status": "error", "message": str(e)})
+
+        # ЛОГИКА НОВОГО ИНСТРУМЕНТА END_CALL
+        async def process_end_call(params: FunctionCallParams):
+            await params.result_callback({"status": "success", "message": "Call ended"})
+            # Эта команда мгновенно прерывает пайплайн и отправляет скрипт в блок finally
+            await task.queue_frames([EndFrame()])
 
         llm.register_function("save_lead", process_save_lead)
         llm.register_function("Booking_tool", process_booking)
         llm.register_function("send_sms", process_sms)
+        llm.register_function("end_call", process_end_call)
 
         recovery_processor = InterruptionRecoveryProcessor(context)
 
@@ -865,7 +877,6 @@ async def handle_asterisk_conn(reader, writer):
         recovery_processor.task = task
         runner = PipelineRunner()
 
-        # --- TEMPORAL AWARENESS ДЛЯ ПЕРВОЙ ФРАЗЫ ---
         if is_outbound:
             greeting_prompt = (
                 f"SYSTEM EVENT: Клиент ({client_name}) ответил на исходящий звонок. "
@@ -896,65 +907,62 @@ async def handle_asterisk_conn(reader, writer):
     except Exception as e:
         print(f"❌ Ошибка соединения: {e}", flush=True)
     finally:
-        print("📞 Звонок завершен. Сбор данных...", flush=True)
+        print("📞 Звонок завершен. Закрываем сокет и собираем данные...", flush=True)
+        
+        # 1. МГНОВЕННОЕ ЗАКРЫТИЕ СОКЕТА
+        # Разрываем связь до генерации саммари. Asterisk сразу кладет трубку.
+        try:
+            writer.close()
+        except Exception:
+            pass
+
         call_direction = "outbound" if is_outbound else "inbound"
-        
-        await asyncio.sleep(0.5)
-        
         wav_filename = f"{ASTERISK_RECORDING_PATH}/{session_uuid}.wav"
         
-        try:
-            has_context = "context" in locals() and context is not None
-            if has_context and client_id:
-                user_replies = [
-                    m["content"] for m in context.messages
-                    if m.get("role") == "user" and "SYSTEM EVENT:" not in m.get("content", "")
-                ]
+        # 2. ИЗВЛЕЧЕНИЕ КОНТЕКСТА В ЛОКАЛЬНЫЕ ПЕРЕМЕННЫЕ
+        has_context = "context" in locals() and context is not None
+        if has_context and client_id:
+            user_replies = [
+                m["content"] for m in context.messages
+                if m.get("role") == "user" and "SYSTEM EVENT:" not in m.get("content", "")
+            ]
 
-                full_transcript = ""
-                for msg in context.messages:
-                    if msg.get("role") in ["user", "assistant"] and msg.get("content"):
-                        if "SYSTEM COMMAND:" not in msg["content"]:
-                            role = "Client" if msg["role"] == "user" else "AI"
-                            full_transcript += f"{role}: {msg['content']}\n"
+            full_transcript = ""
+            for msg in context.messages:
+                if msg.get("role") in ["user", "assistant"] and msg.get("content"):
+                    if "SYSTEM COMMAND:" not in msg["content"]:
+                        role = "Client" if msg["role"] == "user" else "AI"
+                        full_transcript += f"{role}: {msg['content']}\n"
 
-                if len(user_replies) == 0:
-                    call_status = "outbound_short_call" if is_outbound else "inbound_dropped"
-                    await run_archivist_and_notify_n8n(
-                        client_id=client_id,
-                        phone=target_phone,
-                        client_name=client_name,
-                        old_memory=caller_memory,
-                        chat_history=full_transcript,
-                        audio_url="",
-                        sys_length=system_instructions_length,
-                        direction=call_direction,
-                        call_status=call_status
-                    )
-                else:
-                    audio_url = await upload_audio_to_supabase(client_id, wav_filename)
-                    
-                    # Отправляем в фон, чтобы скрипт мог завершить работу сокета
-                    asyncio.create_task(run_archivist_and_notify_n8n(
-                        client_id=client_id,
-                        phone=target_phone,
-                        client_name=client_name,
-                        old_memory=caller_memory,
-                        chat_history=full_transcript,
-                        audio_url=audio_url or "",
-                        sys_length=system_instructions_length,
-                        direction=call_direction,
-                        call_status="completed"
-                    ))
-        except Exception as post_err:
-            print(f"❌ ОШИБКА В ПОСТ-ОБРАБОТКЕ: {post_err}", flush=True)
+            # 3. ФОНОВАЯ ОБРАБОТКА И ОТПРАВКА
+            # Эта функция выполняется в фоне, не блокируя основной процесс FastAPI
+            async def background_post_processing():
+                await asyncio.sleep(0.5) # Даем Астериску время дописать файл
+                try:
+                    if len(user_replies) == 0:
+                        call_status = "outbound_short_call" if is_outbound else "inbound_dropped"
+                        await run_archivist_and_notify_n8n(
+                            client_id, target_phone, client_name, caller_memory, full_transcript, "",
+                            system_instructions_length, call_direction, call_status
+                        )
+                    else:
+                        audio_url = await upload_audio_to_supabase(client_id, wav_filename)
+                        await run_archivist_and_notify_n8n(
+                            client_id, target_phone, client_name, caller_memory, full_transcript, audio_url or "",
+                            system_instructions_length, call_direction, "completed"
+                        )
+                except Exception as post_err:
+                    print(f"❌ ОШИБКА В ФОНОВОЙ ПОСТ-ОБРАБОТКЕ: {post_err}", flush=True)
+                finally:
+                    if wav_filename and os.path.exists(wav_filename):
+                        try: os.remove(wav_filename)
+                        except Exception: pass
+                    gc.collect()
 
-        if wav_filename and os.path.exists(wav_filename):
-            try: os.remove(wav_filename)
-            except Exception: pass
-        
-        writer.close()
-        gc.collect()
+            # Запускаем фоновую задачу, не ожидая (без await)
+            asyncio.create_task(background_post_processing())
+        else:
+            gc.collect()
 
 @app.on_event("startup")
 async def startup_event():
