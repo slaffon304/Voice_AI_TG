@@ -1,4 +1,4 @@
-pipecat-ai[google]==1.1.0
+pipecat-ai[google,rnnoise]==1.1.0
 fastapi
 uvicorn[standard]
 websockets
@@ -7,4 +7,3 @@ pytz
 supabase
 google-genai
 redis
-pipecat-ai[rnnoise]
