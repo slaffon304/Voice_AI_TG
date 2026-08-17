@@ -1,4 +1,5 @@
-pipecat-ai[google,rnnoise]==1.1.0
+pipecat-ai[google]==1.1.0
+pyrnnoise
 fastapi
 uvicorn[standard]
 websockets
