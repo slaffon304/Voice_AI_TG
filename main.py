@@ -46,6 +46,18 @@ from supabase import Client, create_client
 import redis.asyncio as redis
 import gc
 
+# ==========================================
+# ШУМОПОДАВЛЕНИЕ (Прямая интеграция)
+# ==========================================
+try:
+    import pyrnnoise
+    rnnoise_filter = pyrnnoise.RNNoise()
+    HAS_RNNOISE = True
+    print("✅ Инициализирован pyrnnoise (Шумоподавление включено)", flush=True)
+except ImportError:
+    HAS_RNNOISE = False
+    rnnoise_filter = None
+    print("⚠️ pyrnnoise не установлен. Для подавления шумов выполните: pip install pyrnnoise", flush=True)
 
 # ==========================================
 # ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
@@ -82,7 +94,7 @@ class RawPCMFrameSerializer(FrameSerializer):
         return None
 
 # ==========================================
-# АДАПТЕР ASTERISK -> WEBSOCKET
+# АДАПТЕР ASTERISK -> WEBSOCKET (С ФИЛЬТРОМ ШУМА)
 # ==========================================
 class AsteriskWSAdapter:
     def __init__(self, reader, writer):
@@ -118,6 +130,15 @@ class AsteriskWSAdapter:
             resampled, self.in_state = audioop.ratecv(
                 data, 2, 1, 8000, 16000, self.in_state
             )
+            
+            # ПРЯМАЯ ФИЛЬТРАЦИЯ ШУМА (RNNOISE)
+            # Фрейм 320 байт при 16000Hz — это ровно 10мс, идеальный формат для pyrnnoise
+            if HAS_RNNOISE and rnnoise_filter and len(resampled) == 320:
+                try:
+                    resampled = rnnoise_filter.filter(resampled)
+                except Exception:
+                    pass
+
             return resampled
         except Exception:
             self.client_state = WebSocketState.DISCONNECTED
@@ -428,7 +449,6 @@ LONG TERM: {old_memory.get('long', 'Нет данных')}
     while attempt < len(fallback_models):
         current_model = fallback_models[attempt]
         try:
-            print(f"🔄 [ARCHIVIST] Попытка {attempt + 1}: обращаемся к {current_model}...", flush=True)
             response = await client.aio.models.generate_content(
                 model=current_model,
                 contents=prompt,
@@ -438,7 +458,6 @@ LONG TERM: {old_memory.get('long', 'Нет данных')}
             break
             
         except Exception as e:
-            print(f"⚠️ [ARCHIVIST] Ошибка API ({current_model}): {e}. Ждем 3 сек...", flush=True)
             attempt += 1
             if attempt < len(fallback_models):
                 await asyncio.sleep(3)
@@ -625,6 +644,10 @@ async def handle_asterisk_conn(reader, writer):
     client_id = None
     target_phone = "Necunoscut"
     client_name = "client"
+    
+    # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Инициализация флага до блока try
+    # Это предотвращает падение скрипта (UnboundLocalError), если Астериск обрывает звонок на 1 секунде
+    is_outbound = False  
 
     try:
         header = await reader.readexactly(3)
@@ -636,7 +659,6 @@ async def handle_asterisk_conn(reader, writer):
             writer.close()
             return
 
-        is_outbound = False
         outbound_info = {}
         inbound_crm = {}
 
@@ -699,6 +721,15 @@ async def handle_asterisk_conn(reader, writer):
         system_prompt += f"RECENT: {caller_memory['short']}\n"
         system_prompt += f"LONG TERM: {caller_memory['long']}\n"
         system_prompt += "</USER_MEMORY>\n"
+
+        # ДИНАМИЧЕСКИЙ ПЕРЕХВАТ ЯЗЫКА
+        # Это принудительно отменяет жесткие правила языка, которые прописаны в базе данных CRM
+        system_prompt += (
+            f"\n\nSYSTEM COMMAND: Игнорируй любые жесткие правила из твоего промпта, запрещающие менять язык. "
+            f"Если клиент обращается к тебе на другом языке (например, переходит с RO на RU или наоборот), "
+            f"ТЫ ОБЯЗАН мгновенно переключиться на язык клиента и продолжать диалог на нём. "
+            f"Текущий ожидаемый язык из CRM: {call_lang}.\n"
+        )
 
         tools = [
             {
@@ -849,11 +880,11 @@ async def handle_asterisk_conn(reader, writer):
         async def process_end_call(params: FunctionCallParams):
             await params.result_callback({"status": "success", "message": "Call ended"})
             
-            # Даем ИИ 3.5 секунды, чтобы договорить слова прощания, и только потом рубим пайплайн
             async def delayed_end():
                 await asyncio.sleep(3.5)
                 if task:
-                    await task.queue_frames([EndFrame()])
+                    # ИСПОЛЬЗУЕМ CancelFrame, ЧТОБЫ ИЗБЕЖАТЬ 30-СЕКУНДНОГО ЗАВИСАНИЯ GEMINI
+                    await task.queue_frames([CancelFrame()])
             
             asyncio.create_task(delayed_end())
 
@@ -864,17 +895,14 @@ async def handle_asterisk_conn(reader, writer):
 
         recovery_processor = InterruptionRecoveryProcessor(context)
 
-        # Сборка пайплайна с учетом шумоподавления (если установлено)
-        processors_list = [
-    transport.input(),
-    context_aggregator.user(),
-    llm,
-    recovery_processor,
-    transport.output(),
-    context_aggregator.assistant(),
-]
-        
-        pipeline = Pipeline(processors_list)
+        pipeline = Pipeline([
+            transport.input(),
+            context_aggregator.user(),
+            llm,
+            recovery_processor,
+            transport.output(),
+            context_aggregator.assistant(),
+        ])
 
         task = PipelineTask(
             pipeline,
