@@ -131,8 +131,6 @@ class AsteriskWSAdapter:
                 data, 2, 1, 8000, 16000, self.in_state
             )
             
-            # ПРЯМАЯ ФИЛЬТРАЦИЯ ШУМА (RNNOISE)
-            # Фрейм 320 байт при 16000Hz — это ровно 10мс, идеальный формат для pyrnnoise
             if HAS_RNNOISE and rnnoise_filter and len(resampled) == 320:
                 try:
                     resampled = rnnoise_filter.filter(resampled)
@@ -645,9 +643,9 @@ async def handle_asterisk_conn(reader, writer):
     target_phone = "Necunoscut"
     client_name = "client"
     
-    # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Инициализация флага до блока try
-    # Это предотвращает падение скрипта (UnboundLocalError), если Астериск обрывает звонок на 1 секунде
+    # Инициализируем переменные до try, чтобы избежать UnboundLocalError при крашах
     is_outbound = False  
+    session_uuid = "unknown"
 
     try:
         header = await reader.readexactly(3)
@@ -708,6 +706,10 @@ async def handle_asterisk_conn(reader, writer):
         tz = pytz.timezone("Europe/Chisinau")
         current_time = datetime.datetime.now(tz).strftime("%A, %d %B %Y, %H:%M")
         
+        # ОЧИСТКА ПРОМПТА ОТ ЖЕСТКИХ ПРАВИЛ ЯЗЫКА ИЗ CRM
+        # Это удалит фразу "1. LIMBA (CRITIC):..." чтобы она не блокировала переключение языка
+        raw_prompt = re.sub(r"\d+\.\s*LIMBA.*?(?=\n\d+\.|\n\n|\Z)", "", raw_prompt, flags=re.IGNORECASE | re.DOTALL)
+
         system_prompt = raw_prompt.replace("{company_name}", client_data.get("company_name") or "Compania")
         system_prompt = system_prompt.replace("{business_context}", client_data.get("business_context") or "")
         system_prompt = system_prompt.replace("{bot_goal}", client_data.get("bot_goal") or "")
@@ -723,13 +725,9 @@ async def handle_asterisk_conn(reader, writer):
         system_prompt += "</USER_MEMORY>\n"
 
         # ДИНАМИЧЕСКИЙ ПЕРЕХВАТ ЯЗЫКА
-        # Это принудительно отменяет жесткие правила языка, которые прописаны в базе данных CRM
-        system_prompt += (
-            f"\n\nSYSTEM COMMAND: Игнорируй любые жесткие правила из твоего промпта, запрещающие менять язык. "
-            f"Если клиент обращается к тебе на другом языке (например, переходит с RO на RU или наоборот), "
-            f"ТЫ ОБЯЗАН мгновенно переключиться на язык клиента и продолжать диалог на нём. "
-            f"Текущий ожидаемый язык из CRM: {call_lang}.\n"
-        )
+        system_prompt += f"\n\n<LANGUAGE_RULE>\n"
+        system_prompt += f"ГЛАВНОЕ ПРАВИЛО ЯЗЫКА: Изначально ты говоришь на языке '{call_lang}'. НО если клиент отвечает тебе или обращается на другом языке (перешел на русский или румынский), ТЫ ОБЯЗАН мгновенно и без извинений переключиться на язык клиента и продолжать диалог только на нём. Подстройка под язык клиента — твой абсолютный приоритет.\n"
+        system_prompt += f"</LANGUAGE_RULE>\n"
 
         tools = [
             {
@@ -809,10 +807,9 @@ async def handle_asterisk_conn(reader, writer):
                 model="gemini-3.1-flash-live-preview",
                 voice=persona_data.get("voice_model", "Enceladus"),
                 system_instruction=system_prompt,
-                vad=GeminiVADParams(
-                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
-                    silence_duration_ms=1200,
-                ),
+                # ИСПРАВЛЕНИЕ ЗАИКАНИЯ: ОТКЛЮЧАЕМ СЕРВЕРНЫЙ VAD. 
+                # Теперь конфликтов нет, паузами управляет только локальный SmartTurn.
+                vad=GeminiVADParams(disabled=True),
             ),
         )
 
@@ -883,7 +880,6 @@ async def handle_asterisk_conn(reader, writer):
             async def delayed_end():
                 await asyncio.sleep(3.5)
                 if task:
-                    # ИСПОЛЬЗУЕМ CancelFrame, ЧТОБЫ ИЗБЕЖАТЬ 30-СЕКУНДНОГО ЗАВИСАНИЯ GEMINI
                     await task.queue_frames([CancelFrame()])
             
             asyncio.create_task(delayed_end())
@@ -915,22 +911,22 @@ async def handle_asterisk_conn(reader, writer):
             greeting_prompt = (
                 f"SYSTEM EVENT: Клиент ({client_name}) ответил на исходящий звонок. "
                 f"Цель звонка, которую ты должен выполнить: {purpose}. "
-                f"Язык общения: {call_lang}. Начни разговор согласно твоему системному промпту и указанной цели."
+                f"Язык клиента: {call_lang}. Начни разговор согласно твоему системному промпту и указанной цели."
             )
         else:
             if time_context == "very_recent":
                 greeting_prompt = (
                     f"SYSTEM EVENT: Клиент {client_name} перезвонил спустя пару минут. Не здоровайся заново. "
-                    f"Скажи: 'Да-да, слушаю, связь прервалась' и продолжай суть."
+                    f"Язык клиента: {call_lang}. Скажи: 'Да-да, слушаю, связь прервалась' и продолжай суть."
                 )
             elif time_context == "same_day":
                 greeting_prompt = (
                     f"SYSTEM EVENT: Клиент {client_name} снова на связи. Уточни, чем еще можешь помочь по контексту прошлых бесед. "
-                    f"Опирайся на память (RECENT)."
+                    f"Язык клиента: {call_lang}. Опирайся на память (RECENT)."
                 )
             else:
                 greeting_prompt = (
-                    f"SYSTEM EVENT: Входящий звонок. Клиент: {client_name}. Язык: {call_lang}. "
+                    f"SYSTEM EVENT: Входящий звонок. Клиент: {client_name}. Язык клиента: {call_lang}. "
                     f"Начни диалог. Если есть память (RECENT), учитывай её и не задавай одни и те же вопросы."
                 )
 
