@@ -137,6 +137,15 @@ class AsteriskWSAdapter:
             self.client_state = WebSocketState.DISCONNECTED
             raise
 
+    # ВОССТАНОВЛЕННАЯ ФУНКЦИЯ, КОТОРАЯ ВОЗВРАЩАЕТ СЛУХ БОТУ
+    async def receive(self):
+        try:
+            data = await self.receive_bytes()
+            return {"type": "websocket.receive", "bytes": data}
+        except Exception:
+            self.client_state = WebSocketState.DISCONNECTED
+            return {"type": "websocket.disconnect", "code": 1000}
+
     async def send_bytes(self, data):
         if self.client_state != WebSocketState.CONNECTED:
             return
@@ -695,6 +704,7 @@ async def handle_asterisk_conn(reader, writer):
         tz = pytz.timezone("Europe/Chisinau")
         current_time = datetime.datetime.now(tz).strftime("%A, %d %B %Y, %H:%M")
         
+        # ОЧИСТКА ПРОМПТА ОТ ЖЕСТКИХ ПРАВИЛ ЯЗЫКА ИЗ CRM
         raw_prompt = re.sub(r"\d+\.\s*LIMBA.*?(?=\n\d+\.|\n\n|\Z)", "", raw_prompt, flags=re.IGNORECASE | re.DOTALL)
 
         system_prompt = raw_prompt.replace("{company_name}", client_data.get("company_name") or "Compania")
@@ -711,6 +721,7 @@ async def handle_asterisk_conn(reader, writer):
         system_prompt += f"LONG TERM: {caller_memory['long']}\n"
         system_prompt += "</USER_MEMORY>\n"
 
+        # ДИНАМИЧЕСКИЙ ПЕРЕХВАТ ЯЗЫКА
         system_prompt += f"\n\n<LANGUAGE_RULE>\n"
         system_prompt += f"ГЛАВНОЕ ПРАВИЛО ЯЗЫКА: Изначально ты говоришь на языке '{call_lang}'. НО если клиент отвечает тебе или обращается на другом языке (перешел на русский или румынский), ТЫ ОБЯЗАН мгновенно и без извинений переключиться на язык клиента и продолжать диалог только на нём. Подстройка под язык клиента — твой абсолютный приоритет.\n"
         system_prompt += f"</LANGUAGE_RULE>\n"
@@ -786,7 +797,6 @@ async def handle_asterisk_conn(reader, writer):
         context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
         context_aggregator = LLMContextAggregatorPair(context=context)
 
-        # ОСТАВЛЯЕМ VAD ВКЛЮЧЕННЫМ. Теперь он слышит только чистую речь.
         llm = GeminiLiveLLMService(
             api_key=GEMINI_API_KEY,
             tools=tools,
@@ -795,7 +805,7 @@ async def handle_asterisk_conn(reader, writer):
                 voice=persona_data.get("voice_model", "Enceladus"),
                 system_instruction=system_prompt,
                 vad=GeminiVADParams(
-                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
                     silence_duration_ms=1200,
                 ),
             ),
