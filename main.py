@@ -81,7 +81,7 @@ class RawPCMFrameSerializer(FrameSerializer):
         return None
 
 # ==========================================
-# АДАПТЕР ASTERISK -> WEBSOCKET
+# АДАПТЕР ASTERISK (С АНТИ-ЭХО И ШУМОВЫМ ГЕЙТОМ НА ЧИСТОМ PYTHON)
 # ==========================================
 class AsteriskWSAdapter:
     def __init__(self, reader, writer):
@@ -92,6 +92,7 @@ class AsteriskWSAdapter:
         self.in_state = None
         self.out_state = None
         self.next_send_time = time.time()
+        self.speaking_until = 0.0
 
     async def accept(self):
         pass
@@ -117,18 +118,24 @@ class AsteriskWSAdapter:
             resampled, self.in_state = audioop.ratecv(
                 data, 2, 1, 8000, 16000, self.in_state
             )
+            
+            # --- SOFTWARE AEC & NOISE GATE ---
+            now = time.time()
+            if now < self.speaking_until + 0.4:
+                # 1. Подавление эха: Бот недавно говорил. Заменяем входящий звук на тишину.
+                resampled = b'\x00' * len(resampled)
+            else:
+                # 2. Шумовой гейт: Вычисляем громкость фрейма
+                rms = audioop.rms(resampled, 2)
+                # Если громкость ниже порога (250 — это тихий шум линии), глушим фрейм.
+                # Это полностью убьет галлюцинации Gemini от "белого шума".
+                if rms < 250:
+                    resampled = b'\x00' * len(resampled)
+
             return resampled
         except Exception:
             self.client_state = WebSocketState.DISCONNECTED
             raise
-
-    async def receive(self):
-        try:
-            data = await self.receive_bytes()
-            return {"type": "websocket.receive", "bytes": data}
-        except Exception:
-            self.client_state = WebSocketState.DISCONNECTED
-            return {"type": "websocket.disconnect", "code": 1000}
 
     async def send_bytes(self, data):
         if self.client_state != WebSocketState.CONNECTED:
@@ -150,6 +157,9 @@ class AsteriskWSAdapter:
                 await asyncio.sleep(sleep_time)
 
             self.next_send_time += audio_duration
+            
+            # Обновляем таймер: до какого момента бот будет говорить
+            self.speaking_until = self.next_send_time
 
             header = b"\x10" + len(resampled).to_bytes(2, byteorder="big")
             self.writer.write(header + resampled)
@@ -427,7 +437,6 @@ LONG TERM: {old_memory.get('long', 'Нет данных')}
     while attempt < len(fallback_models):
         current_model = fallback_models[attempt]
         try:
-            print(f"🔄 [ARCHIVIST] Попытка {attempt + 1}: обращаемся к {current_model}...", flush=True)
             response = await client.aio.models.generate_content(
                 model=current_model,
                 contents=prompt,
@@ -437,7 +446,6 @@ LONG TERM: {old_memory.get('long', 'Нет данных')}
             break
             
         except Exception as e:
-            print(f"⚠️ [ARCHIVIST] Ошибка API ({current_model}): {e}. Ждем 3 сек...", flush=True)
             attempt += 1
             if attempt < len(fallback_models):
                 await asyncio.sleep(3)
@@ -624,6 +632,9 @@ async def handle_asterisk_conn(reader, writer):
     client_id = None
     target_phone = "Necunoscut"
     client_name = "client"
+    
+    is_outbound = False  
+    session_uuid = "unknown"
 
     try:
         header = await reader.readexactly(3)
@@ -635,7 +646,6 @@ async def handle_asterisk_conn(reader, writer):
             writer.close()
             return
 
-        is_outbound = False
         outbound_info = {}
         inbound_crm = {}
 
@@ -685,6 +695,8 @@ async def handle_asterisk_conn(reader, writer):
         tz = pytz.timezone("Europe/Chisinau")
         current_time = datetime.datetime.now(tz).strftime("%A, %d %B %Y, %H:%M")
         
+        raw_prompt = re.sub(r"\d+\.\s*LIMBA.*?(?=\n\d+\.|\n\n|\Z)", "", raw_prompt, flags=re.IGNORECASE | re.DOTALL)
+
         system_prompt = raw_prompt.replace("{company_name}", client_data.get("company_name") or "Compania")
         system_prompt = system_prompt.replace("{business_context}", client_data.get("business_context") or "")
         system_prompt = system_prompt.replace("{bot_goal}", client_data.get("bot_goal") or "")
@@ -699,7 +711,10 @@ async def handle_asterisk_conn(reader, writer):
         system_prompt += f"LONG TERM: {caller_memory['long']}\n"
         system_prompt += "</USER_MEMORY>\n"
 
-        # НОВЫЙ ИНСТРУМЕНТ: Завершение звонка (end_call)
+        system_prompt += f"\n\n<LANGUAGE_RULE>\n"
+        system_prompt += f"ГЛАВНОЕ ПРАВИЛО ЯЗЫКА: Изначально ты говоришь на языке '{call_lang}'. НО если клиент отвечает тебе или обращается на другом языке (перешел на русский или румынский), ТЫ ОБЯЗАН мгновенно и без извинений переключиться на язык клиента и продолжать диалог только на нём. Подстройка под язык клиента — твой абсолютный приоритет.\n"
+        system_prompt += f"</LANGUAGE_RULE>\n"
+
         tools = [
             {
                 "function_declarations": [
@@ -743,7 +758,7 @@ async def handle_asterisk_conn(reader, writer):
                     },
                     {
                         "name": "end_call",
-                        "description": "Încheie apelul. Folosește această funcție pentru a pune receptorul atunci când conversația s-a încheiat sau clientul și-a luat rămas bun.",
+                        "description": "Încheie apelul. OBLIGATORIU: Spune o scurtă frază de rămas-bun ÎNAINTE de a apela această funcție (ex: 'O zi bună, la revedere!'). Nu folosi această funcție fără a saluta la final.",
                         "parameters": {
                             "type": "object",
                             "properties": {},
@@ -771,6 +786,7 @@ async def handle_asterisk_conn(reader, writer):
         context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
         context_aggregator = LLMContextAggregatorPair(context=context)
 
+        # ОСТАВЛЯЕМ VAD ВКЛЮЧЕННЫМ. Теперь он слышит только чистую речь.
         llm = GeminiLiveLLMService(
             api_key=GEMINI_API_KEY,
             tools=tools,
@@ -779,7 +795,7 @@ async def handle_asterisk_conn(reader, writer):
                 voice=persona_data.get("voice_model", "Enceladus"),
                 system_instruction=system_prompt,
                 vad=GeminiVADParams(
-                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
                     silence_duration_ms=1200,
                 ),
             ),
@@ -846,11 +862,15 @@ async def handle_asterisk_conn(reader, writer):
                     await send_tg_alert(tg_chat, error_msg)
                     await params.result_callback({"status": "error", "message": str(e)})
 
-        # ЛОГИКА НОВОГО ИНСТРУМЕНТА END_CALL
         async def process_end_call(params: FunctionCallParams):
             await params.result_callback({"status": "success", "message": "Call ended"})
-            # Эта команда мгновенно прерывает пайплайн и отправляет скрипт в блок finally
-            await task.queue_frames([EndFrame()])
+            
+            async def delayed_end():
+                await asyncio.sleep(3.5)
+                if task:
+                    await task.queue_frames([CancelFrame()])
+            
+            asyncio.create_task(delayed_end())
 
         llm.register_function("save_lead", process_save_lead)
         llm.register_function("Booking_tool", process_booking)
@@ -859,16 +879,14 @@ async def handle_asterisk_conn(reader, writer):
 
         recovery_processor = InterruptionRecoveryProcessor(context)
 
-        pipeline = Pipeline(
-            [
-                transport.input(),
-                context_aggregator.user(),
-                llm,
-                recovery_processor,
-                transport.output(),
-                context_aggregator.assistant(),
-            ]
-        )
+        pipeline = Pipeline([
+            transport.input(),
+            context_aggregator.user(),
+            llm,
+            recovery_processor,
+            transport.output(),
+            context_aggregator.assistant(),
+        ])
 
         task = PipelineTask(
             pipeline,
@@ -881,22 +899,22 @@ async def handle_asterisk_conn(reader, writer):
             greeting_prompt = (
                 f"SYSTEM EVENT: Клиент ({client_name}) ответил на исходящий звонок. "
                 f"Цель звонка, которую ты должен выполнить: {purpose}. "
-                f"Язык общения: {call_lang}. Начни разговор согласно твоему системному промпту и указанной цели."
+                f"Язык клиента: {call_lang}. Начни разговор согласно твоему системному промпту и указанной цели."
             )
         else:
             if time_context == "very_recent":
                 greeting_prompt = (
                     f"SYSTEM EVENT: Клиент {client_name} перезвонил спустя пару минут. Не здоровайся заново. "
-                    f"Скажи: 'Да-да, слушаю, связь прервалась' и продолжай суть."
+                    f"Язык клиента: {call_lang}. Скажи: 'Да-да, слушаю, связь прервалась' и продолжай суть."
                 )
             elif time_context == "same_day":
                 greeting_prompt = (
                     f"SYSTEM EVENT: Клиент {client_name} снова на связи. Уточни, чем еще можешь помочь по контексту прошлых бесед. "
-                    f"Опирайся на память (RECENT)."
+                    f"Язык клиента: {call_lang}. Опирайся на память (RECENT)."
                 )
             else:
                 greeting_prompt = (
-                    f"SYSTEM EVENT: Входящий звонок. Клиент: {client_name}. Язык: {call_lang}. "
+                    f"SYSTEM EVENT: Входящий звонок. Клиент: {client_name}. Язык клиента: {call_lang}. "
                     f"Начни диалог. Если есть память (RECENT), учитывай её и не задавай одни и те же вопросы."
                 )
 
@@ -909,8 +927,6 @@ async def handle_asterisk_conn(reader, writer):
     finally:
         print("📞 Звонок завершен. Закрываем сокет и собираем данные...", flush=True)
         
-        # 1. МГНОВЕННОЕ ЗАКРЫТИЕ СОКЕТА
-        # Разрываем связь до генерации саммари. Asterisk сразу кладет трубку.
         try:
             writer.close()
         except Exception:
@@ -919,7 +935,6 @@ async def handle_asterisk_conn(reader, writer):
         call_direction = "outbound" if is_outbound else "inbound"
         wav_filename = f"{ASTERISK_RECORDING_PATH}/{session_uuid}.wav"
         
-        # 2. ИЗВЛЕЧЕНИЕ КОНТЕКСТА В ЛОКАЛЬНЫЕ ПЕРЕМЕННЫЕ
         has_context = "context" in locals() and context is not None
         if has_context and client_id:
             user_replies = [
@@ -934,10 +949,8 @@ async def handle_asterisk_conn(reader, writer):
                         role = "Client" if msg["role"] == "user" else "AI"
                         full_transcript += f"{role}: {msg['content']}\n"
 
-            # 3. ФОНОВАЯ ОБРАБОТКА И ОТПРАВКА
-            # Эта функция выполняется в фоне, не блокируя основной процесс FastAPI
             async def background_post_processing():
-                await asyncio.sleep(0.5) # Даем Астериску время дописать файл
+                await asyncio.sleep(0.5)
                 try:
                     if len(user_replies) == 0:
                         call_status = "outbound_short_call" if is_outbound else "inbound_dropped"
@@ -959,7 +972,6 @@ async def handle_asterisk_conn(reader, writer):
                         except Exception: pass
                     gc.collect()
 
-            # Запускаем фоновую задачу, не ожидая (без await)
             asyncio.create_task(background_post_processing())
         else:
             gc.collect()
