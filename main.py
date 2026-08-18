@@ -81,7 +81,7 @@ class RawPCMFrameSerializer(FrameSerializer):
         return None
 
 # ==========================================
-# АДАПТЕР ASTERISK (С АНТИ-ЭХО И ШУМОВЫМ ГЕЙТОМ НА ЧИСТОМ PYTHON)
+# АДАПТЕР ASTERISK -> WEBSOCKET (ЧИСТЫЙ И СТАБИЛЬНЫЙ)
 # ==========================================
 class AsteriskWSAdapter:
     def __init__(self, reader, writer):
@@ -92,7 +92,6 @@ class AsteriskWSAdapter:
         self.in_state = None
         self.out_state = None
         self.next_send_time = time.time()
-        self.speaking_until = 0.0
 
     async def accept(self):
         pass
@@ -118,26 +117,11 @@ class AsteriskWSAdapter:
             resampled, self.in_state = audioop.ratecv(
                 data, 2, 1, 8000, 16000, self.in_state
             )
-            
-            # --- SOFTWARE AEC & NOISE GATE ---
-            now = time.time()
-            if now < self.speaking_until + 0.4:
-                # 1. Подавление эха: Бот недавно говорил. Заменяем входящий звук на тишину.
-                resampled = b'\x00' * len(resampled)
-            else:
-                # 2. Шумовой гейт: Вычисляем громкость фрейма
-                rms = audioop.rms(resampled, 2)
-                # Если громкость ниже порога (250 — это тихий шум линии), глушим фрейм.
-                # Это полностью убьет галлюцинации Gemini от "белого шума".
-                if rms < 250:
-                    resampled = b'\x00' * len(resampled)
-
             return resampled
         except Exception:
             self.client_state = WebSocketState.DISCONNECTED
             raise
 
-    # ВОССТАНОВЛЕННАЯ ФУНКЦИЯ, КОТОРАЯ ВОЗВРАЩАЕТ СЛУХ БОТУ
     async def receive(self):
         try:
             data = await self.receive_bytes()
@@ -166,9 +150,6 @@ class AsteriskWSAdapter:
                 await asyncio.sleep(sleep_time)
 
             self.next_send_time += audio_duration
-            
-            # Обновляем таймер: до какого момента бот будет говорить
-            self.speaking_until = self.next_send_time
 
             header = b"\x10" + len(resampled).to_bytes(2, byteorder="big")
             self.writer.write(header + resampled)
@@ -704,7 +685,6 @@ async def handle_asterisk_conn(reader, writer):
         tz = pytz.timezone("Europe/Chisinau")
         current_time = datetime.datetime.now(tz).strftime("%A, %d %B %Y, %H:%M")
         
-        # ОЧИСТКА ПРОМПТА ОТ ЖЕСТКИХ ПРАВИЛ ЯЗЫКА ИЗ CRM
         raw_prompt = re.sub(r"\d+\.\s*LIMBA.*?(?=\n\d+\.|\n\n|\Z)", "", raw_prompt, flags=re.IGNORECASE | re.DOTALL)
 
         system_prompt = raw_prompt.replace("{company_name}", client_data.get("company_name") or "Compania")
@@ -721,7 +701,6 @@ async def handle_asterisk_conn(reader, writer):
         system_prompt += f"LONG TERM: {caller_memory['long']}\n"
         system_prompt += "</USER_MEMORY>\n"
 
-        # ДИНАМИЧЕСКИЙ ПЕРЕХВАТ ЯЗЫКА
         system_prompt += f"\n\n<LANGUAGE_RULE>\n"
         system_prompt += f"ГЛАВНОЕ ПРАВИЛО ЯЗЫКА: Изначально ты говоришь на языке '{call_lang}'. НО если клиент отвечает тебе или обращается на другом языке (перешел на русский или румынский), ТЫ ОБЯЗАН мгновенно и без извинений переключиться на язык клиента и продолжать диалог только на нём. Подстройка под язык клиента — твой абсолютный приоритет.\n"
         system_prompt += f"</LANGUAGE_RULE>\n"
@@ -805,7 +784,7 @@ async def handle_asterisk_conn(reader, writer):
                 voice=persona_data.get("voice_model", "Enceladus"),
                 system_instruction=system_prompt,
                 vad=GeminiVADParams(
-                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
                     silence_duration_ms=1200,
                 ),
             ),
