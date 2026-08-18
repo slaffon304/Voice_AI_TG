@@ -46,14 +46,6 @@ from supabase import Client, create_client
 import redis.asyncio as redis
 import gc
 
-# Попытка импорта RNNoiseFilter для подавления фонового шума
-try:
-    from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
-    HAS_RNNOISE = True
-except ImportError:
-    HAS_RNNOISE = False
-    print("⚠️ RNNoiseFilter не установлен. Для подавления шумов выполните: pip install 'pipecat-ai[rnnoise]'")
-
 # ==========================================
 # ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
 # ==========================================
@@ -707,6 +699,7 @@ async def handle_asterisk_conn(reader, writer):
         system_prompt += f"LONG TERM: {caller_memory['long']}\n"
         system_prompt += "</USER_MEMORY>\n"
 
+        # НОВЫЙ ИНСТРУМЕНТ: Завершение звонка (end_call)
         tools = [
             {
                 "function_declarations": [
@@ -750,7 +743,7 @@ async def handle_asterisk_conn(reader, writer):
                     },
                     {
                         "name": "end_call",
-                        "description": "Încheie apelul. OBLIGATORIU: Spune o scurtă frază de rămas-bun ÎNAINTE de a apela această funcție (ex: 'O zi bună, la revedere!'). Nu folosi această funcție fără a saluta la final.",
+                        "description": "Încheie apelul. Folosește această funcție pentru a pune receptorul atunci când conversația s-a încheiat sau clientul și-a luat rămas bun.",
                         "parameters": {
                             "type": "object",
                             "properties": {},
@@ -853,16 +846,11 @@ async def handle_asterisk_conn(reader, writer):
                     await send_tg_alert(tg_chat, error_msg)
                     await params.result_callback({"status": "error", "message": str(e)})
 
+        # ЛОГИКА НОВОГО ИНСТРУМЕНТА END_CALL
         async def process_end_call(params: FunctionCallParams):
             await params.result_callback({"status": "success", "message": "Call ended"})
-            
-            # Даем ИИ 3.5 секунды, чтобы договорить слова прощания, и только потом рубим пайплайн
-            async def delayed_end():
-                await asyncio.sleep(3.5)
-                if task:
-                    await task.queue_frames([EndFrame()])
-            
-            asyncio.create_task(delayed_end())
+            # Эта команда мгновенно прерывает пайплайн и отправляет скрипт в блок finally
+            await task.queue_frames([EndFrame()])
 
         llm.register_function("save_lead", process_save_lead)
         llm.register_function("Booking_tool", process_booking)
@@ -871,19 +859,16 @@ async def handle_asterisk_conn(reader, writer):
 
         recovery_processor = InterruptionRecoveryProcessor(context)
 
-        # Сборка пайплайна с учетом шумоподавления (если установлено)
-        processors_list = [transport.input()]
-        if HAS_RNNOISE:
-            processors_list.append(RNNoiseFilter())
-        processors_list.extend([
-            context_aggregator.user(),
-            llm,
-            recovery_processor,
-            transport.output(),
-            context_aggregator.assistant(),
-        ])
-        
-        pipeline = Pipeline(processors_list)
+        pipeline = Pipeline(
+            [
+                transport.input(),
+                context_aggregator.user(),
+                llm,
+                recovery_processor,
+                transport.output(),
+                context_aggregator.assistant(),
+            ]
+        )
 
         task = PipelineTask(
             pipeline,
@@ -924,6 +909,8 @@ async def handle_asterisk_conn(reader, writer):
     finally:
         print("📞 Звонок завершен. Закрываем сокет и собираем данные...", flush=True)
         
+        # 1. МГНОВЕННОЕ ЗАКРЫТИЕ СОКЕТА
+        # Разрываем связь до генерации саммари. Asterisk сразу кладет трубку.
         try:
             writer.close()
         except Exception:
@@ -932,6 +919,7 @@ async def handle_asterisk_conn(reader, writer):
         call_direction = "outbound" if is_outbound else "inbound"
         wav_filename = f"{ASTERISK_RECORDING_PATH}/{session_uuid}.wav"
         
+        # 2. ИЗВЛЕЧЕНИЕ КОНТЕКСТА В ЛОКАЛЬНЫЕ ПЕРЕМЕННЫЕ
         has_context = "context" in locals() and context is not None
         if has_context and client_id:
             user_replies = [
@@ -946,8 +934,10 @@ async def handle_asterisk_conn(reader, writer):
                         role = "Client" if msg["role"] == "user" else "AI"
                         full_transcript += f"{role}: {msg['content']}\n"
 
+            # 3. ФОНОВАЯ ОБРАБОТКА И ОТПРАВКА
+            # Эта функция выполняется в фоне, не блокируя основной процесс FastAPI
             async def background_post_processing():
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.5) # Даем Астериску время дописать файл
                 try:
                     if len(user_replies) == 0:
                         call_status = "outbound_short_call" if is_outbound else "inbound_dropped"
@@ -969,6 +959,7 @@ async def handle_asterisk_conn(reader, writer):
                         except Exception: pass
                     gc.collect()
 
+            # Запускаем фоновую задачу, не ожидая (без await)
             asyncio.create_task(background_post_processing())
         else:
             gc.collect()
