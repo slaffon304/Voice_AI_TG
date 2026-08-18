@@ -805,7 +805,7 @@ async def handle_asterisk_conn(reader, writer):
                 voice=persona_data.get("voice_model", "Enceladus"),
                 system_instruction=system_prompt,
                 vad=GeminiVADParams(
-                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
                     silence_duration_ms=1200,
                 ),
             ),
