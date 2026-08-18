@@ -46,18 +46,13 @@ from supabase import Client, create_client
 import redis.asyncio as redis
 import gc
 
-# ==========================================
-# ШУМОПОДАВЛЕНИЕ (Прямая интеграция)
-# ==========================================
+# Попытка импорта RNNoiseFilter для подавления фонового шума
 try:
-    import pyrnnoise
-    rnnoise_filter = pyrnnoise.RNNoise()
+    from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
     HAS_RNNOISE = True
-    print("✅ Инициализирован pyrnnoise (Шумоподавление включено)", flush=True)
 except ImportError:
     HAS_RNNOISE = False
-    rnnoise_filter = None
-    print("⚠️ pyrnnoise не установлен. Для подавления шумов выполните: pip install pyrnnoise", flush=True)
+    print("⚠️ RNNoiseFilter не установлен. Для подавления шумов выполните: pip install 'pipecat-ai[rnnoise]'")
 
 # ==========================================
 # ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
@@ -94,7 +89,7 @@ class RawPCMFrameSerializer(FrameSerializer):
         return None
 
 # ==========================================
-# АДАПТЕР ASTERISK -> WEBSOCKET (С ФИЛЬТРОМ ШУМА)
+# АДАПТЕР ASTERISK -> WEBSOCKET
 # ==========================================
 class AsteriskWSAdapter:
     def __init__(self, reader, writer):
@@ -130,13 +125,6 @@ class AsteriskWSAdapter:
             resampled, self.in_state = audioop.ratecv(
                 data, 2, 1, 8000, 16000, self.in_state
             )
-            
-            if HAS_RNNOISE and rnnoise_filter and len(resampled) == 320:
-                try:
-                    resampled = rnnoise_filter.filter(resampled)
-                except Exception:
-                    pass
-
             return resampled
         except Exception:
             self.client_state = WebSocketState.DISCONNECTED
@@ -447,6 +435,7 @@ LONG TERM: {old_memory.get('long', 'Нет данных')}
     while attempt < len(fallback_models):
         current_model = fallback_models[attempt]
         try:
+            print(f"🔄 [ARCHIVIST] Попытка {attempt + 1}: обращаемся к {current_model}...", flush=True)
             response = await client.aio.models.generate_content(
                 model=current_model,
                 contents=prompt,
@@ -456,6 +445,7 @@ LONG TERM: {old_memory.get('long', 'Нет данных')}
             break
             
         except Exception as e:
+            print(f"⚠️ [ARCHIVIST] Ошибка API ({current_model}): {e}. Ждем 3 сек...", flush=True)
             attempt += 1
             if attempt < len(fallback_models):
                 await asyncio.sleep(3)
@@ -642,10 +632,6 @@ async def handle_asterisk_conn(reader, writer):
     client_id = None
     target_phone = "Necunoscut"
     client_name = "client"
-    
-    # Инициализируем переменные до try, чтобы избежать UnboundLocalError при крашах
-    is_outbound = False  
-    session_uuid = "unknown"
 
     try:
         header = await reader.readexactly(3)
@@ -657,6 +643,7 @@ async def handle_asterisk_conn(reader, writer):
             writer.close()
             return
 
+        is_outbound = False
         outbound_info = {}
         inbound_crm = {}
 
@@ -706,10 +693,6 @@ async def handle_asterisk_conn(reader, writer):
         tz = pytz.timezone("Europe/Chisinau")
         current_time = datetime.datetime.now(tz).strftime("%A, %d %B %Y, %H:%M")
         
-        # ОЧИСТКА ПРОМПТА ОТ ЖЕСТКИХ ПРАВИЛ ЯЗЫКА ИЗ CRM
-        # Это удалит фразу "1. LIMBA (CRITIC):..." чтобы она не блокировала переключение языка
-        raw_prompt = re.sub(r"\d+\.\s*LIMBA.*?(?=\n\d+\.|\n\n|\Z)", "", raw_prompt, flags=re.IGNORECASE | re.DOTALL)
-
         system_prompt = raw_prompt.replace("{company_name}", client_data.get("company_name") or "Compania")
         system_prompt = system_prompt.replace("{business_context}", client_data.get("business_context") or "")
         system_prompt = system_prompt.replace("{bot_goal}", client_data.get("bot_goal") or "")
@@ -723,11 +706,6 @@ async def handle_asterisk_conn(reader, writer):
         system_prompt += f"RECENT: {caller_memory['short']}\n"
         system_prompt += f"LONG TERM: {caller_memory['long']}\n"
         system_prompt += "</USER_MEMORY>\n"
-
-        # ДИНАМИЧЕСКИЙ ПЕРЕХВАТ ЯЗЫКА
-        system_prompt += f"\n\n<LANGUAGE_RULE>\n"
-        system_prompt += f"ГЛАВНОЕ ПРАВИЛО ЯЗЫКА: Изначально ты говоришь на языке '{call_lang}'. НО если клиент отвечает тебе или обращается на другом языке (перешел на русский или румынский), ТЫ ОБЯЗАН мгновенно и без извинений переключиться на язык клиента и продолжать диалог только на нём. Подстройка под язык клиента — твой абсолютный приоритет.\n"
-        system_prompt += f"</LANGUAGE_RULE>\n"
 
         tools = [
             {
@@ -807,9 +785,10 @@ async def handle_asterisk_conn(reader, writer):
                 model="gemini-3.1-flash-live-preview",
                 voice=persona_data.get("voice_model", "Enceladus"),
                 system_instruction=system_prompt,
-                # ИСПРАВЛЕНИЕ ЗАИКАНИЯ: ОТКЛЮЧАЕМ СЕРВЕРНЫЙ VAD. 
-                # Теперь конфликтов нет, паузами управляет только локальный SmartTurn.
-                vad=GeminiVADParams(disabled=True),
+                vad=GeminiVADParams(
+                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
+                    silence_duration_ms=1200,
+                ),
             ),
         )
 
@@ -877,10 +856,11 @@ async def handle_asterisk_conn(reader, writer):
         async def process_end_call(params: FunctionCallParams):
             await params.result_callback({"status": "success", "message": "Call ended"})
             
+            # Даем ИИ 3.5 секунды, чтобы договорить слова прощания, и только потом рубим пайплайн
             async def delayed_end():
                 await asyncio.sleep(3.5)
                 if task:
-                    await task.queue_frames([CancelFrame()])
+                    await task.queue_frames([EndFrame()])
             
             asyncio.create_task(delayed_end())
 
@@ -891,14 +871,19 @@ async def handle_asterisk_conn(reader, writer):
 
         recovery_processor = InterruptionRecoveryProcessor(context)
 
-        pipeline = Pipeline([
-            transport.input(),
+        # Сборка пайплайна с учетом шумоподавления (если установлено)
+        processors_list = [transport.input()]
+        if HAS_RNNOISE:
+            processors_list.append(RNNoiseFilter())
+        processors_list.extend([
             context_aggregator.user(),
             llm,
             recovery_processor,
             transport.output(),
             context_aggregator.assistant(),
         ])
+        
+        pipeline = Pipeline(processors_list)
 
         task = PipelineTask(
             pipeline,
@@ -911,22 +896,22 @@ async def handle_asterisk_conn(reader, writer):
             greeting_prompt = (
                 f"SYSTEM EVENT: Клиент ({client_name}) ответил на исходящий звонок. "
                 f"Цель звонка, которую ты должен выполнить: {purpose}. "
-                f"Язык клиента: {call_lang}. Начни разговор согласно твоему системному промпту и указанной цели."
+                f"Язык общения: {call_lang}. Начни разговор согласно твоему системному промпту и указанной цели."
             )
         else:
             if time_context == "very_recent":
                 greeting_prompt = (
                     f"SYSTEM EVENT: Клиент {client_name} перезвонил спустя пару минут. Не здоровайся заново. "
-                    f"Язык клиента: {call_lang}. Скажи: 'Да-да, слушаю, связь прервалась' и продолжай суть."
+                    f"Скажи: 'Да-да, слушаю, связь прервалась' и продолжай суть."
                 )
             elif time_context == "same_day":
                 greeting_prompt = (
                     f"SYSTEM EVENT: Клиент {client_name} снова на связи. Уточни, чем еще можешь помочь по контексту прошлых бесед. "
-                    f"Язык клиента: {call_lang}. Опирайся на память (RECENT)."
+                    f"Опирайся на память (RECENT)."
                 )
             else:
                 greeting_prompt = (
-                    f"SYSTEM EVENT: Входящий звонок. Клиент: {client_name}. Язык клиента: {call_lang}. "
+                    f"SYSTEM EVENT: Входящий звонок. Клиент: {client_name}. Язык: {call_lang}. "
                     f"Начни диалог. Если есть память (RECENT), учитывай её и не задавай одни и те же вопросы."
                 )
 
