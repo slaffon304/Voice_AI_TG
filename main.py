@@ -39,6 +39,8 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
+# Официальный импорт фильтра шума Pipecat
+from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
 from pydantic import BaseModel
 import pytz
 from starlette.websockets import WebSocketState
@@ -81,7 +83,7 @@ class RawPCMFrameSerializer(FrameSerializer):
         return None
 
 # ==========================================
-# АДАПТЕР ASTERISK -> WEBSOCKET (ЧИСТЫЙ И СТАБИЛЬНЫЙ)
+# АДАПТЕР ASTERISK (ЧИСТЫЙ, БЕЗ КОСТЫЛЕЙ)
 # ==========================================
 class AsteriskWSAdapter:
     def __init__(self, reader, writer):
@@ -114,6 +116,7 @@ class AsteriskWSAdapter:
                 self.client_state = WebSocketState.DISCONNECTED
                 raise Exception("Hangup")
 
+            # Только ресемплинг. Шумоподавление берет на себя RNNoiseFilter в транспорте.
             resampled, self.in_state = audioop.ratecv(
                 data, 2, 1, 8000, 16000, self.in_state
             )
@@ -705,6 +708,7 @@ async def handle_asterisk_conn(reader, writer):
         system_prompt += f"ГЛАВНОЕ ПРАВИЛО ЯЗЫКА: Изначально ты говоришь на языке '{call_lang}'. НО если клиент отвечает тебе или обращается на другом языке (перешел на русский или румынский), ТЫ ОБЯЗАН мгновенно и без извинений переключиться на язык клиента и продолжать диалог только на нём. Подстройка под язык клиента — твой абсолютный приоритет.\n"
         system_prompt += f"</LANGUAGE_RULE>\n"
 
+        # ЖЕСТКАЯ ИНСТРУКЦИЯ ДЛЯ УСМИРЕНИЯ АГРЕССИВНОГО БРОНИРОВАНИЯ
         tools = [
             {
                 "function_declarations": [
@@ -723,7 +727,7 @@ async def handle_asterisk_conn(reader, writer):
                     },
                     {
                         "name": "Booking_tool",
-                        "description": "Gestionează calendarul.",
+                        "description": "Gestionează calendarul. ВНИМАНИЕ: Вызывать эту функцию ТОЛЬКО если клиент ПРЯМО попросил назначить встречу или проверить свободное время. Не вызывай для обычных консультаций или рассказов о деталях проекта.",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -763,10 +767,13 @@ async def handle_asterisk_conn(reader, writer):
         system_instructions_length = len(full_system_text)
 
         fake_websocket = AsteriskWSAdapter(reader, writer)
+        
+        # ⚡ ПРАВИЛЬНАЯ ИНТЕГРАЦИЯ RNNOISE В ТРАНСПОРТ СОГЛАСНО ДОКУМЕНТАЦИИ PIPECAT 
         transport = FastAPIWebsocketTransport(
             websocket=fake_websocket,
             params=FastAPIWebsocketParams(
                 audio_in_enabled=True,
+                audio_in_filter=RNNoiseFilter(), # Подавление шума в реальном времени!
                 audio_out_enabled=True,
                 add_wav_header=False,
                 serializer=RawPCMFrameSerializer(),
@@ -776,6 +783,7 @@ async def handle_asterisk_conn(reader, writer):
         context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
         context_aggregator = LLMContextAggregatorPair(context=context)
 
+        # Gemini VAD включен для отслеживания пауз, аудио чистое благодаря фильтру
         llm = GeminiLiveLLMService(
             api_key=GEMINI_API_KEY,
             tools=tools,
@@ -784,7 +792,7 @@ async def handle_asterisk_conn(reader, writer):
                 voice=persona_data.get("voice_model", "Enceladus"),
                 system_instruction=system_prompt,
                 vad=GeminiVADParams(
-                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
                     silence_duration_ms=1200,
                 ),
             ),
