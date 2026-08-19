@@ -82,7 +82,7 @@ class RawPCMFrameSerializer(FrameSerializer):
         return None
 
 # ==========================================
-# АДАПТЕР ASTERISK (ЧИСТЫЙ)
+# АДАПТЕР ASTERISK -> WEBSOCKET (ЧИСТЫЙ И СТАБИЛЬНЫЙ)
 # ==========================================
 class AsteriskWSAdapter:
     def __init__(self, reader, writer):
@@ -166,6 +166,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ==========================================
+# ФУНКЦИИ ФОРМАТИРОВАНИЯ ТЕЛЕФОНА
+# ==========================================
 def format_kommo_phone(phone: str) -> str:
     if not phone or phone == "Necunoscut":
         return "Necunoscut"
@@ -197,6 +200,9 @@ def extract_real_phone(*args, ignore_trunk="78001079"):
                 return num
     return "Necunoscut"
 
+# ==========================================
+# ФУНКЦИИ БАЗЫ ДАННЫХ И ПАМЯТИ
+# ==========================================
 async def get_client_data(client_id: str):
     if not SUPABASE_URL or not SUPABASE_KEY:
         return None
@@ -361,6 +367,9 @@ async def upload_audio_to_supabase(client_id: str, filepath: str) -> str | None:
         print(f"❌ [STORAGE] Ошибка загрузки файла {filepath}: {e}", flush=True)
         return None
 
+# ==========================================
+# ИИ-АРХИВАРИУС (Консолидация памяти + Отчет)
+# ==========================================
 async def run_archivist_and_notify_n8n(
     client_id: str, phone: str, client_name: str, old_memory: dict, chat_history: str, 
     audio_url: str, sys_length: int, direction: str, call_status: str
@@ -484,6 +493,9 @@ LONG TERM: {old_memory.get('long', 'Нет данных')}
         print(f"❌ [ARCHIVIST] Ошибка сохранения/отправки: {e}", flush=True)
 
 
+# ==========================================
+# ЭНДПОИНТЫ API
+# ==========================================
 @app.get("/get_uuid")
 async def get_client_uuid(
     sip_login: str = None, 
@@ -674,12 +686,6 @@ async def handle_asterisk_conn(reader, writer):
         tz = pytz.timezone("Europe/Chisinau")
         current_time = datetime.datetime.now(tz).strftime("%A, %d %B %Y, %H:%M")
         
-        # 1. Убираем языковые правила CRM, чтобы они не конфликтовали с нашими
-        raw_prompt = re.sub(r"\d+\.\s*LIMBA.*?(?=\n\d+\.|\n\n|\Z)", "", raw_prompt, flags=re.IGNORECASE | re.DOTALL)
-        
-        # 2. СМЯГЧЕНИЕ АГРЕССИИ ИЗ CRM (Меняем жесткую установку на консультацию)
-        raw_prompt = raw_prompt.replace("appointments/calls booking", "informare și consultare")
-
         system_prompt = raw_prompt.replace("{company_name}", client_data.get("company_name") or "Compania")
         system_prompt = system_prompt.replace("{business_context}", client_data.get("business_context") or "")
         system_prompt = system_prompt.replace("{bot_goal}", client_data.get("bot_goal") or "")
@@ -694,79 +700,70 @@ async def handle_asterisk_conn(reader, writer):
         system_prompt += f"LONG TERM: {caller_memory['long']}\n"
         system_prompt += "</USER_MEMORY>\n"
 
-        # 3. ЖЕСТКИЙ БЛОК УКРАИНСКОГО И ДРУГИХ ЯЗЫКОВ
-        system_prompt += f"\n\n<LANGUAGE_RULE>\n"
-        system_prompt += f"ГЛАВНОЕ ПРАВИЛО ЯЗЫКА: Твой базовый язык для этого звонка — '{call_lang}'. Ты имеешь право говорить ТОЛЬКО на русском (ru) или румынском (ro). Подстраивайся под клиента: если он говорит по-русски — отвечай по-русски, если по-румынски — по-румынски. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать украинский (uk), английский (en) или любые другие языки, даже если система распознала их из-за фонового шума.\n"
-        system_prompt += f"</LANGUAGE_RULE>\n"
-
-        tools = [
+        active_tools = [
             {
-                "function_declarations": [
-                    {
-                        "name": "save_lead",
-                        "description": "Salvează datele de contact și motivul apelului în CRM.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "client_name": {"type": "string"},
-                                "client_phone": {"type": "string"},
-                                "request_summary": {"type": "string"}
-                            },
-                            "required": ["client_name", "client_phone", "request_summary"],
-                        },
+                "name": "save_lead",
+                "description": "Salvează datele de contact și motivul apelului în CRM.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "client_name": {"type": "string"},
+                        "client_phone": {"type": "string"},
+                        "request_summary": {"type": "string"}
                     },
-                    {
-                        "name": "Booking_tool",
-                        # 4. СТРОГИЙ ЗАПРЕТ НА ВЫЗОВ КАЛЕНДАРЯ ПРИ ОТМАЗКАХ КЛИЕНТА
-                        "description": "Gestionează calendarul. КРИТИЧЕСКОЕ ПРАВИЛО: Вызывать ТОЛЬКО если клиент ПРЯМО и ЧЕТКО сказал 'хочу назначить встречу', 'давай созвонимся', 'забронируй звонок'. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО вызывать эту функцию, если клиент говорит 'мне пора на встречу', 'я ухожу', 'у меня дела', или просто просит рассказать подробности.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "action": {"type": "string", "enum": ["check", "book", "cancel"]},
-                                "phone": {"type": "string"},
-                                "start_time": {"type": "string"}
-                            },
-                            "required": ["action"],
-                        },
+                    "required": ["client_name", "client_phone", "request_summary"],
+                },
+            },
+            {
+                "name": "send_sms",
+                "description": "Trimite un SMS clientului.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "phone": {"type": "string"},
+                        "message": {"type": "string"}
                     },
-                    {
-                        "name": "send_sms",
-                        "description": "Trimite un SMS clientului.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "phone": {"type": "string"},
-                                "message": {"type": "string"}
-                            },
-                            "required": ["phone", "message"],
-                        },
-                    },
-                    {
-                        "name": "end_call",
-                        "description": "Încheie apelul. OBLIGATORIU: Spune o scurtă frază de rămas-bun ÎNAINTE de a apela această funcție (ex: 'O zi bună, la revedere!'). Nu folosi această funcție fără a saluta la final.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {},
-                            "required": []
-                        }
-                    }
-                ]
+                    "required": ["phone", "message"],
+                },
+            },
+            {
+                "name": "end_call",
+                "description": "Încheie apelul. OBLIGATORIU: Spune o scurtă frază de rămas-bun ÎNAINTE de a apela această funcție (ex: 'O zi bună, la revedere!'). Nu folosi această funcție fără a saluta la final.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
             }
         ]
 
+        if client_data.get("google_calendar_id"):
+            active_tools.append({
+                "name": "Booking_tool",
+                "description": "Gestionează calendarul. Folosește această funcție DOAR atunci când clientul cere explicit o programare.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["check", "book", "cancel"]},
+                        "phone": {"type": "string"},
+                        "start_time": {"type": "string"}
+                    },
+                    "required": ["action"],
+                },
+            })
+
+        tools = [{"function_declarations": active_tools}]
         full_system_text = system_prompt + json.dumps(tools)
         system_instructions_length = len(full_system_text)
 
         fake_websocket = AsteriskWSAdapter(reader, writer)
-        
-        # Транспорт с официальным RNNoiseFilter (зависимости добавлены)
         transport = FastAPIWebsocketTransport(
             websocket=fake_websocket,
             params=FastAPIWebsocketParams(
                 audio_in_enabled=True,
-                audio_in_filter=RNNoiseFilter(), 
                 audio_out_enabled=True,
                 add_wav_header=False,
+                audio_in_filter=RNNoiseFilter(),
                 serializer=RawPCMFrameSerializer(),
             ),
         )
@@ -860,9 +857,10 @@ async def handle_asterisk_conn(reader, writer):
             asyncio.create_task(delayed_end())
 
         llm.register_function("save_lead", process_save_lead)
-        llm.register_function("Booking_tool", process_booking)
         llm.register_function("send_sms", process_sms)
         llm.register_function("end_call", process_end_call)
+        if client_data.get("google_calendar_id"):
+            llm.register_function("Booking_tool", process_booking)
 
         recovery_processor = InterruptionRecoveryProcessor(context)
 
