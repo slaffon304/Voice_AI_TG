@@ -1,17 +1,8 @@
 # Используем легковесный образ Python
 FROM python:3.11-slim
 
-# Устанавливаем системные зависимости для работы со звуком и компиляции пакета av
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    pkg-config \
-    libavformat-dev \
-    libavcodec-dev \
-    libavdevice-dev \
-    libavutil-dev \
-    libswscale-dev \
-    libswresample-dev \
-    libavfilter-dev \
+# Устанавливаем только ffmpeg, без лишнего мусора для разработки
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
