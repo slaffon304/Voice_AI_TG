@@ -39,7 +39,6 @@ from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
 )
-# Официальный импорт фильтра шума Pipecat
 from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
 from pydantic import BaseModel
 import pytz
@@ -83,7 +82,7 @@ class RawPCMFrameSerializer(FrameSerializer):
         return None
 
 # ==========================================
-# АДАПТЕР ASTERISK (ЧИСТЫЙ, БЕЗ КОСТЫЛЕЙ)
+# АДАПТЕР ASTERISK (ЧИСТЫЙ)
 # ==========================================
 class AsteriskWSAdapter:
     def __init__(self, reader, writer):
@@ -116,7 +115,6 @@ class AsteriskWSAdapter:
                 self.client_state = WebSocketState.DISCONNECTED
                 raise Exception("Hangup")
 
-            # Только ресемплинг. Шумоподавление берет на себя RNNoiseFilter в транспорте.
             resampled, self.in_state = audioop.ratecv(
                 data, 2, 1, 8000, 16000, self.in_state
             )
@@ -168,9 +166,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==========================================
-# ФУНКЦИИ ФОРМАТИРОВАНИЯ ТЕЛЕФОНА
-# ==========================================
 def format_kommo_phone(phone: str) -> str:
     if not phone or phone == "Necunoscut":
         return "Necunoscut"
@@ -202,9 +197,6 @@ def extract_real_phone(*args, ignore_trunk="78001079"):
                 return num
     return "Necunoscut"
 
-# ==========================================
-# ФУНКЦИИ БАЗЫ ДАННЫХ И ПАМЯТИ
-# ==========================================
 async def get_client_data(client_id: str):
     if not SUPABASE_URL or not SUPABASE_KEY:
         return None
@@ -369,9 +361,6 @@ async def upload_audio_to_supabase(client_id: str, filepath: str) -> str | None:
         print(f"❌ [STORAGE] Ошибка загрузки файла {filepath}: {e}", flush=True)
         return None
 
-# ==========================================
-# ИИ-АРХИВАРИУС (Консолидация памяти + Отчет)
-# ==========================================
 async def run_archivist_and_notify_n8n(
     client_id: str, phone: str, client_name: str, old_memory: dict, chat_history: str, 
     audio_url: str, sys_length: int, direction: str, call_status: str
@@ -495,9 +484,6 @@ LONG TERM: {old_memory.get('long', 'Нет данных')}
         print(f"❌ [ARCHIVIST] Ошибка сохранения/отправки: {e}", flush=True)
 
 
-# ==========================================
-# ЭНДПОИНТЫ API
-# ==========================================
 @app.get("/get_uuid")
 async def get_client_uuid(
     sip_login: str = None, 
@@ -688,7 +674,11 @@ async def handle_asterisk_conn(reader, writer):
         tz = pytz.timezone("Europe/Chisinau")
         current_time = datetime.datetime.now(tz).strftime("%A, %d %B %Y, %H:%M")
         
+        # 1. Убираем языковые правила CRM, чтобы они не конфликтовали с нашими
         raw_prompt = re.sub(r"\d+\.\s*LIMBA.*?(?=\n\d+\.|\n\n|\Z)", "", raw_prompt, flags=re.IGNORECASE | re.DOTALL)
+        
+        # 2. СМЯГЧЕНИЕ АГРЕССИИ ИЗ CRM (Меняем жесткую установку на консультацию)
+        raw_prompt = raw_prompt.replace("appointments/calls booking", "informare și consultare")
 
         system_prompt = raw_prompt.replace("{company_name}", client_data.get("company_name") or "Compania")
         system_prompt = system_prompt.replace("{business_context}", client_data.get("business_context") or "")
@@ -704,11 +694,11 @@ async def handle_asterisk_conn(reader, writer):
         system_prompt += f"LONG TERM: {caller_memory['long']}\n"
         system_prompt += "</USER_MEMORY>\n"
 
+        # 3. ЖЕСТКИЙ БЛОК УКРАИНСКОГО И ДРУГИХ ЯЗЫКОВ
         system_prompt += f"\n\n<LANGUAGE_RULE>\n"
-        system_prompt += f"ГЛАВНОЕ ПРАВИЛО ЯЗЫКА: Изначально ты говоришь на языке '{call_lang}'. НО если клиент отвечает тебе или обращается на другом языке (перешел на русский или румынский), ТЫ ОБЯЗАН мгновенно и без извинений переключиться на язык клиента и продолжать диалог только на нём. Подстройка под язык клиента — твой абсолютный приоритет.\n"
+        system_prompt += f"ГЛАВНОЕ ПРАВИЛО ЯЗЫКА: Твой базовый язык для этого звонка — '{call_lang}'. Ты имеешь право говорить ТОЛЬКО на русском (ru) или румынском (ro). Подстраивайся под клиента: если он говорит по-русски — отвечай по-русски, если по-румынски — по-румынски. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать украинский (uk), английский (en) или любые другие языки, даже если система распознала их из-за фонового шума.\n"
         system_prompt += f"</LANGUAGE_RULE>\n"
 
-        # ЖЕСТКАЯ ИНСТРУКЦИЯ ДЛЯ УСМИРЕНИЯ АГРЕССИВНОГО БРОНИРОВАНИЯ
         tools = [
             {
                 "function_declarations": [
@@ -727,7 +717,8 @@ async def handle_asterisk_conn(reader, writer):
                     },
                     {
                         "name": "Booking_tool",
-                        "description": "Gestionează calendarul. ВНИМАНИЕ: Вызывать эту функцию ТОЛЬКО если клиент ПРЯМО попросил назначить встречу или проверить свободное время. Не вызывай для обычных консультаций или рассказов о деталях проекта.",
+                        # 4. СТРОГИЙ ЗАПРЕТ НА ВЫЗОВ КАЛЕНДАРЯ ПРИ ОТМАЗКАХ КЛИЕНТА
+                        "description": "Gestionează calendarul. КРИТИЧЕСКОЕ ПРАВИЛО: Вызывать ТОЛЬКО если клиент ПРЯМО и ЧЕТКО сказал 'хочу назначить встречу', 'давай созвонимся', 'забронируй звонок'. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО вызывать эту функцию, если клиент говорит 'мне пора на встречу', 'я ухожу', 'у меня дела', или просто просит рассказать подробности.",
                         "parameters": {
                             "type": "object",
                             "properties": {
@@ -768,12 +759,12 @@ async def handle_asterisk_conn(reader, writer):
 
         fake_websocket = AsteriskWSAdapter(reader, writer)
         
-        # ⚡ ПРАВИЛЬНАЯ ИНТЕГРАЦИЯ RNNOISE В ТРАНСПОРТ СОГЛАСНО ДОКУМЕНТАЦИИ PIPECAT 
+        # Транспорт с официальным RNNoiseFilter (зависимости добавлены)
         transport = FastAPIWebsocketTransport(
             websocket=fake_websocket,
             params=FastAPIWebsocketParams(
                 audio_in_enabled=True,
-                audio_in_filter=RNNoiseFilter(), # Подавление шума в реальном времени!
+                audio_in_filter=RNNoiseFilter(), 
                 audio_out_enabled=True,
                 add_wav_header=False,
                 serializer=RawPCMFrameSerializer(),
@@ -783,7 +774,6 @@ async def handle_asterisk_conn(reader, writer):
         context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
         context_aggregator = LLMContextAggregatorPair(context=context)
 
-        # Gemini VAD включен для отслеживания пауз, аудио чистое благодаря фильтру
         llm = GeminiLiveLLMService(
             api_key=GEMINI_API_KEY,
             tools=tools,
