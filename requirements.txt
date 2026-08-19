@@ -1,5 +1,5 @@
 pipecat-ai[google,rnnoise,soxr]==1.1.0
-av==11.0.0
+av
 fastapi
 uvicorn[standard]
 websockets
