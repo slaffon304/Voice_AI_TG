@@ -27,7 +27,9 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
+    LLMUserAggregatorParams, # Добавлен импорт параметров агрегатора
 )
+from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies # Добавлен импорт внешних стратегий
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.services.google.gemini_live.llm import (
@@ -82,7 +84,7 @@ class RawPCMFrameSerializer(FrameSerializer):
         return None
 
 # ==========================================
-# АДАПТЕР ASTERISK -> WEBSOCKET (ЧИСТЫЙ И СТАБИЛЬНЫЙ)
+# АДАПТЕР ASTERISK
 # ==========================================
 class AsteriskWSAdapter:
     def __init__(self, reader, writer):
@@ -166,51 +168,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==========================================
-# ФУНКЦИИ ФОРМАТИРОВАНИЯ ТЕЛЕФОНА
-# ==========================================
 def format_kommo_phone(phone: str) -> str:
     if not phone or phone == "Necunoscut":
         return "Necunoscut"
-        
     clean = "".join(filter(str.isdigit, str(phone)))
-    if not clean:
-        return "Necunoscut"
-        
-    if clean.startswith("0") and len(clean) == 9:
-        clean = "373" + clean[1:]
-    elif len(clean) == 8:
-        clean = "373" + clean
-        
-    if clean.startswith("373") and len(clean) >= 11:
-        return f"+373 {clean[3:]}"
-        
-    if len(clean) > 3:
-        return f"+{clean[:3]} {clean[3:]}"
-        
+    if not clean: return "Necunoscut"
+    if clean.startswith("0") and len(clean) == 9: clean = "373" + clean[1:]
+    elif len(clean) == 8: clean = "373" + clean
+    if clean.startswith("373") and len(clean) >= 11: return f"+373 {clean[3:]}"
+    if len(clean) > 3: return f"+{clean[:3]} {clean[3:]}"
     return f"+{clean}"
 
 def extract_real_phone(*args, ignore_trunk="78001079"):
     for val in args:
-        if not val:
-            continue
+        if not val: continue
         matches = re.findall(r"\d{8,15}", str(val))
         for num in matches:
-            if ignore_trunk not in num and num != "078001079":
-                return num
+            if ignore_trunk not in num and num != "078001079": return num
     return "Necunoscut"
 
-# ==========================================
-# ФУНКЦИИ БАЗЫ ДАННЫХ И ПАМЯТИ
-# ==========================================
 async def get_client_data(client_id: str):
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return None
-
+    if not SUPABASE_URL or not SUPABASE_KEY: return None
     clean_url = SUPABASE_URL.replace("/rest/v1", "").rstrip("/")
     url = f"{clean_url}/rest/v1/saas_clients?id=eq.{client_id}&select=company_name,business_context,tone,bot_goal,subscription_status_assistent,system_message,saas_projects(tg_chat_id_notify,google_calendar_id)"
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url, headers=headers)
@@ -227,40 +208,31 @@ async def get_client_data(client_id: str):
                     client_record["google_calendar_id"] = None
                 return client_record
             return None
-        except Exception:
-            return None
+        except Exception: return None
 
 async def get_persona_data(client_id: str):
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return None
-
+    if not SUPABASE_URL or not SUPABASE_KEY: return None
     clean_url = SUPABASE_URL.replace("/rest/v1", "").rstrip("/")
     url = f"{clean_url}/rest/v1/bot_personas?client_id=eq.{client_id}&select=system_prompt,voice_model,language"
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url, headers=headers, timeout=5.0)
             response.raise_for_status()
             data = response.json()
-            if len(data) > 0:
-                return data[0]
+            if len(data) > 0: return data[0]
             return None
-        except Exception:
-            return None
+        except Exception: return None
 
 async def get_caller_memory(client_id: str, phone: str):
     default_memory = {"core": "", "short": "", "long": ""}
     if not SUPABASE_URL or not SUPABASE_KEY or not phone or phone == "Necunoscut":
         return default_memory, "first_time"
-
     clean_phone = "".join(filter(str.isdigit, str(phone)))
     clean_url = SUPABASE_URL.replace("/rest/v1", "").rstrip("/")
     url = f"{clean_url}/rest/v1/caller_memories?client_id=eq.{client_id}&phone=eq.{clean_phone}&select=core_identity,short_term_context,long_term_context,last_interaction_at"
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-
     time_context = "first_time"
-    
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(url, headers=headers, timeout=2.0)
@@ -273,46 +245,28 @@ async def get_caller_memory(client_id: str, phone: str):
                         "short": record.get("short_term_context", ""),
                         "long": record.get("long_term_context", "")
                     }
-                    
                     last_at_str = record.get("last_interaction_at")
                     if last_at_str:
                         last_time = datetime.datetime.fromisoformat(last_at_str.replace('Z', '+00:00'))
                         now = datetime.datetime.now(datetime.timezone.utc)
                         delta_minutes = int((now - last_time).total_seconds() / 60)
-                        
-                        if delta_minutes < 15:
-                            time_context = "very_recent"
-                        elif delta_minutes < 1440:
-                            time_context = "same_day"
-                        else:
-                            time_context = "new_day"
-                    
+                        if delta_minutes < 15: time_context = "very_recent"
+                        elif delta_minutes < 1440: time_context = "same_day"
+                        else: time_context = "new_day"
                     return memory, time_context
-    except Exception as e:
-        print(f"⚠️ Ошибка Supabase при получении памяти: {e}", flush=True)
-
+    except Exception as e: print(f"⚠️ Ошибка Supabase при получении памяти: {e}", flush=True)
     return default_memory, time_context
 
 async def lookup_inbound_client_in_kommo(caller_phone: str) -> dict:
-    if not KOMMO_SUBDOMAIN or not KOMMO_ACCESS_TOKEN or caller_phone == "Necunoscut":
-        return {}
-
+    if not KOMMO_SUBDOMAIN or not KOMMO_ACCESS_TOKEN or caller_phone == "Necunoscut": return {}
     subdomain = KOMMO_SUBDOMAIN.encode("ascii", "ignore").decode("ascii").strip()
     token = KOMMO_ACCESS_TOKEN.encode("ascii", "ignore").decode("ascii").strip()
     clean_phone = "".join(filter(str.isdigit, str(caller_phone)))
-    
-    if len(clean_phone) < 6:
-        return {}
-
+    if len(clean_phone) < 6: return {}
     search_query = clean_phone[-8:] if len(clean_phone) >= 8 else clean_phone
-
     url = f"https://{subdomain}.kommo.com/api/v4/contacts"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     params = {"query": search_query, "with": "leads"}
-
     async with httpx.AsyncClient() as http_client:
         try:
             resp = await http_client.get(url, headers=headers, params=params, timeout=2.5)
@@ -332,8 +286,7 @@ async def lookup_inbound_client_in_kommo(caller_phone: str) -> dict:
                             elif "ro" in val or "rom" in val or "md" in val: lang = "ro"
                             break
                     return {"found": True, "name": client_name, "lang": lang}
-        except Exception:
-            pass
+        except Exception: pass
     return {"found": False}
 
 async def send_tg_alert(chat_id: str, message: str):
@@ -344,39 +297,22 @@ async def send_tg_alert(chat_id: str, message: str):
         except Exception: pass
 
 async def upload_audio_to_supabase(client_id: str, filepath: str) -> str | None:
-    if not SUPABASE_URL or not SUPABASE_KEY or not os.path.exists(filepath):
-        print(f"⚠️ [STORAGE] Файл {filepath} не найден на диске.", flush=True)
-        return None
+    if not SUPABASE_URL or not SUPABASE_KEY or not os.path.exists(filepath): return None
     try:
         clean_supa_url = SUPABASE_URL.replace("/rest/v1", "").rstrip("/")
         supabase: Client = create_client(clean_supa_url, SUPABASE_KEY)
         bucket_name = "call-recordings"
-        
         unique_filename = f"record_{uuid.uuid4().hex[:8]}.wav"
         storage_path = f"records/{client_id}/{unique_filename}"
-        
         def _upload():
             with open(filepath, "rb") as f:
-                supabase.storage.from_(bucket_name).upload(
-                    path=storage_path, file=f, file_options={"content-type": "audio/wav"}
-                )
+                supabase.storage.from_(bucket_name).upload(path=storage_path, file=f, file_options={"content-type": "audio/wav"})
             return supabase.storage.from_(bucket_name).get_public_url(storage_path)
-        audio_url = await asyncio.to_thread(_upload)
-        return audio_url
-    except Exception as e:
-        print(f"❌ [STORAGE] Ошибка загрузки файла {filepath}: {e}", flush=True)
-        return None
+        return await asyncio.to_thread(_upload)
+    except Exception as e: return None
 
-# ==========================================
-# ИИ-АРХИВАРИУС (Консолидация памяти + Отчет)
-# ==========================================
-async def run_archivist_and_notify_n8n(
-    client_id: str, phone: str, client_name: str, old_memory: dict, chat_history: str, 
-    audio_url: str, sys_length: int, direction: str, call_status: str
-):
-    if not chat_history.strip() or phone == "Necunoscut":
-        return
-
+async def run_archivist_and_notify_n8n(client_id: str, phone: str, client_name: str, old_memory: dict, chat_history: str, audio_url: str, sys_length: int, direction: str, call_status: str):
+    if not chat_history.strip() or phone == "Necunoscut": return
     print(f"🔄 [ARCHIVIST] Запуск консолидации памяти для {phone}...", flush=True)
     tz = pytz.timezone("Europe/Chisinau")
     today_date = datetime.datetime.now(tz).strftime('%Y-%m-%d')
@@ -394,7 +330,7 @@ LONG TERM: {old_memory.get('long', 'Нет данных')}
 {chat_history}
 
 ИНСТРУКЦИЯ (Выведи СТРОГО JSON):
-1. 'core_identity': Обнови, если клиент сообщил фундаментальный факт (имя, компания, важная деталь).
+1. 'core_identity': Обнови, если клиент сообщил фундаментальный факт.
 2. 'short_term_context': Перемести старые факты (старше 3 дней) в long_term. Запиши новые факты из звонка в формате "[{today_date}]: факт".
 3. 'long_term_context': Сжатая история прошлых обращений.
 4. 'summary': Подробная суть текущего звонка для менеджера в CRM.
@@ -404,27 +340,13 @@ LONG TERM: {old_memory.get('long', 'Нет данных')}
 
 Формат ответа (без markdown):
 {{
-    "core_identity": "...",
-    "short_term_context": "...",
-    "long_term_context": "...",
-    "summary": "...",
-    "sentiment": "...",
-    "next_step": "...",
-    "language": "..."
+    "core_identity": "...", "short_term_context": "...", "long_term_context": "...", "summary": "...", "sentiment": "...", "next_step": "...", "language": "..."
 }}
 """
-
-    fallback_models = [
-        'gemini-3.6-flash',
-        'gemini-3.1-pro-preview',
-        'gemini-3.1-flash-lite',
-        'gemini-3.5-flash'
-    ]
-    
+    fallback_models = ['gemini-3.6-flash', 'gemini-3.1-pro-preview', 'gemini-3.1-flash-lite', 'gemini-3.5-flash']
     attempt = 0
     data = {}
     client = genai.Client(api_key=GEMINI_API_KEY)
-    
     while attempt < len(fallback_models):
         current_model = fallback_models[attempt]
         try:
@@ -435,21 +357,14 @@ LONG TERM: {old_memory.get('long', 'Нет данных')}
             )
             data = json.loads(response.text.strip())
             break
-            
-        except Exception as e:
+        except Exception:
             attempt += 1
-            if attempt < len(fallback_models):
-                await asyncio.sleep(3)
+            if attempt < len(fallback_models): await asyncio.sleep(3)
             else:
-                print("❌ [ARCHIVIST] Все модели упали. Отчет уйдет с базовыми данными.", flush=True)
                 data = {
-                    "core_identity": old_memory.get('core', ''),
-                    "short_term_context": old_memory.get('short', ''),
-                    "long_term_context": old_memory.get('long', ''),
-                    "summary": "Ошибка генерации саммари (Все API модели недоступны). Транскрипт сохранен.",
-                    "sentiment": "Неизвестно",
-                    "next_step": "Связаться вручную",
-                    "language": "ro"
+                    "core_identity": old_memory.get('core', ''), "short_term_context": old_memory.get('short', ''),
+                    "long_term_context": old_memory.get('long', ''), "summary": "Ошибка генерации саммари (Все API модели недоступны).",
+                    "sentiment": "Неизвестно", "next_step": "Связаться вручную", "language": "ro"
                 }
 
     try:
@@ -457,10 +372,8 @@ LONG TERM: {old_memory.get('long', 'Нет данных')}
         db = create_client(clean_url, SUPABASE_KEY)
         await asyncio.to_thread(
             db.table("caller_memories").upsert({
-                "client_id": client_id,
-                "phone": clean_phone,
-                "core_identity": data.get("core_identity", ""),
-                "short_term_context": data.get("short_term_context", ""),
+                "client_id": client_id, "phone": clean_phone,
+                "core_identity": data.get("core_identity", ""), "short_term_context": data.get("short_term_context", ""),
                 "long_term_context": data.get("long_term_context", ""),
                 "last_interaction_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }, on_conflict="client_id,phone").execute
@@ -468,51 +381,28 @@ LONG TERM: {old_memory.get('long', 'Нет данных')}
         print("💾 [ARCHIVIST] Память успешно сохранена.", flush=True)
 
         n8n_payload = {
-            "client_id": client_id,
-            "end_client_name": client_name,
-            "end_client_phone": phone,
-            "status": call_status,
-            "transcript": chat_history,
+            "client_id": client_id, "end_client_name": client_name, "end_client_phone": phone,
+            "status": call_status, "transcript": chat_history,
             "summary": json.dumps({
-                "client_name": client_name,
-                "summary": data.get("summary", ""),
-                "sentiment": data.get("sentiment", ""),
-                "next_step": data.get("next_step", ""),
+                "client_name": client_name, "summary": data.get("summary", ""),
+                "sentiment": data.get("sentiment", ""), "next_step": data.get("next_step", ""),
                 "language": data.get("language", "")
             }, ensure_ascii=False),
-            "audio_url": audio_url,
-            "system_instructions_length": sys_length,
-            "platform": "gsm_voice",
-            "direction": direction,
+            "audio_url": audio_url, "system_instructions_length": sys_length,
+            "platform": "gsm_voice", "direction": direction,
         }
         async with httpx.AsyncClient() as http_client:
             await http_client.post(f"{N8N_BASE_URL}/post-call-summary", json=n8n_payload, timeout=10.0)
             print("✅ [ARCHIVIST] Отчет успешно отправлен в n8n", flush=True)
+    except Exception as e: print(f"❌ [ARCHIVIST] Ошибка сохранения/отправки: {e}", flush=True)
 
-    except Exception as e:
-        print(f"❌ [ARCHIVIST] Ошибка сохранения/отправки: {e}", flush=True)
-
-
-# ==========================================
-# ЭНДПОИНТЫ API
-# ==========================================
 @app.get("/get_uuid")
-async def get_client_uuid(
-    sip_login: str = None, 
-    sip_login_gsm: str = None, 
-    phone: str = None, 
-    ani: str = None, 
-    from_hdr: str = None, 
-    all_id: str = None
-):
-    if not sip_login and not sip_login_gsm:
-        return Response(content="error", media_type="text/plain")
-
+async def get_client_uuid(sip_login: str = None, sip_login_gsm: str = None, phone: str = None, ani: str = None, from_hdr: str = None, all_id: str = None):
+    if not sip_login and not sip_login_gsm: return Response(content="error", media_type="text/plain")
     clean_url = SUPABASE_URL.replace("/rest/v1", "").rstrip("/")
     identifier = sip_login_gsm if sip_login_gsm else sip_login
     url = f"{clean_url}/rest/v1/bot_channels?identifier=eq.{identifier}&select=client_id"
     headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
-
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.get(url, headers=headers)
@@ -520,17 +410,13 @@ async def get_client_uuid(
             data = resp.json()
             if data and isinstance(data, list) and len(data) > 0:
                 client_id = str(data[0].get("client_id"))
-                
                 raw_phone = extract_real_phone(ani, all_id, from_hdr, phone)
                 formatted_phone = format_kommo_phone(raw_phone)
-                
                 if formatted_phone != "Necunoscut" and redis_client:
                     await redis_client.setex(f"incoming_phone:{client_id}", 60, formatted_phone)
-
                 return Response(content=client_id, media_type="text/plain")
             return Response(content="not_found", media_type="text/plain")
-        except Exception:
-            return Response(content="error", media_type="text/plain")
+        except Exception: return Response(content="error", media_type="text/plain")
 
 class OutboundCallRequest(BaseModel):
     client_id: str
@@ -544,35 +430,18 @@ class OutboundCallRequest(BaseModel):
 async def initiate_outbound_call(req: OutboundCallRequest):
     call_uuid = str(uuid.uuid4())
     formatted_phone = format_kommo_phone(req.target_phone)
-    
     call_data = {
-        "client_id": req.client_id,
-        "target_phone": formatted_phone,
-        "client_name": req.client_name,
-        "call_purpose": req.call_purpose,
-        "custom_context": req.custom_context,
-        "lang": req.lang,
+        "client_id": req.client_id, "target_phone": formatted_phone, "client_name": req.client_name,
+        "call_purpose": req.call_purpose, "custom_context": req.custom_context, "lang": req.lang,
     }
-
-    if redis_client:
-        await redis_client.setex(f"call_context:{call_uuid}", 600, json.dumps(call_data))
-
+    if redis_client: await redis_client.setex(f"call_context:{call_uuid}", 600, json.dumps(call_data))
     payload = {
         "endpoint": f"PJSIP/{formatted_phone}{ASTERISK_ENDPOINT_SUFFIX}",
-        "extension": "s",
-        "context": "outbound-ai",
-        "priority": 1,
-        "variables": {"CALL_UUID": call_uuid},
+        "extension": "s", "context": "outbound-ai", "priority": 1, "variables": {"CALL_UUID": call_uuid},
     }
-
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.post(
-                ASTERISK_ARI_URL,
-                json=payload,
-                auth=(ASTERISK_ARI_USER, ASTERISK_ARI_PASS),
-                timeout=10.0,
-            )
+            resp = await client.post(ASTERISK_ARI_URL, json=payload, auth=(ASTERISK_ARI_USER, ASTERISK_ARI_PASS), timeout=10.0)
             if resp.status_code not in (200, 201):
                 if redis_client: await redis_client.delete(f"call_context:{call_uuid}")
                 return {"status": "error", "details": resp.text}
@@ -599,8 +468,7 @@ class InterruptionRecoveryProcessor(FrameProcessor):
                 })
                 await self.task.queue_frames([LLMRunFrame()])
                 self.is_interrupted = False
-        except asyncio.CancelledError:
-            pass
+        except asyncio.CancelledError: pass
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -613,7 +481,6 @@ class InterruptionRecoveryProcessor(FrameProcessor):
             self.is_interrupted = False
         await self.push_frame(frame, direction)
 
-
 # ==========================================
 # ГЛАВНЫЙ ОБРАБОТЧИК ASTERISK
 # ==========================================
@@ -623,7 +490,6 @@ async def handle_asterisk_conn(reader, writer):
     client_id = None
     target_phone = "Necunoscut"
     client_name = "client"
-    
     is_outbound = False  
     session_uuid = "unknown"
 
@@ -657,8 +523,7 @@ async def handle_asterisk_conn(reader, writer):
             client_id = session_uuid
             if redis_client:
                 saved_phone = await redis_client.get(f"incoming_phone:{client_id}")
-                if saved_phone:
-                    target_phone = saved_phone
+                if saved_phone: target_phone = saved_phone
             
             inbound_crm = await lookup_inbound_client_in_kommo(target_phone)
             if inbound_crm.get("found"):
@@ -757,30 +622,44 @@ async def handle_asterisk_conn(reader, writer):
         system_instructions_length = len(full_system_text)
 
         fake_websocket = AsteriskWSAdapter(reader, writer)
+        
+        # Оставляем RNNoiseFilter, он спасает от белого шума Астериска
         transport = FastAPIWebsocketTransport(
             websocket=fake_websocket,
             params=FastAPIWebsocketParams(
                 audio_in_enabled=True,
+                audio_in_filter=RNNoiseFilter(), 
                 audio_out_enabled=True,
                 add_wav_header=False,
-                audio_in_filter=RNNoiseFilter(),
                 serializer=RawPCMFrameSerializer(),
             ),
         )
 
-        context = LLMContext(messages=[{"role": "system", "content": system_prompt}])
-        context_aggregator = LLMContextAggregatorPair(context=context)
+        # ⚡ ФИКС 3: Пустой context при инициализации, чтобы избежать дублирования промпта
+        context = LLMContext(messages=[])
+        
+        
+        # ⚡ ФИКС 1: Отключаем локальный Smart Turn и жестко включаем режим реального времени
+        context_aggregator = LLMContextAggregatorPair(
+            context=context,
+            realtime_service_mode=True, # Жесткая фиксация режима реального времени
+            user_params=LLMUserAggregatorParams(
+                user_turn_strategies=ExternalUserTurnStrategies()
+            )
+        )
 
+        # ⚡ ФИКС 2: Настраиваем VAD в Gemini (увеличиваем паузы и снижаем чувствительность)
         llm = GeminiLiveLLMService(
             api_key=GEMINI_API_KEY,
             tools=tools,
             settings=GeminiLiveLLMService.Settings(
                 model="gemini-3.1-flash-live-preview",
                 voice=persona_data.get("voice_model", "Enceladus"),
-                system_instruction=system_prompt,
+                system_instruction=system_prompt, # Промпт теперь передается только здесь
                 vad=GeminiVADParams(
-                    start_sensitivity=types.StartSensitivity.START_SENSITIVITY_LOW,
-                    silence_duration_ms=1200,
+                    end_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
+                    silence_duration_ms=2000,
+                    disabled=False,
                 ),
             ),
         )
@@ -790,10 +669,7 @@ async def handle_asterisk_conn(reader, writer):
             comp_name = client_data.get("company_name", "Companie")
             async with httpx.AsyncClient() as http_client:
                 try:
-                    response = await http_client.post(
-                        f"{N8N_BASE_URL}/save_lead?client_id={client_id}&tg_chat_id={tg_chat}",
-                        json=params.arguments, timeout=5.0
-                    )
+                    response = await http_client.post(f"{N8N_BASE_URL}/save_lead?client_id={client_id}&tg_chat_id={tg_chat}", json=params.arguments, timeout=5.0)
                     response.raise_for_status()
                     await params.result_callback(response.json())
                 except asyncio.CancelledError:
@@ -801,8 +677,7 @@ async def handle_asterisk_conn(reader, writer):
                     except: pass
                     raise
                 except Exception as e:
-                    error_msg = f"⚠️ <b>Eroare API (save_lead)</b>\n🏢 Companie: {comp_name}\n🔧 Detalii eroare: <code>{str(e)}</code>"
-                    await send_tg_alert(tg_chat, error_msg)
+                    await send_tg_alert(tg_chat, f"⚠️ <b>Eroare API (save_lead)</b>\n🏢 Companie: {comp_name}\n🔧 Detalii eroare: <code>{str(e)}</code>")
                     await params.result_callback({"error": f"Eroare CRM: {str(e)}"})
 
         async def process_booking(params: FunctionCallParams):
@@ -811,10 +686,7 @@ async def handle_asterisk_conn(reader, writer):
             comp_name = client_data.get("company_name", "Companie")
             async with httpx.AsyncClient() as http_client:
                 try:
-                    response = await http_client.post(
-                        f"{N8N_BASE_URL}/booking?client_id={client_id}&google_calendar_id={cal_id}",
-                        json=params.arguments, timeout=10.0
-                    )
+                    response = await http_client.post(f"{N8N_BASE_URL}/booking?client_id={client_id}&google_calendar_id={cal_id}", json=params.arguments, timeout=10.0)
                     response.raise_for_status()
                     await params.result_callback(response.json())
                 except asyncio.CancelledError:
@@ -822,8 +694,7 @@ async def handle_asterisk_conn(reader, writer):
                     except: pass
                     raise
                 except Exception as e:
-                    error_msg = f"⚠️ <b>Eroare API (Booking_tool)</b>\n🏢 Companie: {comp_name}\n🔧 Detalii eroare: <code>{str(e)}</code>"
-                    await send_tg_alert(tg_chat, error_msg)
+                    await send_tg_alert(tg_chat, f"⚠️ <b>Eroare API (Booking_tool)</b>\n🏢 Companie: {comp_name}\n🔧 Detalii eroare: <code>{str(e)}</code>")
                     await params.result_callback({"status": "error", "message": str(e)})
 
         async def process_sms(params: FunctionCallParams):
@@ -831,10 +702,7 @@ async def handle_asterisk_conn(reader, writer):
             comp_name = client_data.get("company_name", "Companie")
             async with httpx.AsyncClient() as http_client:
                 try:
-                    response = await http_client.post(
-                        f"{N8N_BASE_URL}/send_sms?client_id={client_id}",
-                        json=params.arguments, timeout=5.0
-                    )
+                    response = await http_client.post(f"{N8N_BASE_URL}/send_sms?client_id={client_id}", json=params.arguments, timeout=5.0)
                     response.raise_for_status()
                     await params.result_callback({"status": "success", "message": "SMS trimis"})
                 except asyncio.CancelledError:
@@ -842,18 +710,14 @@ async def handle_asterisk_conn(reader, writer):
                     except: pass
                     raise
                 except Exception as e:
-                    error_msg = f"⚠️ <b>Eroare API (send_sms)</b>\n🏢 Companie: {comp_name}\n🔧 Detalii eroare: <code>{str(e)}</code>"
-                    await send_tg_alert(tg_chat, error_msg)
+                    await send_tg_alert(tg_chat, f"⚠️ <b>Eroare API (send_sms)</b>\n🏢 Companie: {comp_name}\n🔧 Detalii eroare: <code>{str(e)}</code>")
                     await params.result_callback({"status": "error", "message": str(e)})
 
         async def process_end_call(params: FunctionCallParams):
             await params.result_callback({"status": "success", "message": "Call ended"})
-            
             async def delayed_end():
                 await asyncio.sleep(3.5)
-                if task:
-                    await task.queue_frames([CancelFrame()])
-            
+                if task: await task.queue_frames([CancelFrame()])
             asyncio.create_task(delayed_end())
 
         llm.register_function("save_lead", process_save_lead)
@@ -873,36 +737,21 @@ async def handle_asterisk_conn(reader, writer):
             context_aggregator.assistant(),
         ])
 
-        task = PipelineTask(
-            pipeline,
-            params=PipelineParams(allow_interruptions=True, idle_timeout=20.0),
-        )
+        task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True, idle_timeout=20.0))
         recovery_processor.task = task
         runner = PipelineRunner()
 
         if is_outbound:
-            greeting_prompt = (
-                f"SYSTEM EVENT: Клиент ({client_name}) ответил на исходящий звонок. "
-                f"Цель звонка, которую ты должен выполнить: {purpose}. "
-                f"Язык клиента: {call_lang}. Начни разговор согласно твоему системному промпту и указанной цели."
-            )
+            greeting_prompt = f"SYSTEM EVENT: Клиент ({client_name}) ответил на исходящий звонок. Цель звонка, которую ты должен выполнить: {purpose}. Язык клиента: {call_lang}. Начни разговор согласно твоему системному промпту и указанной цели."
         else:
             if time_context == "very_recent":
-                greeting_prompt = (
-                    f"SYSTEM EVENT: Клиент {client_name} перезвонил спустя пару минут. Не здоровайся заново. "
-                    f"Язык клиента: {call_lang}. Скажи: 'Да-да, слушаю, связь прервалась' и продолжай суть."
-                )
+                greeting_prompt = f"SYSTEM EVENT: Клиент {client_name} перезвонил спустя пару минут. Не здоровайся заново. Язык клиента: {call_lang}. Скажи: 'Да-да, слушаю, связь прервалась' и продолжай суть."
             elif time_context == "same_day":
-                greeting_prompt = (
-                    f"SYSTEM EVENT: Клиент {client_name} снова на связи. Уточни, чем еще можешь помочь по контексту прошлых бесед. "
-                    f"Язык клиента: {call_lang}. Опирайся на память (RECENT)."
-                )
+                greeting_prompt = f"SYSTEM EVENT: Клиент {client_name} снова на связи. Уточни, чем еще можешь помочь по контексту прошлых бесед. Язык клиента: {call_lang}. Опирайся на память (RECENT)."
             else:
-                greeting_prompt = (
-                    f"SYSTEM EVENT: Входящий звонок. Клиент: {client_name}. Язык клиента: {call_lang}. "
-                    f"Начни диалог. Если есть память (RECENT), учитывай её и не задавай одни и те же вопросы."
-                )
+                greeting_prompt = f"SYSTEM EVENT: Входящий звонок. Клиент: {client_name}. Язык клиента: {call_lang}. Начни диалог. Если есть память (RECENT), учитывай её и не задавай одни и те же вопросы."
 
+        # Отправляем первое системное сообщение ТОЛЬКО как стартовый пинок для начала диалога
         context.add_message({"role": "user", "content": greeting_prompt})
         await task.queue_frames([LLMRunFrame()])
         await runner.run(task)
@@ -911,22 +760,15 @@ async def handle_asterisk_conn(reader, writer):
         print(f"❌ Ошибка соединения: {e}", flush=True)
     finally:
         print("📞 Звонок завершен. Закрываем сокет и собираем данные...", flush=True)
-        
-        try:
-            writer.close()
-        except Exception:
-            pass
+        try: writer.close()
+        except Exception: pass
 
         call_direction = "outbound" if is_outbound else "inbound"
         wav_filename = f"{ASTERISK_RECORDING_PATH}/{session_uuid}.wav"
         
         has_context = "context" in locals() and context is not None
         if has_context and client_id:
-            user_replies = [
-                m["content"] for m in context.messages
-                if m.get("role") == "user" and "SYSTEM EVENT:" not in m.get("content", "")
-            ]
-
+            user_replies = [m["content"] for m in context.messages if m.get("role") == "user" and "SYSTEM EVENT:" not in m.get("content", "")]
             full_transcript = ""
             for msg in context.messages:
                 if msg.get("role") in ["user", "assistant"] and msg.get("content"):
@@ -939,18 +781,11 @@ async def handle_asterisk_conn(reader, writer):
                 try:
                     if len(user_replies) == 0:
                         call_status = "outbound_short_call" if is_outbound else "inbound_dropped"
-                        await run_archivist_and_notify_n8n(
-                            client_id, target_phone, client_name, caller_memory, full_transcript, "",
-                            system_instructions_length, call_direction, call_status
-                        )
+                        await run_archivist_and_notify_n8n(client_id, target_phone, client_name, caller_memory, full_transcript, "", system_instructions_length, call_direction, call_status)
                     else:
                         audio_url = await upload_audio_to_supabase(client_id, wav_filename)
-                        await run_archivist_and_notify_n8n(
-                            client_id, target_phone, client_name, caller_memory, full_transcript, audio_url or "",
-                            system_instructions_length, call_direction, "completed"
-                        )
-                except Exception as post_err:
-                    print(f"❌ ОШИБКА В ФОНОВОЙ ПОСТ-ОБРАБОТКЕ: {post_err}", flush=True)
+                        await run_archivist_and_notify_n8n(client_id, target_phone, client_name, caller_memory, full_transcript, audio_url or "", system_instructions_length, call_direction, "completed")
+                except Exception as post_err: print(f"❌ ОШИБКА В ФОНОВОЙ ПОСТ-ОБРАБОТКЕ: {post_err}", flush=True)
                 finally:
                     if wav_filename and os.path.exists(wav_filename):
                         try: os.remove(wav_filename)
