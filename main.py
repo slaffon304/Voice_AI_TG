@@ -85,7 +85,7 @@ class RawPCMFrameSerializer(FrameSerializer):
         return None
 
 # ==========================================
-# АДАПТЕР ASTERISK (ИДЕАЛЬНЫЙ NATIVE 24kHz)
+# АДАПТЕР ASTERISK (ЧИСТЫЙ 16 КГЦ БЕЗ КОСТЫЛЕЙ)
 # ==========================================
 class AsteriskWSAdapter:
     def __init__(self, reader, writer):
@@ -118,10 +118,10 @@ class AsteriskWSAdapter:
                 self.client_state = WebSocketState.DISCONNECTED
                 raise Exception("Hangup")
 
-            # Звук от Астериска приходит в чистых 24 кГц (slin24)
             if not data or len(data) == 0:
                 return b""
 
+            # Благодаря .wav16 в Астериске, сюда приходят чистые 16 кГц
             return data
         except Exception:
             self.client_state = WebSocketState.DISCONNECTED
@@ -147,8 +147,11 @@ class AsteriskWSAdapter:
         if self.client_state != WebSocketState.CONNECTED:
             return
         try:
-            # Возвращаем расчет для 16000 Гц (16 бит моно = 32000 байт/сек)
-            audio_duration = len(data) / 32000.0
+            # Мягкое понижение громкости, чтобы бот не "орал"
+            softened_data = audioop.mul(data, 2, 0.75)
+
+            # 16000 Гц, 16 бит моно = 32000 байт/сек
+            audio_duration = len(softened_data) / 32000.0
             now = time.time()
 
             if self.next_send_time < now:
@@ -160,9 +163,9 @@ class AsteriskWSAdapter:
 
             self.next_send_time += audio_duration
 
-            # ⚡ ФИКС ПРОТОКОЛА: Маркер 0x12 сообщает Астериску, что звук идет в 16 кГц
-            header = b"\x12" + len(data).to_bytes(2, byteorder="big")
-            self.writer.write(header + data)
+            # Маркер 0x12 сообщает Астериску, что звук идет в 16 кГц
+            header = b"\x12" + len(softened_data).to_bytes(2, byteorder="big")
+            self.writer.write(header + softened_data)
             await self.writer.drain()
         except Exception:
             pass
@@ -795,7 +798,7 @@ async def handle_asterisk_conn(reader, writer):
         except Exception: pass
 
         call_direction = "outbound" if is_outbound else "inbound"
-        wav_filename = f"{ASTERISK_RECORDING_PATH}/{session_uuid}.wav"
+        wav_filename = f"{ASTERISK_RECORDING_PATH}/{session_uuid}.wav16"
         
         has_context = "context" in locals() and context is not None
         if has_context and client_id:
