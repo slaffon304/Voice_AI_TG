@@ -1,5 +1,4 @@
 import asyncio
-import audioop
 import datetime
 import json
 import os
@@ -8,7 +7,6 @@ import time
 import uuid
 from fastapi import FastAPI, Response, Depends, HTTPException, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
@@ -29,9 +27,9 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
-    LLMUserAggregatorParams, # Добавлен импорт параметров агрегатора
+    LLMUserAggregatorParams,
 )
-from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies # Добавлен импорт внешних стратегий
+from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.serializers.base_serializer import FrameSerializer
 from pipecat.services.google.gemini_live.llm import (
@@ -59,6 +57,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 REDIS_URL = os.getenv("REDIS_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+API_SECRET_TOKEN = os.getenv("API_SECRET_TOKEN")
 
 ASTERISK_ARI_URL = os.getenv("ASTERISK_ARI_URL", "http://187.77.69.233:8088/ari/channels")
 ASTERISK_ARI_USER = os.getenv("ASTERISK_ARI_USER", "asterisk")
@@ -86,7 +85,7 @@ class RawPCMFrameSerializer(FrameSerializer):
         return None
 
 # ==========================================
-# АДАПТЕР ASTERISK
+# АДАПТЕР ASTERISK (БЕЗ AUDIOOP, СКОРОСТНОЙ)
 # ==========================================
 class AsteriskWSAdapter:
     def __init__(self, reader, writer):
@@ -94,9 +93,8 @@ class AsteriskWSAdapter:
         self.writer = writer
         self.client_state = WebSocketState.CONNECTED
         self.application_state = WebSocketState.CONNECTED
-        self.in_state = None
-        self.out_state = None
         self.next_send_time = time.time()
+        self.is_muted = False 
 
     async def accept(self):
         pass
@@ -120,36 +118,36 @@ class AsteriskWSAdapter:
                 self.client_state = WebSocketState.DISCONNECTED
                 raise Exception("Hangup")
 
-            # ЗАЩИТА: Отбрасываем пустые фреймы (silence suppression)
             if not data or len(data) == 0:
                 return b""
 
-            resampled, self.in_state = audioop.ratecv(
-                data, 2, 1, 8000, 16000, self.in_state
-            )
-            return resampled
+            return data
         except Exception:
             self.client_state = WebSocketState.DISCONNECTED
             raise
 
     async def receive(self):
-        try:
-            data = await self.receive_bytes()
-            return {"type": "websocket.receive", "bytes": data}
-        except Exception:
-            self.client_state = WebSocketState.DISCONNECTED
-            return {"type": "websocket.disconnect", "code": 1000}
+        while True:
+            try:
+                data = await self.receive_bytes()
+                
+                if not data:
+                    continue
+
+                if self.is_muted:
+                    data = b'\x00' * len(data)
+
+                return {"type": "websocket.receive", "bytes": data}
+            except Exception:
+                self.client_state = WebSocketState.DISCONNECTED
+                return {"type": "websocket.disconnect", "code": 1000}
 
     async def send_bytes(self, data):
         if self.client_state != WebSocketState.CONNECTED:
             return
         try:
-            softened_data = audioop.mul(data, 2, 0.75)
-            resampled, self.out_state = audioop.ratecv(
-                softened_data, 2, 1, 24000, 8000, self.out_state
-            )
-
-            audio_duration = len(resampled) / 16000.0
+            # 16000 Гц, 16 бит моно = 32000 байт/сек
+            audio_duration = len(data) / 32000.0
             now = time.time()
 
             if self.next_send_time < now:
@@ -161,13 +159,14 @@ class AsteriskWSAdapter:
 
             self.next_send_time += audio_duration
 
-            header = b"\x10" + len(resampled).to_bytes(2, byteorder="big")
-            self.writer.write(header + resampled)
+            header = b"\x10" + len(data).to_bytes(2, byteorder="big")
+            self.writer.write(header + data)
             await self.writer.drain()
         except Exception:
             pass
 
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -175,6 +174,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ==========================================
+# БЕЗОПАСНОСТЬ 
+# ==========================================
+security_scheme = HTTPBearer()
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Security(security_scheme)):
+    if not API_SECRET_TOKEN:
+        raise HTTPException(status_code=500, detail="Server config error: API token missing")
+    if credentials.credentials != API_SECRET_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid authorization token")
+    return credentials.credentials
+
+# ==========================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ==========================================
 def format_kommo_phone(phone: str) -> str:
     if not phone or phone == "Necunoscut":
         return "Necunoscut"
@@ -433,18 +447,8 @@ class OutboundCallRequest(BaseModel):
     custom_context: str = ""
     lang: str = "ro"
 
-security = HTTPBearer()
-
-# Твой секретный токен (лучше вынести в переменные окружения: os.getenv("API_SECRET_TOKEN"))
-API_SECRET_TOKEN = os.getenv("API_SECRET_TOKEN") 
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
-    if credentials.credentials != API_SECRET_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    return credentials.credentials
-
 @app.post("/api/dial")
-async def initiate_outbound_call(req: OutboundCallRequest):
+async def initiate_outbound_call(req: OutboundCallRequest, token: str = Depends(verify_token)):
     call_uuid = str(uuid.uuid4())
     formatted_phone = format_kommo_phone(req.target_phone)
     call_data = {
@@ -568,9 +572,13 @@ async def handle_asterisk_conn(reader, writer):
         tz = pytz.timezone("Europe/Chisinau")
         current_time = datetime.datetime.now(tz).strftime("%A, %d %B %Y, %H:%M")
         
-        system_prompt = raw_prompt.replace("{company_name}", client_data.get("company_name") or "Compania")
-        system_prompt = system_prompt.replace("{business_context}", client_data.get("business_context") or "")
-        system_prompt = system_prompt.replace("{bot_goal}", client_data.get("bot_goal") or "")
+        safe_company_name = str(client_data.get("company_name") or "Compania").replace("{", "").replace("}", "")
+        safe_business_context = str(client_data.get("business_context") or "").replace("{", "").replace("}", "")
+        safe_bot_goal = str(client_data.get("bot_goal") or "").replace("{", "").replace("}", "")
+
+        system_prompt = raw_prompt.replace("{company_name}", safe_company_name)
+        system_prompt = system_prompt.replace("{business_context}", safe_business_context)
+        system_prompt = system_prompt.replace("{bot_goal}", safe_bot_goal)
         system_prompt = system_prompt.replace("{tone}", client_data.get("tone") or "friendly")
         system_prompt = system_prompt.replace("{current_datetime}", current_time)
         system_prompt = system_prompt.replace("{office_status}", "Open")
@@ -640,7 +648,6 @@ async def handle_asterisk_conn(reader, writer):
 
         fake_websocket = AsteriskWSAdapter(reader, writer)
         
-        # Оставляем RNNoiseFilter, он спасает от белого шума Астериска
         transport = FastAPIWebsocketTransport(
             websocket=fake_websocket,
             params=FastAPIWebsocketParams(
@@ -652,27 +659,23 @@ async def handle_asterisk_conn(reader, writer):
             ),
         )
 
-        # ⚡ ФИКС 3: Пустой context при инициализации, чтобы избежать дублирования промпта
         context = LLMContext(messages=[])
         
-        
-        # ⚡ ФИКС 1: Отключаем локальный Smart Turn и жестко включаем режим реального времени
         context_aggregator = LLMContextAggregatorPair(
             context=context,
-            realtime_service_mode=True, # Жесткая фиксация режима реального времени
+            realtime_service_mode=True, 
             user_params=LLMUserAggregatorParams(
                 user_turn_strategies=ExternalUserTurnStrategies()
             )
         )
 
-        # ⚡ ФИКС 2: Настраиваем VAD в Gemini (увеличиваем паузы и снижаем чувствительность)
         llm = GeminiLiveLLMService(
             api_key=GEMINI_API_KEY,
             tools=tools,
             settings=GeminiLiveLLMService.Settings(
                 model="gemini-3.1-flash-live-preview",
                 voice=persona_data.get("voice_model", "Enceladus"),
-                system_instruction=system_prompt, # Промпт теперь передается только здесь
+                system_instruction=system_prompt, 
                 vad=GeminiVADParams(
                     end_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
                     silence_duration_ms=2000,
@@ -682,6 +685,7 @@ async def handle_asterisk_conn(reader, writer):
         )
 
         async def process_save_lead(params: FunctionCallParams):
+            fake_websocket.is_muted = True 
             tg_chat = client_data.get("tg_chat_id_notify", "")
             comp_name = client_data.get("company_name", "Companie")
             async with httpx.AsyncClient() as http_client:
@@ -696,8 +700,11 @@ async def handle_asterisk_conn(reader, writer):
                 except Exception as e:
                     await send_tg_alert(tg_chat, f"⚠️ <b>Eroare API (save_lead)</b>\n🏢 Companie: {comp_name}\n🔧 Detalii eroare: <code>{str(e)}</code>")
                     await params.result_callback({"error": f"Eroare CRM: {str(e)}"})
+                finally:
+                    fake_websocket.is_muted = False 
 
         async def process_booking(params: FunctionCallParams):
+            fake_websocket.is_muted = True
             cal_id = client_data.get("google_calendar_id", "")
             tg_chat = client_data.get("tg_chat_id_notify", "")
             comp_name = client_data.get("company_name", "Companie")
@@ -713,8 +720,11 @@ async def handle_asterisk_conn(reader, writer):
                 except Exception as e:
                     await send_tg_alert(tg_chat, f"⚠️ <b>Eroare API (Booking_tool)</b>\n🏢 Companie: {comp_name}\n🔧 Detalii eroare: <code>{str(e)}</code>")
                     await params.result_callback({"status": "error", "message": str(e)})
+                finally:
+                    fake_websocket.is_muted = False
 
         async def process_sms(params: FunctionCallParams):
+            fake_websocket.is_muted = True
             tg_chat = client_data.get("tg_chat_id_notify", "")
             comp_name = client_data.get("company_name", "Companie")
             async with httpx.AsyncClient() as http_client:
@@ -729,6 +739,8 @@ async def handle_asterisk_conn(reader, writer):
                 except Exception as e:
                     await send_tg_alert(tg_chat, f"⚠️ <b>Eroare API (send_sms)</b>\n🏢 Companie: {comp_name}\n🔧 Detalii eroare: <code>{str(e)}</code>")
                     await params.result_callback({"status": "error", "message": str(e)})
+                finally:
+                    fake_websocket.is_muted = False
 
         async def process_end_call(params: FunctionCallParams):
             await params.result_callback({"status": "success", "message": "Call ended"})
@@ -768,7 +780,6 @@ async def handle_asterisk_conn(reader, writer):
             else:
                 greeting_prompt = f"SYSTEM EVENT: Входящий звонок. Клиент: {client_name}. Язык клиента: {call_lang}. Начни диалог. Если есть память (RECENT), учитывай её и не задавай одни и те же вопросы."
 
-        # Отправляем первое системное сообщение ТОЛЬКО как стартовый пинок для начала диалога
         context.add_message({"role": "user", "content": greeting_prompt})
         await task.queue_frames([LLMRunFrame()])
         await runner.run(task)
