@@ -1,4 +1,5 @@
 pipecat-ai[google,rnnoise,soxr]>=1.5.0
+audioop-lts
 fastapi
 uvicorn[standard]
 websockets
