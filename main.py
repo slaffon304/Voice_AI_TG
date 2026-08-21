@@ -6,6 +6,8 @@ import os
 import re
 import time
 import uuid
+from fastapi import FastAPI, Response, Depends, HTTPException, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
@@ -113,9 +115,14 @@ class AsteriskWSAdapter:
             header = await self.reader.readexactly(3)
             p_len = int.from_bytes(header[1:], byteorder="big")
             data = await self.reader.readexactly(p_len)
+            
             if header[0] == 0x00:
                 self.client_state = WebSocketState.DISCONNECTED
                 raise Exception("Hangup")
+
+            # ЗАЩИТА: Отбрасываем пустые фреймы (silence suppression)
+            if not data or len(data) == 0:
+                return b""
 
             resampled, self.in_state = audioop.ratecv(
                 data, 2, 1, 8000, 16000, self.in_state
@@ -425,6 +432,16 @@ class OutboundCallRequest(BaseModel):
     client_name: str = "client"
     custom_context: str = ""
     lang: str = "ro"
+
+security = HTTPBearer()
+
+# Твой секретный токен (лучше вынести в переменные окружения: os.getenv("API_SECRET_TOKEN"))
+API_SECRET_TOKEN = os.getenv("API_SECRET_TOKEN") 
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
+    if credentials.credentials != API_SECRET_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return credentials.credentials
 
 @app.post("/api/dial")
 async def initiate_outbound_call(req: OutboundCallRequest):
