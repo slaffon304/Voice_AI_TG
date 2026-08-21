@@ -654,6 +654,7 @@ async def handle_asterisk_conn(reader, writer):
                 audio_in_enabled=True,
                 audio_in_filter=RNNoiseFilter(), 
                 audio_out_enabled=True,
+                audio_out_sample_rate=16000,
                 add_wav_header=False,
                 serializer=RawPCMFrameSerializer(),
             ),
