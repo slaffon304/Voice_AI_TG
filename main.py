@@ -85,7 +85,7 @@ class RawPCMFrameSerializer(FrameSerializer):
         return None
 
 # ==========================================
-# АДАПТЕР ASTERISK (БЕЗ AUDIOOP, СКОРОСТНОЙ)
+# АДАПТЕР ASTERISK (ИДЕАЛЬНЫЙ NATIVE 24kHz)
 # ==========================================
 class AsteriskWSAdapter:
     def __init__(self, reader, writer):
@@ -118,6 +118,7 @@ class AsteriskWSAdapter:
                 self.client_state = WebSocketState.DISCONNECTED
                 raise Exception("Hangup")
 
+            # Звук от Астериска приходит в чистых 24 кГц (slin24)
             if not data or len(data) == 0:
                 return b""
 
@@ -146,8 +147,8 @@ class AsteriskWSAdapter:
         if self.client_state != WebSocketState.CONNECTED:
             return
         try:
-            # 16000 Гц, 16 бит моно = 32000 байт/сек
-            audio_duration = len(data) / 32000.0
+            # 24000 Гц, 16 бит моно = 48000 байт/сек
+            audio_duration = len(data) / 48000.0
             now = time.time()
 
             if self.next_send_time < now:
@@ -159,7 +160,8 @@ class AsteriskWSAdapter:
 
             self.next_send_time += audio_duration
 
-            header = b"\x10" + len(data).to_bytes(2, byteorder="big")
+            # ⚡ ФИКС ПРОТОКОЛА: Маркер 0x13 сообщает Астериску, что звук идет в 24 кГц
+            header = b"\x13" + len(data).to_bytes(2, byteorder="big")
             self.writer.write(header + data)
             await self.writer.drain()
         except Exception:
