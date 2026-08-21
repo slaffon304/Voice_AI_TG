@@ -147,8 +147,8 @@ class AsteriskWSAdapter:
         if self.client_state != WebSocketState.CONNECTED:
             return
         try:
-            # 24000 Гц, 16 бит моно = 48000 байт/сек
-            audio_duration = len(data) / 48000.0
+            # Возвращаем расчет для 16000 Гц (16 бит моно = 32000 байт/сек)
+            audio_duration = len(data) / 32000.0
             now = time.time()
 
             if self.next_send_time < now:
@@ -160,8 +160,8 @@ class AsteriskWSAdapter:
 
             self.next_send_time += audio_duration
 
-            # ⚡ ФИКС ПРОТОКОЛА: Маркер 0x13 сообщает Астериску, что звук идет в 24 кГц
-            header = b"\x13" + len(data).to_bytes(2, byteorder="big")
+            # ⚡ ФИКС ПРОТОКОЛА: Маркер 0x12 сообщает Астериску, что звук идет в 16 кГц
+            header = b"\x12" + len(data).to_bytes(2, byteorder="big")
             self.writer.write(header + data)
             await self.writer.drain()
         except Exception:
