@@ -85,7 +85,7 @@ class RawPCMFrameSerializer(FrameSerializer):
         return None
 
 # ==========================================
-# АДАПТЕР ASTERISK (ЧИСТЫЙ 16 КГЦ БЕЗ КОСТЫЛЕЙ)
+# АДАПТЕР ASTERISK (С НАРЕЗКОЙ ЧАНКОВ 20ms)
 # ==========================================
 class AsteriskWSAdapter:
     def __init__(self, reader, writer):
@@ -121,7 +121,6 @@ class AsteriskWSAdapter:
             if not data or len(data) == 0:
                 return b""
 
-            # Благодаря .wav16 в Астериске, сюда приходят чистые 16 кГц
             return data
         except Exception:
             self.client_state = WebSocketState.DISCONNECTED
@@ -147,28 +146,34 @@ class AsteriskWSAdapter:
         if self.client_state != WebSocketState.CONNECTED:
             return
         try:
-            # Мягкое понижение громкости, чтобы бот не "орал"
+            # Понижаем громкость, чтобы бот не был слишком громким
             softened_data = audioop.mul(data, 2, 0.75)
 
-            # 16000 Гц, 16 бит моно = 32000 байт/сек
-            audio_duration = len(softened_data) / 32000.0
-            now = time.time()
+            # Нарезаем звук на куски по 20 миллисекунд (640 байт для 16 кГц)
+            CHUNK_SIZE = 640
+            
+            for i in range(0, len(softened_data), CHUNK_SIZE):
+                chunk = softened_data[i:i+CHUNK_SIZE]
+                
+                audio_duration = len(chunk) / 32000.0
+                now = time.time()
 
-            if self.next_send_time < now:
-                self.next_send_time = now
+                if self.next_send_time < now:
+                    self.next_send_time = now
 
-            sleep_time = self.next_send_time - now
-            if sleep_time > 0.01:
-                await asyncio.sleep(sleep_time)
+                sleep_time = self.next_send_time - now
+                if sleep_time > 0.01:
+                    await asyncio.sleep(sleep_time)
 
-            self.next_send_time += audio_duration
+                self.next_send_time += audio_duration
 
-            # Маркер 0x12 сообщает Астериску, что звук идет в 16 кГц
-            header = b"\x12" + len(softened_data).to_bytes(2, byteorder="big")
-            self.writer.write(header + softened_data)
-            await self.writer.drain()
-        except Exception:
-            pass
+                header = b"\x12" + len(chunk).to_bytes(2, byteorder="big")
+                self.writer.write(header + chunk)
+                await self.writer.drain()
+                
+        except Exception as e:
+            # Теперь, если что-то упадет, мы увидим это в логах
+            print(f"Ошибка отправки аудио в Asterisk: {e}", flush=True)
 
 app = FastAPI()
 
