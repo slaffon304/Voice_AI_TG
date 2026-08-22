@@ -738,13 +738,16 @@ async def handle_asterisk_conn(reader, writer):
         if client_data.get("google_calendar_id"):
             active_tools.append({
                 "name": "Booking_tool",
-                "description": "Gestionează calendarul. Folosește această funcție DOAR atunci când clientul cere explicit o programare.",
+                "description": "Gestionează calendarul. ATENȚIE: Programează DOAR în zilele lucrătoare (Luni-Vineri, 09:00-17:00). Este strict interzis să programezi în weekend (Sâmbătă/Duminică). Pentru acțiunea 'book' trebuie OBLIGATORIU să transmiți: client_name, phone, request_summary, start_time și end_time.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "enum": ["check", "book", "cancel"]},
-                        "phone": {"type": "string"},
-                        "start_time": {"type": "string"}
+                        "phone": {"type": "string", "description": "Numărul de telefon al clientului"},
+                        "client_name": {"type": "string", "description": "Numele clientului"},
+                        "request_summary": {"type": "string", "description": "Subiectul programării (ex: Consultație AI)"},
+                        "start_time": {"type": "string", "description": "Ora de început în format ISO 8601 (ex: 2026-08-24T14:00:00+03:00)"},
+                        "end_time": {"type": "string", "description": "Ora de sfârșit în format ISO 8601 (ex: 2026-08-24T15:00:00+03:00)"}
                     },
                     "required": ["action"],
                 },
