@@ -787,7 +787,7 @@ async def handle_asterisk_conn(reader, writer):
                 system_instruction=system_prompt, 
                 vad=GeminiVADParams(
                     end_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
-                    silence_duration_ms=2000,
+                    silence_duration_ms=1000,
                     disabled=False,
                 ),
             ),
