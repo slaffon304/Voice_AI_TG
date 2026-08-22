@@ -174,52 +174,104 @@ class AsteriskWSAdapter:
         """Pipecat мгновенно отдает данные сюда и продолжает работу"""
         if self.client_state != WebSocketState.CONNECTED:
             return
-            
-        # Защита от краша audioop (требуется четное количество байт)
-        if len(data) % 2 != 0:
-            data += b'\x00'
-            
-        self.audio_queue.put_nowait(data)
+# ==========================================
+# АДАПТЕР ASTERISK (БЛОКИРУЮЩИЙ + АВТОДЕТЕКТ 8kHz)
+# ==========================================
+import audioop
 
-    async def _play_loop(self):
-        """Фоновый процесс, который ровно и плавно кормит Астериск"""
-        CHUNK_SIZE = 640 # Ровно 20мс для 16 кГц (32000 байт/сек)
+class AsteriskWSAdapter:
+    def __init__(self, reader, writer):
+        self.reader = reader
+        self.writer = writer
+        self.client_state = WebSocketState.CONNECTED
+        self.application_state = WebSocketState.CONNECTED
+        self.next_send_time = time.time()
+        self.is_muted = False 
+        self.in_state = None # Буфер для ресемплинга входящего звука
+
+    async def accept(self):
+        pass
+
+    async def close(self, code=1000, reason=""):
+        self.client_state = WebSocketState.DISCONNECTED
+        self.application_state = WebSocketState.DISCONNECTED
+        self.writer.close()
         try:
-            while self.client_state == WebSocketState.CONNECTED:
-                data = await self.audio_queue.get()
-                
-                # Понижаем громкость бота
-                softened = audioop.mul(data, 2, 0.75)
-                
-                # Добавляем в общий буфер
-                self.out_buffer.extend(softened)
-
-                # Нарезаем СТРОГО по 640 байт. Остаток (огрызок) ждет следующего куска.
-                while len(self.out_buffer) >= CHUNK_SIZE:
-                    chunk = self.out_buffer[:CHUNK_SIZE]
-                    del self.out_buffer[:CHUNK_SIZE]
-
-                    audio_duration = CHUNK_SIZE / 32000.0
-                    now = time.time()
-                    
-                    if self.next_send_time < now:
-                        self.next_send_time = now
-                        
-                    sleep_time = self.next_send_time - now
-                    if sleep_time > 0.01:
-                        await asyncio.sleep(sleep_time)
-                        
-                    self.next_send_time += audio_duration
-
-                    # Маркер 0x12 (16 кГц) + 640 байт идеального аудио
-                    header = b"\x12" + CHUNK_SIZE.to_bytes(2, byteorder="big")
-                    self.writer.write(header + chunk)
-                    await self.writer.drain()
-                    
-        except asyncio.CancelledError:
+            await self.writer.wait_closed()
+        except Exception:
             pass
+
+    async def receive_bytes(self):
+        try:
+            header = await self.reader.readexactly(3)
+            p_len = int.from_bytes(header[1:], byteorder="big")
+            data = await self.reader.readexactly(p_len)
+            
+            if header[0] == 0x00:
+                self.client_state = WebSocketState.DISCONNECTED
+                raise Exception("Hangup")
+
+            if not data or len(data) == 0:
+                return b""
+
+            # ⚡ ЖЕЛЕЗНАЯ ЗАЩИТА: Если Asterisk шлет 8 кГц (0x10), принудительно тянем до 16 кГц
+            # Это навсегда убьет испанские галлюцинации.
+            if header[0] == 0x10:
+                data, self.in_state = audioop.ratecv(data, 2, 1, 8000, 16000, self.in_state)
+
+            return data
+        except Exception:
+            self.client_state = WebSocketState.DISCONNECTED
+            raise
+
+    async def receive(self):
+        while True:
+            try:
+                data = await self.receive_bytes()
+                
+                if not data:
+                    continue
+
+                if self.is_muted:
+                    data = b'\x00' * len(data)
+
+                return {"type": "websocket.receive", "bytes": data}
+            except Exception:
+                self.client_state = WebSocketState.DISCONNECTED
+                return {"type": "websocket.disconnect", "code": 1000}
+
+    async def send_bytes(self, data):
+        if self.client_state != WebSocketState.CONNECTED:
+            return
+        try:
+            # Смягчаем громкость бота
+            softened_data = audioop.mul(data, 2, 0.75)
+            
+            # ⚡ НАРЕЗКА БЕЗ ОЧЕРЕДИ: Блокируем выполнение прямо здесь. 
+            # Pipecat будет ждать, пока звук реально не проиграется в линии!
+            CHUNK_SIZE = 640 
+            
+            for i in range(0, len(softened_data), CHUNK_SIZE):
+                chunk = softened_data[i:i+CHUNK_SIZE]
+
+                audio_duration = len(chunk) / 32000.0
+                now = time.time()
+
+                if self.next_send_time < now:
+                    self.next_send_time = now
+
+                sleep_time = self.next_send_time - now
+                if sleep_time > 0.01:
+                    await asyncio.sleep(sleep_time)
+
+                self.next_send_time += audio_duration
+
+                header = b"\x12" + len(chunk).to_bytes(2, byteorder="big")
+                self.writer.write(header + chunk)
+                await self.writer.drain()
+                
         except Exception as e:
-            print(f"Ошибка фонового плеера: {e}", flush=True)
+            print(f"Ошибка отправки аудио: {e}", flush=True)
 
 app = FastAPI()
 
