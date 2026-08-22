@@ -59,11 +59,11 @@ REDIS_URL = os.getenv("REDIS_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 API_SECRET_TOKEN = os.getenv("API_SECRET_TOKEN")
 
-ASTERISK_ARI_URL = os.getenv("ASTERISK_ARI_URL", "http://187.77.69.233:8088/ari/channels")
-ASTERISK_ARI_USER = os.getenv("ASTERISK_ARI_USER", "asterisk")
-ASTERISK_ARI_PASS = os.getenv("ASTERISK_ARI_PASS", "labupgrade_ari_pass")
-ASTERISK_ENDPOINT_SUFFIX = os.getenv("ASTERISK_ENDPOINT_SUFFIX", "@moldcell_endpoint")
-N8N_BASE_URL = os.getenv("N8N_BASE_URL", "https://n8n.labupgrade.in/webhook")
+ASTERISK_ARI_URL = os.getenv("ASTERISK_ARI_URL")
+ASTERISK_ARI_USER = os.getenv("ASTERISK_ARI_USER")
+ASTERISK_ARI_PASS = os.getenv("ASTERISK_ARI_PASS")
+ASTERISK_ENDPOINT_SUFFIX = os.getenv("ASTERISK_ENDPOINT_SUFFIX")
+N8N_BASE_URL = os.getenv("N8N_BASE_URL")
 ASTERISK_RECORDING_PATH = os.getenv("ASTERISK_RECORDING_PATH", "/var/spool/asterisk/monitor")
 
 KOMMO_SUBDOMAIN = os.getenv("KOMMO_SUBDOMAIN")
@@ -692,6 +692,8 @@ async def handle_asterisk_conn(reader, writer):
         system_prompt = system_prompt.replace("{office_status}", "Open")
         system_prompt = system_prompt.replace("{lang}", call_lang)
 
+        system_prompt += f"\n\n[PROGRAMUL DE LUCRU - CRITIC]\n"
+        system_prompt += f"Astăzi este {current_time}. Verifică programul de lucru din contextul companiei. ESTE STRICT INTERZIS să programezi în afara orelor de lucru sau în weekend (Sâmbătă/Duminică). Dacă clientul cere o zi de odihnă, refuză politicos și propune prima zi lucrătoare.\n"
         system_prompt += f"\n\n<USER_MEMORY>\n"
         system_prompt += f"CORE: {caller_memory['core']}\n"
         system_prompt += f"RECENT: {caller_memory['short']}\n"
