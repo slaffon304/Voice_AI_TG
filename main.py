@@ -167,6 +167,9 @@ MAX_CALL_SECONDS = _env_int("MAX_CALL_SECONDS", 900)
 # Раньше этого не было: бот принял мусорную расшифровку за прощание и положил
 # трубку на 40-й секунде. Ниже этого порога end_call игнорируется.
 MIN_SECONDS_BEFORE_END_CALL = _env_int("MIN_SECONDS_BEFORE_END_CALL", 25)
+# Значения из исходной рабочей версии, характером не управляются.
+VAD_SILENCE_MS = _env_int("VAD_SILENCE_MS", 1000)
+RECOVERY_DELAY_S = _env_float("RECOVERY_DELAY_S", 4.0)
 IDLE_TIMEOUT_SECONDS = _env_float("IDLE_TIMEOUT_SECONDS", 20.0)
 PERSONA_CACHE_TTL = _env_int("PERSONA_CACHE_TTL", 60)
 
@@ -355,115 +358,81 @@ def build_audio_filter():
 # 3. ДВИЖОК ХАРАКТЕРА
 # =============================================================================
 
+# Шкалы характера — ровно те же, что в bbb (таблица companion_settings).
 TRAITS = (
-    "warmth",
+    "openness",
+    "conscientiousness",
+    "extraversion",
+    "agreeableness",
+    "neuroticism",
+    "sarcasm",
     "energy",
-    "formality",
-    "assertiveness",
-    "verbosity",
-    "empathy",
-    "humor",
-    "persistence",
-    "patience",
-    "precision",
+    "proactivity",
+    "tough_love",
+    "ego",
 )
 
-# Каждая шкала 1..10 разворачивается в конкретную поведенческую директиву.
-# Три ведра: 1-3 (low), 4-7 (mid), 8-10 (high).
-# Характер собирается так же, как в bbb: голые шкалы 1-10 с названными
-# полюсами плюс одна инструкция адаптироваться под них. Никаких заранее
-# написанных фраз — модель сама выводит поведение из чисел.
 _TRAIT_SCALES: tuple[tuple[str, str], ...] = (
-    ("warmth",        "Теплота (сухой и деловой - душевный)"),
-    ("energy",        "Энергетика (медленный - гиперэнергичный)"),
-    ("formality",     "Формальность (свободно - строго официально)"),
-    ("assertiveness", "Инициативность (ведомый - ведущий)"),
-    ("verbosity",     "Развёрнутость (односложный - подробно презентует)"),
-    ("empathy",       "Эмпатия (только факты - считывает эмоции)"),
-    ("humor",         "Юмор (серьёзный - ироничный)"),
-    ("persistence",   "Настойчивость (не давит - дожимает до результата)"),
-    ("patience",      "Терпение (торопится - бесконечно терпелив)"),
-    ("precision",     "Точность (примерно - выверяет каждую цифру)"),
+    ("openness",          "Открытость (консерватор - творец)"),
+    ("conscientiousness", "Собранность (хаос - педант)"),
+    ("extraversion",      "Экстраверсия (интроверт - душа компании)"),
+    ("agreeableness",     "Дружелюбие (критик - эмпат)"),
+    ("neuroticism",       "Эмоциональность (спокоен - легко возбудим)"),
+    ("sarcasm",           "Сарказм (серьезный - ироничный)"),
+    ("energy",            "Энергетика (медленный - гиперэнергичный)"),
+    ("proactivity",       "Инициативность (ведомый - ведущий)"),
+    ("tough_love",        "Стиль поддержки (мягко - жестко мотивирует)"),
+    ("ego",               "Эго (скромный - высокомерный)"),
 )
 
+# Акцент и манера речи по языку — как lang_profiles в bbb.
 _SPEECH_STYLE: dict[str, str] = {
-    "ro": (
-        "Vorbește româna ca în Moldova: clar, natural, fără afectare. "
-        "Folosește umpluturi firești ('deci', 'păi', 'adică', 'bun'). "
-        "Ritmul și pauzele adaptează-le la portretul de mai sus."
-    ),
     "ru": (
-        "Говори на живом разговорном русском. Используй естественные "
-        "заполнители речи ('так', 'смотрите', 'то есть', 'хорошо'). "
-        "Темп, паузы и интонацию подстраивай под портрет выше."
+        "Speak with a native Russian accent. Use natural Russian conversational "
+        "fillers (like 'ну', 'так', 'смотрите'). Let your pacing and pauses follow "
+        "the psychological portrait above."
+    ),
+    "ro": (
+        "Speak with a native Moldovan Romanian accent. Use natural fillers "
+        "(like 'deci', 'păi', 'adică'). Let your pacing and pauses follow the "
+        "psychological portrait above."
     ),
     "en": (
-        "Speak natural conversational English at a business pace. "
-        "Use natural fillers ('so', 'alright', 'you know'). "
-        "Adapt pacing and pauses to the portrait above."
+        "Speak with a neutral business English accent. Use natural fillers "
+        "(like 'so', 'alright'). Let your pacing and pauses follow the "
+        "psychological portrait above."
     ),
-}
-
-_ADDRESS_FORM: dict[str, tuple[str, str]] = {
-    "ro": ("Adresează-te cu 'tu'.", "Adresează-te cu 'dumneavoastră'."),
-    "ru": ("Обращайся на «ты».", "Обращайся на «вы»."),
-    "en": ("Use a casual second person.", "Use a courteous second person."),
-}
-
-_RATE_DIRECTIVE = {
-    "slow": {"ro": "Vorbește mai rar decât media.", "ru": "Говори медленнее среднего.",
-             "en": "Speak slower than average."},
-    "normal": {"ro": "Ritm conversațional obișnuit.", "ru": "Обычный разговорный темп.",
-               "en": "Normal conversational pace."},
-    "fast": {"ro": "Vorbește alert, dar clar.", "ru": "Говори быстро, но разборчиво.",
-             "en": "Speak briskly but clearly."},
 }
 
 
 @dataclass
 class Persona:
-    """Характер бота. Одна строка bot_personas на клиента."""
+    """Характер бота. Поля повторяют companion_settings из bbb."""
 
-    persona_name: str = "Asistent"
+    persona_name: str = ""
     lore: str = ""
     voice_model: str = "Enceladus"
     language: str = DEFAULT_LANG
     system_prompt: str = ""
-
     personality_enabled: bool = True
-    warmth: int = 6
-    energy: int = 5
-    formality: int = 7
-    assertiveness: int = 5
-    verbosity: int = 4
-    empathy: int = 6
-    humor: int = 3
-    persistence: int = 5
-    patience: int = 7
-    precision: int = 8
 
-    speech_rate: str = "normal"
-    use_fillers: bool = True
-    address_form: str = "auto"  # formal | informal | auto
-    catchphrases: str = ""
-    forbidden_topics: str = ""
+    openness: int = 5
+    conscientiousness: int = 5
+    extraversion: int = 5
+    agreeableness: int = 5
+    neuroticism: int = 5
+    sarcasm: int = 5
+    energy: int = 5
+    proactivity: int = 5
+    tough_love: int = 5
+    ego: int = 5
 
     @classmethod
     def from_row(cls, row: dict[str, Any] | None) -> "Persona":
         p = cls()
         if not row:
             return p
-        for f in (
-            "persona_name",
-            "lore",
-            "voice_model",
-            "language",
-            "system_prompt",
-            "speech_rate",
-            "address_form",
-            "catchphrases",
-            "forbidden_topics",
-        ):
+        for f in ("persona_name", "lore", "voice_model", "language", "system_prompt"):
             val = row.get(f)
             if val:
                 setattr(p, f, str(val))
@@ -474,56 +443,24 @@ class Persona:
                     setattr(p, f, max(1, min(10, int(val))))
                 except (TypeError, ValueError):
                     pass
-        for f in ("personality_enabled", "use_fillers"):
-            val = row.get(f)
-            if val is not None:
-                setattr(p, f, bool(val))
+        if row.get("personality_enabled") is not None:
+            p.personality_enabled = bool(row["personality_enabled"])
         return p
-
-    # --- характер -> технические параметры, не только текст промпта ---
-
-    @property
-    def silence_duration_ms(self) -> int:
-        """Терпеливый бот дольше ждёт, пока собеседник додумает фразу."""
-        return int(max(600, min(1600, 600 + self.patience * 90)))
-
-    @property
-    def end_sensitivity(self):
-        return (
-            types.EndSensitivity.END_SENSITIVITY_LOW
-            if self.patience >= 8
-            else types.EndSensitivity.END_SENSITIVITY_HIGH
-        )
-
-    @property
-    def recovery_delay(self) -> float:
-        """Через сколько секунд молчания бот перехватывает инициативу."""
-        return round(2.5 + self.patience * 0.25, 2)
-
-    @property
-    def is_formal(self) -> bool:
-        if self.address_form == "formal":
-            return True
-        if self.address_form == "informal":
-            return False
-        return self.formality >= 5
 
 
 def build_personality_block(p: Persona, lang: str) -> str:
-    """<AI_IDENTITY> + <BEHAVIOR_ENGINE>, как в bbb."""
+    """<AI_IDENTITY> + <BEHAVIOR_ENGINE> — та же конструкция, что в bbb."""
     if not p.personality_enabled:
         return ""
 
     lang = (lang or DEFAULT_LANG).lower()[:2]
-    out: list[str] = []
-
-    out.append("<AI_IDENTITY>")
+    out: list[str] = ["<AI_IDENTITY>"]
     if p.persona_name:
-        out.append(f"Твоё имя: {p.persona_name}")
+        out.append(f"Твое имя: {p.persona_name}")
     if p.lore:
         out.append(f"Твоя личная предыстория (LORE): {p.lore}")
         out.append(
-            "ВНИМАНИЕ: Это ТВОЯ история и ТВОИ интересы. "
+            "ВНИМАНИЕ: Это ТВОИ интересы и ТВОЯ история. "
             "НИКОГДА не приписывай эти факты собеседнику!"
         )
     out.append("</AI_IDENTITY>")
@@ -531,24 +468,15 @@ def build_personality_block(p: Persona, lang: str) -> str:
 
     out.append("<BEHAVIOR_ENGINE>")
     out.append("ПСИХОЛОГИЧЕСКИЙ ПОРТРЕТ (Шкала 1-10):")
-    for i, (field, label) in enumerate(_TRAIT_SCALES, start=1):
-        out.append(f"{i}. {label}: {getattr(p, field)}")
+    for i, (field_name, label) in enumerate(_TRAIT_SCALES, start=1):
+        out.append(f"{i}. {label}: {getattr(p, field_name)}")
     out.append("")
     out.append(
-        "ИНСТРУКЦИЯ К ХАРАКТЕРУ: Адаптируй свой лексикон, длину реплик, длину пауз, "
-        "скорость речи, напор и эмоции СТРОГО под эти 10 показателей. "
-        "Эти показатели важнее любых общих указаний о тоне ниже по промпту."
+        "ИНСТРУКЦИЯ К ХАРАКТЕРУ: Адаптируй свой лексикон, длину пауз, скорость речи "
+        "и эмоции СТРОГО под эти 10 показателей. Они важнее любых общих указаний "
+        "о тоне ниже по промпту."
     )
-    out.append(f"РЕЧЬ: {_SPEECH_STYLE.get(lang, _SPEECH_STYLE['en'])}")
-    out.append(f"ТЕМП: {_RATE_DIRECTIVE.get(p.speech_rate, _RATE_DIRECTIVE['normal']).get(lang, '')}")
-    forms = _ADDRESS_FORM.get(lang, _ADDRESS_FORM["en"])
-    out.append(f"ОБРАЩЕНИЕ: {forms[1] if p.is_formal else forms[0]}")
-    if not p.use_fillers:
-        out.append("ЗАПОЛНИТЕЛИ: не используй их, говори чисто.")
-    if p.catchphrases:
-        out.append(f"ФИРМЕННЫЕ ФРАЗЫ (редко): {p.catchphrases}")
-    if p.forbidden_topics:
-        out.append(f"НИКОГДА не обсуждай: {p.forbidden_topics}")
+    out.append(f"МАНЕРА РЕЧИ: {_SPEECH_STYLE.get(lang, _SPEECH_STYLE['en'])}")
     out.append("</BEHAVIOR_ENGINE>")
 
     return "\n".join(out)
@@ -682,8 +610,7 @@ async def get_persona_row(client_id: str) -> dict | None:
 
     cols = ",".join(
         ["system_prompt", "voice_model", "language", "persona_name", "lore",
-         "personality_enabled", "speech_rate", "use_fillers", "address_form",
-         "catchphrases", "forbidden_topics", *TRAITS]
+         "personality_enabled", *TRAITS]
     )
     rows = await sb_select("bot_personas", {"client_id": f"eq.{client_id}", "select": cols})
     row = rows[0] if rows else None
@@ -1761,10 +1688,7 @@ async def persona_preview(client_id: str, lang: str = DEFAULT_LANG, _: str = Dep
         "traits": {t: getattr(persona, t) for t in TRAITS},
         "personality_block": block,
         "estimated_tokens": estimate_tokens(block),
-        "vad": {
-            "silence_duration_ms": persona.silence_duration_ms,
-            "recovery_delay_s": persona.recovery_delay,
-        },
+        "voice_model": persona.voice_model,
     }
 
 
@@ -1963,8 +1887,8 @@ async def handle_asterisk_conn(
                     voice=persona.voice_model,
                     system_instruction=system_prompt,
                     vad=GeminiVADParams(
-                        end_sensitivity=persona.end_sensitivity,
-                        silence_duration_ms=persona.silence_duration_ms,
+                        end_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                        silence_duration_ms=VAD_SILENCE_MS,
                         disabled=False,
                     ),
                 ),
@@ -2094,7 +2018,7 @@ async def handle_asterisk_conn(
             if client_data.get("google_calendar_id"):
                 llm.register_function("Booking_tool", process_booking)
 
-            recovery = InterruptionRecoveryProcessor(context, delay=persona.recovery_delay)
+            recovery = InterruptionRecoveryProcessor(context, delay=RECOVERY_DELAY_S)
             probe = InboundAudioProbe()
 
             pipeline = Pipeline(
