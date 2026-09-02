@@ -9,7 +9,7 @@ Asterisk AudioSocket  <->  Pipecat  <->  Gemini Live
   * per-call корреляция входящего номера (устранена гонка при одновременных звонках)
   * URL-энкодинг всех параметров PostgREST
   * таймауты на всех HTTP-вызовах, параллельная загрузка контекста звонка
-  * учёт токенов и себестоимости звонка (gsm_call_logs)
+  * учёт токенов и себестоимости звонка — уходит в существующий call_logs через n8n
   * лимит одновременных звонков и максимальной длительности
   * structured logging с call_id
   * рабочие часы и таймзона — из БД, а не хардкод
@@ -30,7 +30,7 @@ import os
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -141,7 +141,7 @@ AS_TYPE_AUDIO_OUT = _env_int("AS_TYPE_AUDIO_OUT", 0x12)
 ASTERISK_INPUT_RATE = _env_int("ASTERISK_INPUT_RATE", 16000)
 
 # Шумодав — улучшение, а не обязательный компонент. Выключается без редеплоя.
-ENABLE_RNNOISE = _env_bool("ENABLE_RNNOISE", True)
+ENABLE_RNNOISE = _env_bool("ENABLE_RNNOISE", False)
 # Сторож: сколько секунд тишины в пайплайне при живом сокете считать поломкой.
 AUDIO_STALL_SECONDS = _env_float("AUDIO_STALL_SECONDS", 10.0)
 
@@ -164,6 +164,9 @@ ARCHIVIST_MODELS = [
 MAX_CONCURRENT_CALLS = _env_int("MAX_CONCURRENT_CALLS", 25)
 MAX_CALLS_PER_CLIENT = _env_int("MAX_CALLS_PER_CLIENT", 5)
 MAX_CALL_SECONDS = _env_int("MAX_CALL_SECONDS", 900)
+# Раньше этого не было: бот принял мусорную расшифровку за прощание и положил
+# трубку на 40-й секунде. Ниже этого порога end_call игнорируется.
+MIN_SECONDS_BEFORE_END_CALL = _env_int("MIN_SECONDS_BEFORE_END_CALL", 25)
 IDLE_TIMEOUT_SECONDS = _env_float("IDLE_TIMEOUT_SECONDS", 20.0)
 PERSONA_CACHE_TTL = _env_int("PERSONA_CACHE_TTL", 60)
 
@@ -367,85 +370,53 @@ TRAITS = (
 
 # Каждая шкала 1..10 разворачивается в конкретную поведенческую директиву.
 # Три ведра: 1-3 (low), 4-7 (mid), 8-10 (high).
-_TRAIT_DIRECTIVES: dict[str, tuple[str, str, str]] = {
-    "warmth": (
-        "Keep a neutral, businesslike register. No small talk.",
-        "Be polite and pleasant, with brief human touches.",
-        "Be openly warm: acknowledge the person before moving to business.",
-    ),
-    "energy": (
-        "Speak calmly and unhurriedly; leave space between sentences.",
-        "Keep a natural, even tempo.",
-        "Speak with clear energy and forward momentum.",
-    ),
-    "formality": (
-        "Use everyday, informal wording.",
-        "Use a polite, neutral professional register.",
-        "Use strictly formal, professional wording. No slang.",
-    ),
-    "assertiveness": (
-        "Follow the caller's lead. Answer what is asked, nothing more.",
-        "Guide the conversation, but yield whenever the caller takes over.",
-        "Lead the call: set the agenda and drive it to the next step yourself.",
-    ),
-    "verbosity": (
-        "Answer in one short sentence. Never read more than three items aloud.",
-        "Keep answers to one or two sentences; expand only when asked.",
-        "Give complete answers with context, still natural for speech.",
-    ),
-    "empathy": (
-        "Stay factual. Do not comment on the caller's feelings.",
-        "Acknowledge frustration in one short phrase, then solve the problem.",
-        "Name and validate the caller's feelings before solving the problem.",
-    ),
-    "humor": (
-        "No jokes at all.",
-        "An occasional light remark is fine, never at the caller's expense.",
-        "Use light humour freely while staying respectful.",
-    ),
-    "persistence": (
-        "Never push. If the caller declines, close the call politely.",
-        "Make one clear attempt at the next step; accept a refusal.",
-        "Make up to two attempts to secure the next step, then accept a refusal.",
-    ),
-    "patience": (
-        "Move briskly. Re-ask once, then offer a callback.",
-        "Give the caller time to think before prompting again.",
-        "Be very patient: rephrase and repeat calmly as many times as needed.",
-    ),
-    "precision": (
-        "Approximate answers are acceptable.",
-        "Be accurate and say plainly when you are unsure.",
-        "Be exact with names, dates, times and numbers, and read them back for confirmation.",
-    ),
-}
+# Характер собирается так же, как в bbb: голые шкалы 1-10 с названными
+# полюсами плюс одна инструкция адаптироваться под них. Никаких заранее
+# написанных фраз — модель сама выводит поведение из чисел.
+_TRAIT_SCALES: tuple[tuple[str, str], ...] = (
+    ("warmth",        "Теплота (сухой и деловой - душевный)"),
+    ("energy",        "Энергетика (медленный - гиперэнергичный)"),
+    ("formality",     "Формальность (свободно - строго официально)"),
+    ("assertiveness", "Инициативность (ведомый - ведущий)"),
+    ("verbosity",     "Развёрнутость (односложный - подробно презентует)"),
+    ("empathy",       "Эмпатия (только факты - считывает эмоции)"),
+    ("humor",         "Юмор (серьёзный - ироничный)"),
+    ("persistence",   "Настойчивость (не давит - дожимает до результата)"),
+    ("patience",      "Терпение (торопится - бесконечно терпелив)"),
+    ("precision",     "Точность (примерно - выверяет каждую цифру)"),
+)
 
 _SPEECH_STYLE: dict[str, str] = {
     "ro": (
-        "Speak Romanian as spoken in Moldova: clear, natural, unaffected. "
-        "Natural fillers: 'deci', 'păi', 'adică', 'bun'."
+        "Vorbește româna ca în Moldova: clar, natural, fără afectare. "
+        "Folosește umpluturi firești ('deci', 'păi', 'adică', 'bun'). "
+        "Ritmul și pauzele adaptează-le la portretul de mai sus."
     ),
     "ru": (
-        "Speak natural conversational Russian. "
-        "Natural fillers: 'так', 'смотрите', 'то есть', 'хорошо'."
+        "Говори на живом разговорном русском. Используй естественные "
+        "заполнители речи ('так', 'смотрите', 'то есть', 'хорошо'). "
+        "Темп, паузы и интонацию подстраивай под портрет выше."
     ),
     "en": (
-        "Speak natural conversational English at a relaxed business pace. "
-        "Natural fillers: 'so', 'alright', 'you know'."
+        "Speak natural conversational English at a business pace. "
+        "Use natural fillers ('so', 'alright', 'you know'). "
+        "Adapt pacing and pauses to the portrait above."
     ),
 }
 
 _ADDRESS_FORM: dict[str, tuple[str, str]] = {
-    # (informal, formal)
-    "ro": ("Address the caller informally ('tu').", "Address the caller formally ('dumneavoastră')."),
-    "ru": ("Address the caller informally ('ты').", "Address the caller formally ('вы')."),
-    "en": ("Use a casual second person.", "Use a courteous, professional second person."),
+    "ro": ("Adresează-te cu 'tu'.", "Adresează-te cu 'dumneavoastră'."),
+    "ru": ("Обращайся на «ты».", "Обращайся на «вы»."),
+    "en": ("Use a casual second person.", "Use a courteous second person."),
 }
 
 _RATE_DIRECTIVE = {
-    "slow": "Speak noticeably slower than average.",
-    "normal": "Speak at an average conversational pace.",
-    "fast": "Speak briskly, but stay fully intelligible.",
+    "slow": {"ro": "Vorbește mai rar decât media.", "ru": "Говори медленнее среднего.",
+             "en": "Speak slower than average."},
+    "normal": {"ro": "Ritm conversațional obișnuit.", "ru": "Обычный разговорный темп.",
+               "en": "Normal conversational pace."},
+    "fast": {"ro": "Vorbește alert, dar clar.", "ru": "Говори быстро, но разборчиво.",
+             "en": "Speak briskly but clearly."},
 }
 
 
@@ -538,48 +509,49 @@ class Persona:
         return self.formality >= 5
 
 
-def _bucket(v: int) -> int:
-    return 0 if v <= 3 else (1 if v <= 7 else 2)
-
-
 def build_personality_block(p: Persona, lang: str) -> str:
-    """Собирает компактный блок характера (~250 токенов) для system_instruction."""
+    """<AI_IDENTITY> + <BEHAVIOR_ENGINE>, как в bbb."""
     if not p.personality_enabled:
         return ""
 
     lang = (lang or DEFAULT_LANG).lower()[:2]
-    lines: list[str] = ["<PERSONA>"]
-    # Если имя не заполнено, не навязываем дефолт: у клиента оно уже может быть
-    # задано в собственном system_prompt ("Ești Grigorii..."), и два имени в
-    # одном промпте модель путают.
-    if p.persona_name and p.persona_name.strip().lower() not in ("asistent", "assistant", "bot"):
-        lines.append(f"Your name is {p.persona_name}. You are a voice agent on a phone call.")
-    else:
-        lines.append("You are a voice agent on a phone call.")
+    out: list[str] = []
+
+    out.append("<AI_IDENTITY>")
+    if p.persona_name:
+        out.append(f"Твоё имя: {p.persona_name}")
     if p.lore:
-        lines.append(f"Background (yours, never the caller's): {p.lore}")
+        out.append(f"Твоя личная предыстория (LORE): {p.lore}")
+        out.append(
+            "ВНИМАНИЕ: Это ТВОЯ история и ТВОИ интересы. "
+            "НИКОГДА не приписывай эти факты собеседнику!"
+        )
+    out.append("</AI_IDENTITY>")
+    out.append("")
 
-    lines.append("")
-    lines.append("BEHAVIOUR (follow every line):")
-    for trait in TRAITS:
-        directive = _TRAIT_DIRECTIVES[trait][_bucket(getattr(p, trait))]
-        lines.append(f"- {directive}")
-
-    lines.append("")
-    lines.append("SPEECH:")
-    lines.append(f"- {_SPEECH_STYLE.get(lang, _SPEECH_STYLE['en'])}")
-    lines.append(f"- {_RATE_DIRECTIVE.get(p.speech_rate, _RATE_DIRECTIVE['normal'])}")
+    out.append("<BEHAVIOR_ENGINE>")
+    out.append("ПСИХОЛОГИЧЕСКИЙ ПОРТРЕТ (Шкала 1-10):")
+    for i, (field, label) in enumerate(_TRAIT_SCALES, start=1):
+        out.append(f"{i}. {label}: {getattr(p, field)}")
+    out.append("")
+    out.append(
+        "ИНСТРУКЦИЯ К ХАРАКТЕРУ: Адаптируй свой лексикон, длину реплик, длину пауз, "
+        "скорость речи, напор и эмоции СТРОГО под эти 10 показателей. "
+        "Эти показатели важнее любых общих указаний о тоне ниже по промпту."
+    )
+    out.append(f"РЕЧЬ: {_SPEECH_STYLE.get(lang, _SPEECH_STYLE['en'])}")
+    out.append(f"ТЕМП: {_RATE_DIRECTIVE.get(p.speech_rate, _RATE_DIRECTIVE['normal']).get(lang, '')}")
     forms = _ADDRESS_FORM.get(lang, _ADDRESS_FORM["en"])
-    lines.append(f"- {forms[1] if p.is_formal else forms[0]}")
+    out.append(f"ОБРАЩЕНИЕ: {forms[1] if p.is_formal else forms[0]}")
     if not p.use_fillers:
-        lines.append("- Do not use conversational fillers; speak cleanly.")
+        out.append("ЗАПОЛНИТЕЛИ: не используй их, говори чисто.")
     if p.catchphrases:
-        lines.append(f"- Signature phrases you may use sparingly: {p.catchphrases}")
+        out.append(f"ФИРМЕННЫЕ ФРАЗЫ (редко): {p.catchphrases}")
     if p.forbidden_topics:
-        lines.append(f"- Never discuss: {p.forbidden_topics}")
+        out.append(f"НИКОГДА не обсуждай: {p.forbidden_topics}")
+    out.append("</BEHAVIOR_ENGINE>")
 
-    lines.append("</PERSONA>")
-    return "\n".join(lines)
+    return "\n".join(out)
 
 
 TELEPHONY_RULES = """<CALL_RULES>
@@ -931,6 +903,31 @@ async def lookup_contact(client_data: dict, client_id: str, phone: str) -> dict:
         return {"found": False}
 
 
+async def ensure_end_client(client_id: str, phone: str, name: str = "", lang: str = "") -> None:
+    """
+    Каждый входящий с незнакомого номера получает карточку в end_clients.
+    Имя и язык дописываются после разговора, когда бот их узнал.
+    Повторный вызов ничего не ломает — на (client_id, phone) стоит unique.
+    """
+    if not phone or phone == "Necunoscut" or not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    row: dict[str, Any] = {"client_id": client_id, "phone": phone, "lead_status": "new"}
+    if name:
+        row["name"] = name
+    if lang:
+        row["language"] = lang
+    try:
+        db = create_client(SUPABASE_URL, SUPABASE_KEY)
+        await asyncio.to_thread(
+            db.table("end_clients")
+            .upsert(row, on_conflict="client_id,phone", ignore_duplicates=not (name or lang))
+            .execute
+        )
+        log.info("end_clients upserted for %s (name=%s lang=%s)", phone, name or "-", lang or "-")
+    except Exception as exc:
+        log.warning("end_clients upsert failed: %s", exc)
+
+
 async def send_tg_alert(chat_id: str | None, message: str) -> None:
     if not TG_BOT_TOKEN or not chat_id:
         return
@@ -964,16 +961,6 @@ async def upload_audio_to_supabase(client_id: str, filepath: str) -> str | None:
         return None
 
 
-async def insert_call_log(row: dict) -> None:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return
-    try:
-        db = create_client(SUPABASE_URL, SUPABASE_KEY)
-        await asyncio.to_thread(db.table("gsm_call_logs").insert(row).execute)
-    except Exception as exc:
-        log.warning("call log insert failed: %s", exc)
-
-
 # =============================================================================
 # 6. АРХИВАРИУС (память + резюме для CRM)
 # =============================================================================
@@ -990,6 +977,7 @@ async def run_archivist_and_notify_n8n(
     direction: str,
     call_status: str,
     tz_name: str,
+    usage_stats: dict | None = None,
 ) -> None:
     if not chat_history.strip() or phone == "Necunoscut":
         return
@@ -1015,9 +1003,10 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
 4. summary: суть текущего звонка для менеджера.
 5. sentiment: настрой и возражения.
 6. next_step: следующий шаг (перезвонить, отправить КП и т.д.).
-7. language: язык клиента (ro/ru/en).
+7. language: язык, на котором РЕАЛЬНО говорил клиент (ro/ru/en).
+8. client_name: имя клиента, если он его назвал. Иначе пустая строка.
 
-{{"core_identity":"...","short_term_context":"...","long_term_context":"...","summary":"...","sentiment":"...","next_step":"...","language":"..."}}
+{{"core_identity":"...","short_term_context":"...","long_term_context":"...","summary":"...","sentiment":"...","next_step":"...","language":"...","client_name":"..."}}
 """
 
     data: dict[str, Any] = {}
@@ -1067,6 +1056,12 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
     except Exception as exc:
         log.error("[archivist] memory save failed: %s", exc)
 
+    # Дописываем в карточку то, что удалось узнать за разговор.
+    learned_name = str(data.get("client_name") or "").strip()
+    learned_lang = normalize_lang(data.get("language")) or ""
+    if learned_name or learned_lang:
+        await ensure_end_client(client_id, phone, learned_name, learned_lang)
+
     if not N8N_BASE_URL:
         return
     payload = {
@@ -1089,6 +1084,9 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
         "system_instructions_length": sys_length,
         "platform": "gsm_voice",
         "direction": direction,
+        # Расход звонка идёт тем же вебхуком — n8n пишет его в call_logs,
+        # отдельная таблица не нужна.
+        **(usage_stats or {}),
     }
     try:
         await http().post(f"{N8N_BASE_URL}/post-call-summary", json=payload, timeout=10.0)
@@ -1393,6 +1391,8 @@ def build_system_prompt(
     lang: str,
     now: dt.datetime,
     hours: dict[str, list[str]],
+    caller_phone: str = "Necunoscut",
+    caller_name: str = "",
 ) -> str:
     raw = persona.system_prompt or client_data.get("system_message") or "Ești un asistent virtual."
     is_open, readable_hours = office_state(hours, now)
@@ -1414,7 +1414,31 @@ def build_system_prompt(
     ):
         prompt = prompt.replace(token, value)
 
-    blocks = [prompt, "", build_personality_block(persona, lang), "", TELEPHONY_RULES, ""]
+    # Характер идёт ПЕРВЫМ. Раньше он стоял в хвосте, после трёх тысяч токенов
+    # клиентского промпта, и терялся — поэтому его и не было слышно.
+    blocks = [build_personality_block(persona, lang), "", prompt, "", TELEPHONY_RULES, ""]
+
+    # Номер звонящего. Раньше он никуда не передавался, и бот был вынужден
+    # спрашивать номер у человека, который с этого номера и звонит.
+    blocks.append("<CALLER>")
+    if caller_phone and caller_phone != "Necunoscut":
+        blocks.append(f"The caller is phoning from: {caller_phone}")
+        blocks.append(
+            "You already have this number. Never ask the caller for their phone number. "
+            "Use it directly when saving a lead or sending an SMS. Ask only if they want "
+            "to be reached on a different number."
+        )
+    else:
+        blocks.append("The caller's number is hidden. Ask for it only if you need a callback.")
+    if caller_name:
+        blocks.append(f"The caller's name is {caller_name}. Use it naturally, do not re-ask.")
+    else:
+        blocks.append(
+            "You do not know the caller's name. Never invent one. Ask for it only when "
+            "the conversation actually needs it."
+        )
+    blocks.append("</CALLER>")
+    blocks.append("")
 
     blocks.append("<SCHEDULE>")
     blocks.append(f"Now: {now.strftime('%A, %d %B %Y, %H:%M')} ({now.tzname()}).")
@@ -1434,7 +1458,22 @@ def build_system_prompt(
     blocks.append("Use this to avoid re-asking what you already know. Never read it aloud.")
     blocks.append("</CALLER_MEMORY>")
     blocks.append("")
-    blocks.append(f"Speak only in: {lang.upper()}.")
+
+    # Раньше здесь стояло жёсткое "Speak only in: XX", которое перебивало
+    # более разумное правило из промпта клиента.
+    blocks.append("<LANGUAGE>")
+    blocks.append(f"Start the call in {lang.upper()} and stay there by default.")
+    blocks.append(
+        "Switch languages only when the caller has clearly and deliberately spoken "
+        "another language for two full turns in a row. Then switch completely and stay "
+        "in the new language for the rest of the call."
+    )
+    blocks.append(
+        "Never switch because of a single word, a fragment, a greeting, or speech you "
+        "did not understand. If the audio is unclear, assume the caller is still using "
+        "the current language and ask them to repeat."
+    )
+    blocks.append("</LANGUAGE>")
 
     return "\n".join(b for b in blocks if b is not None)
 
@@ -1448,10 +1487,16 @@ def build_tools(client_data: dict, readable_hours: str) -> list[dict]:
                 "type": "object",
                 "properties": {
                     "client_name": {"type": "string"},
-                    "client_phone": {"type": "string"},
+                    "client_phone": {
+                        "type": "string",
+                        "description": (
+                            "Doar dacă clientul cere să fie contactat pe ALT număr. "
+                            "Numărul de la care sună este deja cunoscut — nu-l întreba."
+                        ),
+                    },
                     "request_summary": {"type": "string"},
                 },
-                "required": ["client_name", "client_phone", "request_summary"],
+                "required": ["client_name", "request_summary"],
             },
         },
         {
@@ -1466,8 +1511,9 @@ def build_tools(client_data: dict, readable_hours: str) -> list[dict]:
         {
             "name": "end_call",
             "description": (
-                "Încheie apelul. OBLIGATORIU: spune o scurtă frază de rămas-bun ÎNAINTE "
-                "de a apela această funcție."
+                "Încheie apelul. Folosește DOAR după ce clientul și-a luat rămas-bun clar "
+                "și fără echivoc. Dacă nu ai înțeles ce a spus, cere-i să repete — "
+                "NU închide. OBLIGATORIU: spune o scurtă frază de rămas-bun înainte."
             ),
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
@@ -1847,13 +1893,25 @@ async def handle_asterisk_conn(
                 client_name = (contact.get("name") or "").strip()
                 call_lang = contact.get("lang") or persona.language or DEFAULT_LANG
 
+            # Незнакомый входящий — сразу заводим карточку, не дожидаясь конца
+            # разговора. Даже если звонок оборвётся, номер останется в базе.
+            if not is_outbound and not contact.get("found"):
+                asyncio.create_task(ensure_end_client(client_id, target_phone))
+
             # Имени может не быть — тогда обращаемся нейтрально, а не выдумываем.
             is_known_caller = bool(client_name)
             if not is_known_caller:
                 client_name = "client"
 
             system_prompt = build_system_prompt(
-                client_data, persona, caller_memory, call_lang, now, hours
+                client_data,
+                persona,
+                caller_memory,
+                call_lang,
+                now,
+                hours,
+                caller_phone=target_phone,
+                caller_name=client_name if is_known_caller else "",
             )
             _, readable_hours = office_state(hours, now)
             tools = [{"function_declarations": build_tools(client_data, readable_hours)}]
@@ -1924,6 +1982,10 @@ async def handle_asterisk_conn(
                 return resp.json()
 
             async def process_save_lead(fn: FunctionCallParams):
+                # Номер звонящего известен серверу. Модель указывает его только
+                # если клиент просит связаться по ДРУГОМУ номеру.
+                if not str(fn.arguments.get("client_phone") or "").strip():
+                    fn.arguments["client_phone"] = target_phone
                 # Дедуп: модель иногда зовёт save_lead дважды на один и тот же лид.
                 digest = hashlib.sha1(
                     json.dumps(fn.arguments, sort_keys=True, ensure_ascii=False).encode()
@@ -1999,6 +2061,24 @@ async def handle_asterisk_conn(
                     socket.is_muted = False
 
             async def process_end_call(fn: FunctionCallParams):
+                elapsed = time.time() - start_ts
+                if elapsed < MIN_SECONDS_BEFORE_END_CALL:
+                    clog.warning(
+                        "[%s] end_call blocked at %.0fs — too early, likely misheard",
+                        call_id,
+                        elapsed,
+                    )
+                    await fn.result_callback(
+                        {
+                            "status": "rejected",
+                            "message": (
+                                "Nu închide acum. Clientul nu și-a luat rămas-bun clar. "
+                                "Cere-i să repete și continuă conversația."
+                            ),
+                        }
+                    )
+                    return
+
                 await fn.result_callback({"status": "success", "message": "Call ended"})
 
                 async def delayed_end():
@@ -2115,27 +2195,19 @@ async def handle_asterisk_conn(
                 transcript, user_replies = build_transcript(context.messages)
                 text_in, audio_in, cost = usage.cost(system_prompt_tokens)
 
+                usage_stats = {
+                    "started_at": started_at.isoformat(),
+                    "ended_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "duration_seconds": duration,
+                    "turns": usage.turns,
+                    "input_tokens": usage.prompt_tokens,
+                    "output_tokens": usage.completion_tokens,
+                    "total_cost_usd": round(cost, 6),
+                }
+
                 async def post_processing() -> None:
                     await asyncio.sleep(0.5)
                     try:
-                        await insert_call_log(
-                            {
-                                "client_id": client_id,
-                                "phone": target_phone,
-                                "direction": direction,
-                                "started_at": started_at.isoformat(),
-                                "ended_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                                "duration_seconds": duration,
-                                "turns": usage.turns,
-                                "input_tokens": usage.prompt_tokens,
-                                "output_tokens": usage.completion_tokens,
-                                "text_input_tokens": text_in,
-                                "audio_input_tokens": audio_in,
-                                "total_cost_usd": round(cost, 6),
-                                "system_prompt_chars": system_instructions_length,
-                            }
-                        )
-
                         if user_replies == 0:
                             status = (
                                 "outbound_short_call" if is_outbound else "inbound_dropped"
@@ -2156,6 +2228,7 @@ async def handle_asterisk_conn(
                             direction,
                             status,
                             tz_name,
+                            usage_stats,
                         )
                     except Exception as exc:
                         log.error("[%s] post-processing failed: %s", call_id, exc)
