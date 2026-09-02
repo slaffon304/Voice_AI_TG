@@ -1030,10 +1030,12 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
         log.error("[archivist] memory save failed: %s", exc)
 
     # Дописываем в карточку то, что удалось узнать за разговор.
+    # Язык НЕ записываем: он выводится из расшифровки, а она сейчас ненадёжна.
+    # Один звонок с мусорным ASR прописал клиенту english, и следующий звонок
+    # бот начал по-английски. Пишем только имя.
     learned_name = str(data.get("client_name") or "").strip()
-    learned_lang = normalize_lang(data.get("language")) or ""
-    if learned_name or learned_lang:
-        await ensure_end_client(client_id, phone, learned_name, learned_lang)
+    if learned_name:
+        await ensure_end_client(client_id, phone, learned_name, "")
 
     if not N8N_BASE_URL:
         return
@@ -1455,6 +1457,16 @@ def build_system_prompt(
         "working hours, and never refuse to consult because of the time. If they want a "
         "consultation right now, give it right now, in full."
     )
+    blocks.append(
+        "IMPORTANT — do not confuse the two. A 'phone consultation' that the caller is "
+        "asking you for right now IS THIS CALL, with you, and it is always available. "
+        "Working hours have nothing to do with it. Only hand over to a human when the "
+        "caller explicitly asks for a person, a manager, a specialist or a callback."
+    )
+    blocks.append(
+        "Never say that colleagues are busy, that it is outside working hours, or that "
+        "you cannot consult right now. You can, and you must."
+    )
     blocks.append("")
     blocks.append(
         "PEOPLE are a separate matter. Meetings, callbacks and consultations WITH A HUMAN "
@@ -1502,6 +1514,36 @@ def build_system_prompt(
         "the current language and ask them to repeat."
     )
     blocks.append("</LANGUAGE>")
+    blocks.append("")
+
+    # Последний блок промпта. Клиентский system_prompt содержит жёсткие указания
+    # про стиль ("1 короткое предложение", "запрещены вежливые формулы"), которые
+    # перебивают шкалы характера. Здесь конфликт решается в пользу характера,
+    # но только по стилю — фактические и рабочие правила остаются в силе.
+    if persona.personality_enabled:
+        blocks.append("<PRIORITY>")
+        blocks.append(
+            "ЭТО САМОЕ ВАЖНОЕ УКАЗАНИЕ ВО ВСЁМ ПРОМПТЕ. Главным является "
+            "ПСИХОЛОГИЧЕСКИЙ ПОРТРЕТ из блока <BEHAVIOR_ENGINE> в начале."
+        )
+        blocks.append(
+            "Если где-либо выше сказано отвечать одним коротким предложением, говорить "
+            "предельно кратко, избегать вежливых формул, не развивать мысль или держать "
+            "сухой тон — ЭТИ УКАЗАНИЯ ОТМЕНЕНЫ. Длину реплик, развёрнутость, темп, "
+            "эмоции, напор и лексику задаёт ТОЛЬКО психологический портрет."
+        )
+        blocks.append(
+            "При высокой Инициативности ты ведёшь разговор сам: задаёшь вопросы, "
+            "предлагаешь следующий шаг, не ждёшь, пока тебя спросят. При высокой "
+            "Экстраверсии и Энергетике ты презентуешь развёрнуто, а не отвечаешь "
+            "односложно. Отрабатывай возражения, а не соглашайся и не отступай."
+        )
+        blocks.append(
+            "ЧТО ПОРТРЕТ НЕ ОТМЕНЯЕТ: рабочие часы для встреч с людьми, запрет "
+            "выдумывать факты, цены и даты, запрет зачитывать ссылки вслух, правила "
+            "работы с инструментами и язык разговора."
+        )
+        blocks.append("</PRIORITY>")
 
     return "\n".join(b for b in blocks if b is not None)
 
@@ -2149,36 +2191,40 @@ async def handle_asterisk_conn(
             )
             recovery.task = task
 
-            who = f"{client_name}" if is_known_caller else "an unknown caller"
+            lang_names = {"ro": "РУМЫНСКОМ", "ru": "РУССКОМ", "en": "АНГЛИЙСКОМ"}
+            lang_word = lang_names.get(call_lang, call_lang.upper())
+            who = client_name if is_known_caller else "неизвестный абонент"
             name_rule = (
-                f'Address the caller by name ("{client_name}") once at the start.'
+                f"Обращайся к нему по имени ({client_name}) один раз в начале."
                 if is_known_caller
-                else "You do NOT know the caller's name. Address them neutrally. "
-                "Never invent or guess a name. Ask for it only if the conversation needs it."
+                else "Имени ты не знаешь. Обращайся нейтрально. "
+                "НИКОГДА не выдумывай и не угадывай имя."
+            )
+            lang_rule = (
+                f"ПЕРВАЯ ЖЕ ТВОЯ ФРАЗА ДОЛЖНА БЫТЬ НА {lang_word} ЯЗЫКЕ. "
+                "Это указание написано по-русски, но отвечать на нём НЕ НАДО."
             )
 
             if is_outbound:
                 greeting = (
-                    f"SYSTEM EVENT: {who} answered your outbound call. "
-                    f"Goal of this call: {purpose}. Language: {call_lang}. {name_rule} "
-                    "Open the conversation in character."
+                    f"SYSTEM EVENT: {who} ответил на твой исходящий звонок. "
+                    f"Цель звонка: {purpose}. {lang_rule} {name_rule} "
+                    "Начни разговор строго в своём характере по портрету."
                 )
             elif time_context == "very_recent":
                 greeting = (
-                    f"SYSTEM EVENT: {who} called back after a couple of minutes. "
-                    f"Do not greet again. Language: {call_lang}. {name_rule} "
-                    "Say the line dropped and continue where you left off."
+                    f"SYSTEM EVENT: {who} перезвонил спустя пару минут. Не здоровайся заново. "
+                    f"{lang_rule} {name_rule} Скажи, что связь прервалась, и продолжай суть."
                 )
             elif time_context == "same_day":
                 greeting = (
-                    f"SYSTEM EVENT: {who} is calling again today. Language: {call_lang}. "
-                    f"{name_rule} Use RECENT memory and ask what else you can help with."
+                    f"SYSTEM EVENT: {who} звонит сегодня повторно. {lang_rule} {name_rule} "
+                    "Опирайся на память RECENT. Веди разговор сам, согласно портрету."
                 )
             else:
                 greeting = (
-                    f"SYSTEM EVENT: Inbound call from {who}. Language: {call_lang}. "
-                    f"{name_rule} Open the conversation. "
-                    "If RECENT memory exists, do not re-ask what you already know."
+                    f"SYSTEM EVENT: Входящий звонок, {who}. {lang_rule} {name_rule} "
+                    "Начни диалог согласно портрету. Если есть память RECENT, не переспрашивай известное."
                 )
 
             context.add_message({"role": "user", "content": greeting})
