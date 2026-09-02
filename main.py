@@ -316,7 +316,7 @@ class InputAGC:
         self.level: float | None = None
         self.applied: list[float] = []
 
-    def process(self, data: bytes, adapt: bool = True) -> bytes:
+    def process(self, data: bytes, adapt: bool = True, attenuate_db: float = 0.0) -> bytes:
         if len(data) < 4:
             return data
         import numpy as np
@@ -329,7 +329,8 @@ class InputAGC:
             desired = min(self.max_gain, max(self.min_gain, self.target / self.level))
             self.gain += (desired - self.gain) * 0.12
             self.applied.append(self.gain)
-        out = a * self.gain
+        gain = self.gain * (10 ** (-attenuate_db / 20)) if attenuate_db else self.gain
+        out = a * gain
         lim = 0.75 * 32767.0
         over = np.abs(out) > lim
         if over.any():
@@ -621,7 +622,7 @@ TELEPHONY_RULES = """<CALL_RULES>
 - If you need to send a link or an address, use the send_sms tool instead of reading it aloud.
 - Never invent facts, prices, availability or dates. If you do not know, say so and offer a callback.
 - If the caller asks whether you are a human or an AI assistant, answer honestly.
-- If the line is noisy or the caller is unclear, ask them to repeat once before guessing.
+- If the line is noisy or the caller is unclear, ask them to repeat before guessing. A single unclear turn never changes what you do: keep the topic, keep the language, keep the call going.
 </CALL_RULES>"""
 
 
@@ -1575,8 +1576,9 @@ def build_system_prompt(
         blocks.append(f"The caller's name is {caller_name}. Use it naturally, do not re-ask.")
     else:
         blocks.append(
-            "You do not know the caller's name. Never invent one. Ask for it only when "
-            "the conversation actually needs it."
+            "The contact card has no name. Check <CALLER_MEMORY> below: if a name is "
+            "recorded there, that IS the caller's name — use it and do not ask again. "
+            "Only if memory has no name either: never invent one, ask only when needed."
         )
     blocks.append("</CALLER>")
     blocks.append("")
@@ -1649,11 +1651,26 @@ def build_system_prompt(
         "understand and answer them in whatever language they actually use."
     )
     blocks.append(
-        "This is a GSM line: audio is narrow-band and muffled. Never decide the caller's "
-        "language from a single word or a fragment — wait for a full sentence. Switch "
-        "languages only after the caller has clearly used another one for a full turn; "
-        "then stay in it. If something was unclear, ask them to repeat in the current "
-        "language instead of guessing."
+        "This is a GSM line: audio is narrow-band and muffled. Short utterances of one "
+        "or two words are often misheard — and they can be misheard as words from a "
+        "completely different language."
+    )
+    blocks.append(
+        "RULE FOR SUSPICIOUS TURNS: if a turn is (a) one or two words, or (b) a phrase "
+        "in a language the caller has NOT been speaking in this call, or (c) makes no "
+        "sense in the flow of the conversation — treat it as MISHEARD, not as new "
+        "information. Do not act on it: do not change topic, do not say goodbye, do "
+        "not switch language, do not call any tool. Say briefly that you did not "
+        "catch that and ask them to repeat, in the language you have been using."
+    )
+    blocks.append(
+        "Switch languages only after the caller has clearly spoken a full, meaningful "
+        "sentence in another language and it fits the conversation; then stay in it."
+    )
+    blocks.append(
+        "END OF CALL: say goodbye only when the caller has clearly said goodbye in the "
+        "language of the conversation. A random foreign phrase or a sudden compliment "
+        "is not a goodbye — ask if there is anything else you can help with."
     )
     blocks.append("</LANGUAGE>")
     blocks.append("")
@@ -1688,6 +1705,18 @@ def build_system_prompt(
         blocks.append("</PRIORITY>")
 
     return "\n".join(b for b in blocks if b is not None)
+
+
+def build_vad_params() -> GeminiVADParams:
+    return GeminiVADParams(
+        end_sensitivity=(
+            types.EndSensitivity.END_SENSITIVITY_HIGH
+            if VAD_END_SENSITIVITY == "high"
+            else types.EndSensitivity.END_SENSITIVITY_LOW
+        ),
+        silence_duration_ms=VAD_SILENCE_MS,
+        disabled=False,
+    )
 
 
 def build_tools(client_data: dict, readable_hours: str) -> list[dict]:
@@ -2175,15 +2204,7 @@ async def handle_asterisk_conn(
                     model=GEMINI_MODEL,
                     voice=persona.voice_model,
                     system_instruction=system_prompt,
-                    vad=GeminiVADParams(
-                        end_sensitivity=(
-                            types.EndSensitivity.END_SENSITIVITY_HIGH
-                            if VAD_END_SENSITIVITY == "high"
-                            else types.EndSensitivity.END_SENSITIVITY_LOW
-                        ),
-                        silence_duration_ms=VAD_SILENCE_MS,
-                        disabled=False,
-                    ),
+                    vad=build_vad_params(),
                 ),
             )
 
@@ -2517,5 +2538,4 @@ async def handle_asterisk_conn(
                 asyncio.create_task(post_processing())
             else:
                 gc.collect()
-
- 
+                       
