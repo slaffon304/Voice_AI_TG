@@ -7,3 +7,4 @@ pytz
 supabase
 google-genai
 redis
+audiolab==0.5.1
