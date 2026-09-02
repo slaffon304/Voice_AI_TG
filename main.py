@@ -30,6 +30,7 @@ import os
 import re
 import time
 import uuid
+import wave
 from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import quote
@@ -141,9 +142,12 @@ AS_TYPE_AUDIO_OUT = _env_int("AS_TYPE_AUDIO_OUT", 0x12)
 ASTERISK_INPUT_RATE = _env_int("ASTERISK_INPUT_RATE", 16000)
 
 # Шумодав — улучшение, а не обязательный компонент. Выключается без редеплоя.
-ENABLE_RNNOISE = _env_bool("ENABLE_RNNOISE", False)
+ENABLE_RNNOISE = _env_bool("ENABLE_RNNOISE", True)
 # Сторож: сколько секунд тишины в пайплайне при живом сокете считать поломкой.
 AUDIO_STALL_SECONDS = _env_float("AUDIO_STALL_SECONDS", 10.0)
+# ВРЕМЕННАЯ ДИАГНОСТИКА. Пишет в WAV ровно тот звук, который получает Gemini,
+# и кладёт в Supabase рядом с записью разговора. Убрать, когда починим звук.
+DUMP_INPUT_AUDIO = _env_bool("DUMP_INPUT_AUDIO", True)
 
 PIPELINE_SAMPLE_RATE = _env_int("PIPELINE_SAMPLE_RATE", 16000)
 OUT_CHUNK_SIZE = _env_int("OUT_CHUNK_SIZE", 640)
@@ -516,6 +520,28 @@ def parse_working_hours(raw: Any) -> dict[str, list[str]]:
     return out or dict(_DEFAULT_HOURS)
 
 
+def next_open_slot(hours: dict[str, list[str]], now: dt.datetime) -> str:
+    """Ближайшее время, когда с клиентом сможет говорить человек."""
+    for day_offset in range(0, 8):
+        day = now + dt.timedelta(days=day_offset)
+        window = hours.get(_DAY_KEYS[day.weekday()])
+        if not window:
+            continue
+        try:
+            sh, sm = (int(x) for x in window[0].split(":")[:2])
+            eh, em = (int(x) for x in window[1].split(":")[:2])
+        except (ValueError, IndexError):
+            continue
+        start = day.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end = day.replace(hour=eh, minute=em, second=0, microsecond=0)
+        if day_offset == 0 and now < end:
+            when = max(now, start)
+            return when.strftime("%A %d %B, %H:%M")
+        if day_offset > 0:
+            return start.strftime("%A %d %B, %H:%M")
+    return "нет доступного окна"
+
+
 def office_state(hours: dict[str, list[str]], now: dt.datetime) -> tuple[bool, str]:
     """Возвращает (открыто_сейчас, человекочитаемое расписание)."""
     key = _DAY_KEYS[now.weekday()]
@@ -828,6 +854,26 @@ async def lookup_contact(client_data: dict, client_id: str, phone: str) -> dict:
     except Exception as exc:
         log.warning("contact lookup (%s) failed: %s", provider, exc)
         return {"found": False}
+
+
+async def upload_debug_wav(client_id: str, filepath: str) -> str | None:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    try:
+        supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        storage_path = f"debug-input/{client_id}/in_{uuid.uuid4().hex[:8]}.wav"
+
+        def _upload() -> str:
+            with open(filepath, "rb") as f:
+                supabase.storage.from_("call-recordings").upload(
+                    path=storage_path, file=f, file_options={"content-type": "audio/wav"}
+                )
+            return supabase.storage.from_("call-recordings").get_public_url(storage_path)
+
+        return await asyncio.to_thread(_upload)
+    except Exception as exc:
+        log.warning("debug wav upload failed: %s", exc)
+        return None
 
 
 async def ensure_end_client(client_id: str, phone: str, name: str = "", lang: str = "") -> None:
@@ -1175,13 +1221,32 @@ class InboundAudioProbe(FrameProcessor):
         super().__init__()
         self.last_frame_ts = 0.0
         self.frames = 0
+        self.dump: list[bytes] = [] if DUMP_INPUT_AUDIO else []
+        self.bytes_seen = 0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if isinstance(frame, InputAudioRawFrame):
             self.last_frame_ts = time.time()
             self.frames += 1
+            self.bytes_seen += len(frame.audio)
+            if DUMP_INPUT_AUDIO and self.bytes_seen <= 40_000_000:
+                self.dump.append(frame.audio)
         await self.push_frame(frame, direction)
+
+    def write_wav(self, path: str) -> bool:
+        if not self.dump:
+            return False
+        try:
+            with wave.open(path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(PIPELINE_SAMPLE_RATE)
+                w.writeframes(b"".join(self.dump))
+            return True
+        except Exception as exc:
+            log.warning("input dump failed: %s", exc)
+            return False
 
 
 async def audio_stall_watchdog(
@@ -1334,7 +1399,12 @@ def build_system_prompt(
         ("{bot_goal}", safe(client_data.get("bot_goal"))),
         ("{tone}", safe(client_data.get("tone"), "friendly")),
         ("{current_datetime}", now.strftime("%A, %d %B %Y, %H:%M")),
-        ("{office_status}", "Open" if is_open else "Closed"),
+        (
+            "{office_status}",
+            "Open"
+            if is_open
+            else "Closed for human appointments only — you, the assistant, are available as always",
+        ),
         ("{lang}", lang),
         ("{persona_name}", safe(persona.persona_name, "Asistent")),
         ("{working_hours}", readable_hours),
@@ -1367,15 +1437,46 @@ def build_system_prompt(
     blocks.append("</CALLER>")
     blocks.append("")
 
-    blocks.append("<SCHEDULE>")
-    blocks.append(f"Now: {now.strftime('%A, %d %B %Y, %H:%M')} ({now.tzname()}).")
-    blocks.append(f"Working hours: {readable_hours}.")
-    blocks.append(f"The office is currently {'OPEN' if is_open else 'CLOSED'}.")
+    offset = now.strftime("%z")
+    offset_fmt = f"{offset[:3]}:{offset[3:]}" if offset else "+00:00"
+    next_slot = next_open_slot(hours, now)
+
+    # Две РАЗНЫЕ доступности. Раньше они были смешаны в один блок, и бот,
+    # увидев "офис закрыт", отказывался консультировать в 21:10.
+    blocks.append("<AVAILABILITY>")
     blocks.append(
-        "Never schedule anything outside working hours. If the caller asks for a closed "
-        "slot, decline politely and offer the first available working slot."
+        "YOU ARE AVAILABLE 24/7. Consult, present, explain, answer questions and give "
+        "prices at any hour of the day or night, including right now. The office being "
+        "closed limits NOTHING for you — you are not the office, you are the assistant, "
+        "and you work around the clock."
     )
-    blocks.append("</SCHEDULE>")
+    blocks.append(
+        "NEVER tell the caller to call back later, never postpone their question to "
+        "working hours, and never refuse to consult because of the time. If they want a "
+        "consultation right now, give it right now, in full."
+    )
+    blocks.append("")
+    blocks.append(
+        "PEOPLE are a separate matter. Meetings, callbacks and consultations WITH A HUMAN "
+        f"only happen during working hours: {readable_hours}."
+    )
+    blocks.append(
+        f"Right now it is {now.strftime('%A, %d %B %Y, %H:%M')} local time "
+        f"({now.tzname()}, UTC offset {offset_fmt}). Human staff are "
+        f"{'available now' if is_open else 'not available now'}. "
+        f"The nearest slot with a person: {next_slot}."
+    )
+    blocks.append(
+        "You may use the calendar at ANY hour, including right now. Only the slot itself "
+        "must fall inside working hours. When the caller asks for a meeting, a callback "
+        "or a person, book it — do not tell them to call back."
+    )
+    blocks.append(
+        f"CRITICAL: every date you pass to a tool must be local time with the offset "
+        f"{offset_fmt}. Example for tomorrow at 10:00 local: "
+        f"2026-01-01T10:00:00{offset_fmt}. Never write local clock numbers with +00:00."
+    )
+    blocks.append("</AVAILABILITY>")
     blocks.append("")
 
     blocks.append("<CALLER_MEMORY>")
@@ -1450,9 +1551,12 @@ def build_tools(client_data: dict, readable_hours: str) -> list[dict]:
             {
                 "name": "Booking_tool",
                 "description": (
-                    f"Gestionează calendarul. Programează DOAR în intervalul: {readable_hours}. "
-                    "Pentru 'book' transmite obligatoriu client_name, phone, request_summary, "
-                    "start_time și end_time."
+                    "Gestionează calendarul pentru întâlniri, apeluri inverse și consultații "
+                    "CU UN OM. Poate fi folosit la ORICE oră, inclusiv noaptea — doar slotul "
+                    f"programat trebuie să fie în intervalul: {readable_hours}. "
+                    "NU folosi pentru consultația pe care o oferi tu însuți — aceea o dai "
+                    "imediat, oricând. Pentru 'book' transmite obligatoriu client_name, "
+                    "phone, request_summary, start_time și end_time."
                 ),
                 "parameters": {
                     "type": "object",
@@ -2117,6 +2221,8 @@ async def handle_asterisk_conn(
 
             if context is not None and client_id:
                 transcript, user_replies = build_transcript(context.messages)
+                if transcript:
+                    clog.info("[%s] ДИАЛОГ:\n%s", call_id, transcript)
                 text_in, audio_in, cost = usage.cost(system_prompt_tokens)
 
                 usage_stats = {
@@ -2131,6 +2237,18 @@ async def handle_asterisk_conn(
 
                 async def post_processing() -> None:
                     await asyncio.sleep(0.5)
+                    if DUMP_INPUT_AUDIO:
+                        dump_path = f"/tmp/gemini_input_{call_id}.wav"
+                        if probe.write_wav(dump_path):
+                            url = await upload_debug_wav(client_id, dump_path)
+                            log.info(
+                                "[%s] ЗВУК, КОТОРЫЙ СЛЫШИТ GEMINI (%.1f s): %s",
+                                call_id,
+                                probe.bytes_seen / (PIPELINE_SAMPLE_RATE * 2),
+                                url or dump_path,
+                            )
+                            with contextlib.suppress(Exception):
+                                await asyncio.to_thread(os.remove, dump_path)
                     try:
                         if user_replies == 0:
                             status = (
