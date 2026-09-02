@@ -2505,4 +2505,17 @@ async def handle_asterisk_conn(
                             status,
                             tz_name,
                             usage_stats,
+                        )
+                    except Exception as exc:
+                        log.error("[%s] post-processing failed: %s", call_id, exc)
+                    finally:
+                        with contextlib.suppress(Exception):
+                            if await asyncio.to_thread(os.path.exists, wav_path):
+                                await asyncio.to_thread(os.remove, wav_path)
+                        gc.collect()
+
+                asyncio.create_task(post_processing())
+            else:
+                gc.collect()
+
  
