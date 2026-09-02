@@ -47,7 +47,10 @@ from google import genai
 from google.genai import types
 from supabase import Client, create_client
 
-from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
+try:
+    from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
+except Exception:  # зависимость pyrnnoise/PyAV может быть несовместима после пересборки
+    RNNoiseFilter = None  # type: ignore[assignment]
 from pipecat.frames.frames import (
     CancelFrame,
     Frame,
@@ -130,9 +133,17 @@ TRUNK_NUMBERS = [
 
 # Протокол AudioSocket. Вынесено в конфиг, т.к. значения зависят от сборки Asterisk.
 AS_TYPE_HANGUP = _env_int("AS_TYPE_HANGUP", 0x00)
-AS_TYPE_AUDIO_IN_8K = _env_int("AS_TYPE_AUDIO_IN_8K", 0x10)
 AS_TYPE_AUDIO_OUT = _env_int("AS_TYPE_AUDIO_OUT", 0x12)
-RESAMPLE_INPUT_8K = _env_bool("RESAMPLE_INPUT_8K", True)
+# Частота, с которой Asterisk отдаёт звук. В диалплане стоит slin16 => 16000.
+# Ресемплинг включается ТОЛЬКО если здесь 8000. Раньше код тянул 8->16 по типу
+# пакета 0x10, а этот тип Asterisk шлёт для любого аудио — речь растягивалась
+# вдвое и распознавание сыпалось.
+ASTERISK_INPUT_RATE = _env_int("ASTERISK_INPUT_RATE", 16000)
+
+# Шумодав — улучшение, а не обязательный компонент. Выключается без редеплоя.
+ENABLE_RNNOISE = _env_bool("ENABLE_RNNOISE", True)
+# Сторож: сколько секунд тишины в пайплайне при живом сокете считать поломкой.
+AUDIO_STALL_SECONDS = _env_float("AUDIO_STALL_SECONDS", 10.0)
 
 PIPELINE_SAMPLE_RATE = _env_int("PIPELINE_SAMPLE_RATE", 16000)
 OUT_CHUNK_SIZE = _env_int("OUT_CHUNK_SIZE", 640)
@@ -257,6 +268,84 @@ else:
         if not data or src == dst:
             return data, state
         return _audioop.ratecv(data, 2, 1, src, dst, state)
+
+
+# --- шумоподавление -----------------------------------------------------------
+# 2026-09-02: pyrnnoise упал на `Graph.__init__() got an unexpected keyword
+# argument 'rate'` (несовместимость с PyAV после пересборки образа) и унёс с
+# собой _audio_task_handler — весь входящий звук пропал, при живом исходящем.
+# Фильтр качества звука не имеет права рвать тракт: любая ошибка внутри него
+# теперь один раз логируется и дальше аудио идёт как есть.
+
+if RNNoiseFilter is not None:
+
+    class SafeRNNoiseFilter(RNNoiseFilter):  # type: ignore[misc,valid-type]
+        """RNNoise, который при первой же ошибке отключается вместо падения."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._broken = False
+
+        def _disable(self, exc: Exception) -> None:
+            if not self._broken:
+                self._broken = True
+                log.error(
+                    "RNNoise disabled for this call after error: %s. "
+                    "Audio continues unfiltered. Set ENABLE_RNNOISE=false to silence this.",
+                    exc,
+                )
+
+        async def start(self, sample_rate: int) -> None:
+            try:
+                await super().start(sample_rate)
+            except Exception as exc:
+                self._disable(exc)
+
+        async def stop(self) -> None:
+            parent = getattr(super(), "stop", None)
+            if parent is None:
+                return
+            try:
+                await parent()
+            except Exception as exc:
+                self._disable(exc)
+
+        async def process_frame(self, frame: Frame) -> None:
+            if self._broken:
+                return
+            parent = getattr(super(), "process_frame", None)
+            if parent is None:
+                return
+            try:
+                await parent(frame)
+            except Exception as exc:
+                self._disable(exc)
+
+        async def filter(self, audio: bytes) -> bytes:
+            if self._broken:
+                return audio
+            try:
+                return await super().filter(audio)
+            except Exception as exc:
+                self._disable(exc)
+                return audio
+
+else:
+    SafeRNNoiseFilter = None  # type: ignore[assignment]
+
+
+def build_audio_filter():
+    """Возвращает фильтр входящего аудио или None, если он недоступен/выключен."""
+    if not ENABLE_RNNOISE:
+        return None
+    if SafeRNNoiseFilter is None:
+        log.warning("RNNoiseFilter unavailable (import failed) — running without it")
+        return None
+    try:
+        return SafeRNNoiseFilter()
+    except Exception as exc:
+        log.error("RNNoiseFilter construction failed (%s) — running without it", exc)
+        return None
 
 
 # =============================================================================
@@ -460,7 +549,13 @@ def build_personality_block(p: Persona, lang: str) -> str:
 
     lang = (lang or DEFAULT_LANG).lower()[:2]
     lines: list[str] = ["<PERSONA>"]
-    lines.append(f"Your name is {p.persona_name}. You are a voice agent on a phone call.")
+    # Если имя не заполнено, не навязываем дефолт: у клиента оно уже может быть
+    # задано в собственном system_prompt ("Ești Grigorii..."), и два имени в
+    # одном промпте модель путают.
+    if p.persona_name and p.persona_name.strip().lower() not in ("asistent", "assistant", "bot"):
+        lines.append(f"Your name is {p.persona_name}. You are a voice agent on a phone call.")
+    else:
+        lines.append("You are a voice agent on a phone call.")
     if p.lore:
         lines.append(f"Background (yours, never the caller's): {p.lore}")
 
@@ -535,8 +630,10 @@ def office_state(hours: dict[str, list[str]], now: dt.datetime) -> tuple[bool, s
             is_open = start <= now <= end
         except (ValueError, IndexError):
             is_open = False
+    # jsonb не хранит порядок ключей — без сортировки в промпт уезжает
+    # "Fri, Mon, Thu, Tue, Wed", что модель читает вслух как есть.
     readable = ", ".join(
-        f"{d.capitalize()} {w[0]}-{w[1]}" for d, w in hours.items() if d in _DAY_KEYS
+        f"{d.capitalize()} {hours[d][0]}-{hours[d][1]}" for d in _DAY_KEYS if d in hours
     )
     return is_open, readable or "Mon-Fri 09:00-17:00"
 
@@ -562,6 +659,20 @@ async def sb_select(table: str, params: dict[str, str], timeout: float = 5.0) ->
         return []
 
 
+async def sb_rpc(fn: str, payload: dict, timeout: float = 5.0) -> Any:
+    """Вызов SQL-функции через PostgREST. Нужен там, где фильтр — выражение."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    resp = await http().post(
+        f"{SUPABASE_URL}/rest/v1/rpc/{fn}",
+        headers={**sb_headers(), "Content-Type": "application/json"},
+        json=payload,
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 async def get_client_data(client_id: str) -> dict | None:
     rows = await sb_select(
         "saas_clients",
@@ -570,6 +681,7 @@ async def get_client_data(client_id: str) -> dict | None:
             "select": (
                 "company_name,business_context,tone,bot_goal,"
                 "subscription_status_assistent,system_message,timezone,working_hours,"
+                "crm_provider,crm_config,"
                 "saas_projects(tg_chat_id_notify,google_calendar_id)"
             ),
         },
@@ -585,12 +697,16 @@ async def get_client_data(client_id: str) -> dict | None:
 
 
 async def get_persona(client_id: str) -> Persona:
+    return Persona.from_row(await get_persona_row(client_id))
+
+
+async def get_persona_row(client_id: str) -> dict | None:
     cache_key = f"persona:{client_id}"
     if redis_client:
         with contextlib.suppress(Exception):
             cached = await redis_client.get(cache_key)
             if cached:
-                return Persona.from_row(json.loads(cached))
+                return json.loads(cached)
 
     cols = ",".join(
         ["system_prompt", "voice_model", "language", "persona_name", "lore",
@@ -602,7 +718,7 @@ async def get_persona(client_id: str) -> Persona:
     if redis_client and row:
         with contextlib.suppress(Exception):
             await redis_client.setex(cache_key, PERSONA_CACHE_TTL, json.dumps(row, default=str))
-    return Persona.from_row(row)
+    return row
 
 
 async def get_caller_memory(client_id: str, phone: str) -> tuple[dict, str]:
@@ -639,43 +755,179 @@ async def get_caller_memory(client_id: str, phone: str) -> tuple[dict, str]:
     return memory, time_context
 
 
-async def lookup_inbound_client_in_kommo(caller_phone: str) -> dict:
-    if not KOMMO_SUBDOMAIN or not KOMMO_ACCESS_TOKEN or caller_phone == "Necunoscut":
+# =============================================================================
+# 5b. ПОИСК ЗВОНЯЩЕГО — ДИНАМИЧЕСКИЙ ПО ПРОВАЙДЕРАМ
+# =============================================================================
+# saas_clients.crm_provider говорит, где искать контакт этого клиента,
+# saas_clients.crm_config (jsonb) хранит параметры провайдера.
+# Kommo больше не зашит в код — он один из вариантов.
+#
+#   supabase (дефолт) — таблица end_clients, поиск по последним 8 цифрам
+#   kommo             — {"subdomain": "...", "token": "..."}
+#   webhook           — {"url": "...", "token": "..."}  (n8n: sheets/bitrix/...)
+#   none              — не искать
+
+CONTACT_LOOKUP_TIMEOUT = _env_float("CONTACT_LOOKUP_TIMEOUT", 2.0)
+
+
+def phone_tail(phone: str | None, digits: int = 8) -> str:
+    """Последние N цифр номера. 069635362, +373 69 63 53 62, 37369635362 -> 69635362."""
+    clean = "".join(filter(str.isdigit, str(phone or "")))
+    return clean[-digits:] if len(clean) >= digits else clean
+
+
+def normalize_lang(value: Any) -> str | None:
+    v = str(value or "").strip().lower()
+    if not v:
+        return None
+    if v.startswith("ru") or "рус" in v:
+        return "ru"
+    if v.startswith("ro") or v.startswith("md") or "rom" in v or "rum" in v:
+        return "ro"
+    if v.startswith("en") or "engl" in v:
+        return "en"
+    return None
+
+
+async def _lookup_supabase(phone: str, client_id: str, cfg: dict) -> dict:
+    """
+    Ищем в end_clients через SQL-функцию find_end_client_by_phone.
+    Нормализация номера живёт в самой функции, служебных колонок в таблице нет.
+    """
+    tail = phone_tail(phone)
+    if len(tail) < 8:
         return {"found": False}
-    subdomain = KOMMO_SUBDOMAIN.encode("ascii", "ignore").decode().strip()
-    token = KOMMO_ACCESS_TOKEN.encode("ascii", "ignore").decode().strip()
-    clean = "".join(filter(str.isdigit, str(caller_phone)))
-    if len(clean) < 6:
+    rows = await sb_rpc(
+        "find_end_client_by_phone",
+        {"p_client_id": client_id, "p_tail": tail},
+        timeout=CONTACT_LOOKUP_TIMEOUT,
+    )
+    if not rows:
         return {"found": False}
+    rec = rows[0] if isinstance(rows, list) else rows
+    return {
+        "found": True,
+        "name": (rec.get("name") or "").strip() or None,
+        "lang": normalize_lang(rec.get("language")),
+        "source": "supabase",
+    }
+
+
+async def _lookup_kommo(phone: str, client_id: str, cfg: dict) -> dict:
+    subdomain = str(cfg.get("subdomain") or KOMMO_SUBDOMAIN or "").strip()
+    token = str(cfg.get("token") or KOMMO_ACCESS_TOKEN or "").strip()
+    tail = phone_tail(phone)
+    if not subdomain or not token or len(tail) < 6:
+        return {"found": False}
+    resp = await http().get(
+        f"https://{subdomain}.kommo.com/api/v4/contacts",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"query": tail},
+        timeout=CONTACT_LOOKUP_TIMEOUT,
+    )
+    if resp.status_code != 200:
+        return {"found": False}
+    contacts = (resp.json().get("_embedded") or {}).get("contacts") or []
+    if not contacts:
+        return {"found": False}
+    contact = contacts[0]
+    lang = None
+    for f in contact.get("custom_fields_values") or []:
+        code = str(f.get("field_code") or "").upper()
+        fname = str(f.get("field_name") or "").lower()
+        if code == "LANG" or any(k in fname for k in ("язык", "limba", "lang")):
+            lang = normalize_lang((f.get("values") or [{}])[0].get("value"))
+            break
+    return {
+        "found": True,
+        "name": (contact.get("name") or "").strip() or None,
+        "lang": lang,
+        "source": "kommo",
+    }
+
+
+async def _lookup_webhook(phone: str, client_id: str, cfg: dict) -> dict:
+    """
+    Универсальный адаптер. Отдаём номер — получаем {"name": ..., "language": ...}.
+    Через него подключается всё, для чего не нужен отдельный клиент в Python:
+    Google Sheets, Bitrix, Salesforce, самописные базы. Логика живёт в n8n.
+    """
+    url = str(cfg.get("url") or "").strip()
+    if not url:
+        return {"found": False}
+    headers = {}
+    if cfg.get("token"):
+        headers["Authorization"] = f"Bearer {cfg['token']}"
+    resp = await http().post(
+        url,
+        json={"client_id": client_id, "phone": phone, "phone_tail": phone_tail(phone)},
+        headers=headers,
+        timeout=CONTACT_LOOKUP_TIMEOUT,
+    )
+    if resp.status_code != 200:
+        return {"found": False}
+    data = resp.json()
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    if not isinstance(data, dict) or not data:
+        return {"found": False}
+    name = (data.get("name") or data.get("client_name") or "").strip() or None
+    if not name and not data.get("language"):
+        return {"found": False}
+    return {
+        "found": True,
+        "name": name,
+        "lang": normalize_lang(data.get("language") or data.get("lang")),
+        "source": "webhook",
+    }
+
+
+_CONTACT_PROVIDERS = {
+    "supabase": _lookup_supabase,
+    "end_clients": _lookup_supabase,
+    "kommo": _lookup_kommo,
+    "webhook": _lookup_webhook,
+    "sheets": _lookup_webhook,
+    "bitrix": _lookup_webhook,
+    "salesforce": _lookup_webhook,
+}
+
+
+async def lookup_contact(client_data: dict, client_id: str, phone: str) -> dict:
+    """Один вход для всех провайдеров. Не нашли или упало — звоним как незнакомому."""
+    if not phone or phone == "Necunoscut":
+        return {"found": False}
+
+    provider = str(client_data.get("crm_provider") or "supabase").strip().lower()
+    if provider in ("none", "off", "disabled"):
+        return {"found": False}
+
+    cfg = client_data.get("crm_config") or {}
+    if isinstance(cfg, str):
+        with contextlib.suppress(Exception):
+            cfg = json.loads(cfg)
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    fn = _CONTACT_PROVIDERS.get(provider)
+    if fn is None:
+        log.warning("unknown crm_provider %r for client %s", provider, client_id)
+        return {"found": False}
+
     try:
-        resp = await http().get(
-            f"https://{subdomain}.kommo.com/api/v4/contacts",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            params={"query": clean[-8:] if len(clean) >= 8 else clean, "with": "leads"},
-            timeout=2.5,
+        result = await asyncio.wait_for(
+            fn(phone, client_id, cfg), timeout=CONTACT_LOOKUP_TIMEOUT + 0.5
         )
-        if resp.status_code != 200:
-            return {"found": False}
-        contacts = (resp.json().get("_embedded") or {}).get("contacts") or []
-        if not contacts:
-            return {"found": False}
-        contact = contacts[0]
-        lang = DEFAULT_LANG
-        for f in contact.get("custom_fields_values") or []:
-            code = str(f.get("field_code") or "").upper()
-            name = str(f.get("field_name") or "").lower()
-            if code == "LANG" or any(k in name for k in ("язык", "limba", "lang")):
-                val = str((f.get("values") or [{}])[0].get("value", "")).lower()
-                if "ru" in val or "рус" in val:
-                    lang = "ru"
-                elif any(k in val for k in ("ro", "rom", "md")):
-                    lang = "ro"
-                elif "en" in val:
-                    lang = "en"
-                break
-        return {"found": True, "name": contact.get("name") or "client", "lang": lang}
+        if result.get("found"):
+            log.info(
+                "contact found via %s: name=%s lang=%s",
+                result.get("source"),
+                result.get("name") or "-",
+                result.get("lang") or "-",
+            )
+        return result
     except Exception as exc:
-        log.warning("kommo lookup failed: %s", exc)
+        log.warning("contact lookup (%s) failed: %s", provider, exc)
         return {"found": False}
 
 
@@ -879,6 +1131,7 @@ class AsteriskAudioSocket:
         self.is_muted = False
         self.next_send_time = time.time()
         self._resample_state: Any = None
+        self.last_rx_ts = 0.0  # для сторожа входящего аудио
 
     async def accept(self) -> None:
         return None
@@ -904,9 +1157,11 @@ class AsteriskAudioSocket:
 
         # Asterisk отдаёт 8 кГц — тянем до частоты пайплайна, иначе Gemini
         # слышит замедленную речь и «угадывает» чужой язык.
-        if RESAMPLE_INPUT_8K and header[0] == AS_TYPE_AUDIO_IN_8K:
+        self.last_rx_ts = time.time()
+
+        if ASTERISK_INPUT_RATE != PIPELINE_SAMPLE_RATE:
             data, self._resample_state = pcm_resample(
-                data, self._resample_state, 8000, PIPELINE_SAMPLE_RATE
+                data, self._resample_state, ASTERISK_INPUT_RATE, PIPELINE_SAMPLE_RATE
             )
         return data
 
@@ -983,6 +1238,55 @@ class UsageAggregator(FrameProcessor):
         return text_in, audio_in, usd
 
 
+class InboundAudioProbe(FrameProcessor):
+    """
+    Фиксирует, когда входящий звук реально дошёл до пайплайна.
+    Вместе с AsteriskAudioSocket.last_rx_ts даёт точную картину:
+    байты на сокете есть, а кадров в пайплайне нет = сломан транспорт
+    или audio_in_filter.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_frame_ts = 0.0
+        self.frames = 0
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame):
+            self.last_frame_ts = time.time()
+            self.frames += 1
+        await self.push_frame(frame, direction)
+
+
+async def audio_stall_watchdog(
+    call_id: str, socket: "AsteriskAudioSocket", probe: InboundAudioProbe
+) -> None:
+    """Раз в 5 с сверяет сокет и пайплайн. Молчащий звонок больше не молчит в логах."""
+    try:
+        while True:
+            await asyncio.sleep(5.0)
+            now = time.time()
+            socket_alive = socket.last_rx_ts and (now - socket.last_rx_ts) < 5.0
+            pipeline_stalled = (
+                probe.last_frame_ts == 0.0 or (now - probe.last_frame_ts) > AUDIO_STALL_SECONDS
+            )
+            if socket_alive and pipeline_stalled:
+                log.error(
+                    "[%s] INBOUND AUDIO STALLED: bytes arrive on the AudioSocket but no "
+                    "InputAudioRawFrame reached the pipeline for %.0fs (frames so far: %d). "
+                    "Most likely audio_in_filter or the input transport task crashed — "
+                    "check for '_audio_task_handler unexpected exception' above, "
+                    "or restart with ENABLE_RNNOISE=false.",
+                    call_id,
+                    AUDIO_STALL_SECONDS,
+                    probe.frames,
+                )
+                return
+    except asyncio.CancelledError:
+        pass
+
+
 class InterruptionRecoveryProcessor(FrameProcessor):
     """Клиент перебил и замолчал — бот мягко возвращает инициативу."""
 
@@ -1017,7 +1321,7 @@ class InterruptionRecoveryProcessor(FrameProcessor):
             if self.recovery_task:
                 self.recovery_task.cancel()
             self.recovery_task = asyncio.create_task(self._recovery_timer())
-        elif isinstance(frame, (OutputAudioRawFrame, UserStartedSpeakingFrame)):
+        elif isinstance(frame, (OutputAudioRawFrame, InputAudioRawFrame, UserStartedSpeakingFrame)):
             if self.recovery_task:
                 self.recovery_task.cancel()
             self.is_interrupted = False
@@ -1248,6 +1552,38 @@ async def health() -> dict:
     }
 
 
+async def prewarm_call_context(client_id: str, phone: str) -> dict:
+    """
+    Готовит всё, что нужно боту, ПОКА идут гудки: клиента, персонажа, контакт
+    звонящего и его память. К моменту Answer() ждать уже нечего.
+    """
+    client_data, persona_row = await asyncio.gather(
+        get_client_data(client_id), get_persona_row(client_id)
+    )
+    if not client_data:
+        return {}
+
+    contact, (memory, time_context) = await asyncio.gather(
+        lookup_contact(client_data, client_id, phone),
+        get_caller_memory(client_id, phone),
+    )
+
+    # Токены CRM нужны только для поиска выше — в Redis их не кладём.
+    safe_client_data = {k: v for k, v in client_data.items() if k != "crm_config"}
+
+    return {
+        "client_id": client_id,
+        "phone": phone,
+        "client_data": safe_client_data,
+        "persona_row": persona_row,
+        "contact": contact,
+        "memory": memory,
+        "time_context": time_context,
+        "direction": "inbound",
+        "prewarmed_at": time.time(),
+    }
+
+
 @app.get("/get_uuid")
 async def get_client_uuid(
     sip_login: str | None = None,
@@ -1256,10 +1592,14 @@ async def get_client_uuid(
     ani: str | None = None,
     from_hdr: str | None = None,
     all_id: str | None = None,
-    call_uuid: str | None = None,
     token: str | None = None,
 ):
-    """Вызывается диалпланом Asterisk: sip_login -> client_id."""
+    """
+    Вызывается диалпланом Asterisk ДО ответа на звонок, во время гудков.
+    Возвращает уникальный id ЭТОГО звонка (а не id тенанта), а весь контекст
+    кладёт в Redis. Уникальный id заодно чинит две вещи: одновременные звонки
+    в одну компанию больше не путают номера и не пишут запись в один файл.
+    """
     if INTERNAL_TOKEN and token != INTERNAL_TOKEN:
         return Response(content="error", media_type="text/plain", status_code=401)
 
@@ -1276,16 +1616,30 @@ async def get_client_uuid(
     client_id = str(rows[0].get("client_id"))
     formatted = format_phone(extract_real_phone(ani, all_id, from_hdr, phone))
 
-    if formatted != "Necunoscut" and redis_client:
-        with contextlib.suppress(Exception):
-            if call_uuid:
-                # Точная привязка номера к конкретному звонку.
-                await redis_client.setex(f"inbound_phone:{call_uuid}", 120, formatted)
-            # Совместимость со старым диалпланом: очередь вместо одного ключа,
-            # чтобы одновременные звонки не перетирали номер друг другу.
-            await redis_client.lpush(f"inbound_phone_q:{client_id}", formatted)
-            await redis_client.expire(f"inbound_phone_q:{client_id}", 120)
-    return Response(content=client_id, media_type="text/plain")
+    # Без Redis работаем по-старому: отдаём client_id, бот резолвит сам.
+    if not redis_client:
+        log.warning("redis unavailable — falling back to client_id as AudioSocket id")
+        return Response(content=client_id, media_type="text/plain")
+
+    call_uuid = str(uuid.uuid4())
+    try:
+        ctx = await prewarm_call_context(client_id, formatted)
+        if not ctx:
+            return Response(content="not_found", media_type="text/plain")
+        await redis_client.setex(
+            f"call_context:{call_uuid}", 300, json.dumps(ctx, default=str)
+        )
+        log.info(
+            "prewarmed call %s for client=%s phone=%s contact=%s",
+            call_uuid[:8],
+            client_id,
+            formatted,
+            "found" if ctx["contact"].get("found") else "unknown",
+        )
+        return Response(content=call_uuid, media_type="text/plain")
+    except Exception as exc:
+        log.error("prewarm failed (%s) — falling back to client_id", exc)
+        return Response(content=client_id, media_type="text/plain")
 
 
 class OutboundCallRequest(BaseModel):
@@ -1417,34 +1771,31 @@ async def handle_asterisk_conn(
             uuid_bytes = await asyncio.wait_for(reader.readexactly(payload_len), timeout=5.0)
             session_uuid = str(uuid.UUID(bytes=uuid_bytes))
 
-            outbound_info: dict = {}
-            inbound_crm: dict = {}
-
+            # Redis отдаёт контекст и для исходящих (положил /api/dial),
+            # и для входящих (положил /get_uuid во время гудков).
+            call_ctx: dict = {}
             if redis_client:
                 with contextlib.suppress(Exception):
                     raw = await redis_client.get(f"call_context:{session_uuid}")
                     if raw:
-                        is_outbound = True
-                        outbound_info = json.loads(raw)
+                        call_ctx = json.loads(raw)
                         await redis_client.delete(f"call_context:{session_uuid}")
 
-            purpose = ""
-            if is_outbound:
-                client_id = outbound_info.get("client_id")
-                target_phone = outbound_info.get("target_phone", "Necunoscut")
-                client_name = outbound_info.get("client_name", "client")
-                call_lang = outbound_info.get("lang", DEFAULT_LANG)
-                purpose = outbound_info.get("call_purpose", "")
+            is_outbound = call_ctx.get("direction") == "outbound" or bool(
+                call_ctx.get("call_purpose")
+            )
+            purpose = call_ctx.get("call_purpose", "")
+            contact: dict = call_ctx.get("contact") or {}
+            prewarmed = bool(call_ctx.get("prewarmed_at"))
+
+            if call_ctx:
+                client_id = call_ctx.get("client_id")
+                target_phone = (
+                    call_ctx.get("target_phone") or call_ctx.get("phone") or "Necunoscut"
+                )
             else:
+                # Старый диалплан или Redis лежал: id AudioSocket == id тенанта.
                 client_id = session_uuid
-                call_lang = DEFAULT_LANG
-                if redis_client:
-                    with contextlib.suppress(Exception):
-                        phone = await redis_client.get(f"inbound_phone:{session_uuid}")
-                        if not phone:
-                            phone = await redis_client.rpop(f"inbound_phone_q:{client_id}")
-                        if phone:
-                            target_phone = phone
 
             if not client_id:
                 clog.warning("[%s] no client_id resolved", call_id)
@@ -1457,10 +1808,19 @@ async def handle_asterisk_conn(
             _calls_per_client[client_id] = _calls_per_client.get(client_id, 0) + 1
             counted_client = client_id
 
-            # Параллельная загрузка — экономит ~300-500 мс до первой фразы.
-            client_data, persona = await asyncio.gather(
-                get_client_data(client_id), get_persona(client_id)
-            )
+            # Если контекст прогрет во время гудков — ни одного запроса до Answer().
+            if prewarmed:
+                client_data = call_ctx.get("client_data") or {}
+                persona = Persona.from_row(call_ctx.get("persona_row"))
+                caller_memory = call_ctx.get("memory") or caller_memory
+                time_context = call_ctx.get("time_context", "first_time")
+            else:
+                client_data, persona = await asyncio.gather(
+                    get_client_data(client_id), get_persona(client_id)
+                )
+                client_data = client_data or {}
+                time_context = "first_time"
+
             if not client_data:
                 clog.warning("[%s] client %s not found", call_id, client_id)
                 return
@@ -1474,15 +1834,23 @@ async def handle_asterisk_conn(
             hours = parse_working_hours(client_data.get("working_hours"))
             now = dt.datetime.now(tz_for(tz_name))
 
-            if not is_outbound:
-                inbound_crm = await lookup_inbound_client_in_kommo(target_phone)
-                if inbound_crm.get("found"):
-                    client_name = inbound_crm.get("name") or "client"
-                    call_lang = str(inbound_crm.get("lang") or persona.language).lower().strip()
-                else:
-                    call_lang = persona.language or DEFAULT_LANG
+            if is_outbound:
+                client_name = call_ctx.get("client_name") or ""
+                call_lang = call_ctx.get("lang") or persona.language or DEFAULT_LANG
+            else:
+                if not prewarmed:
+                    # Догоняем то, что не успели сделать во время гудков.
+                    contact, (caller_memory, time_context) = await asyncio.gather(
+                        lookup_contact(client_data, client_id, target_phone),
+                        get_caller_memory(client_id, target_phone),
+                    )
+                client_name = (contact.get("name") or "").strip()
+                call_lang = contact.get("lang") or persona.language or DEFAULT_LANG
 
-            caller_memory, time_context = await get_caller_memory(client_id, target_phone)
+            # Имени может не быть — тогда обращаемся нейтрально, а не выдумываем.
+            is_known_caller = bool(client_name)
+            if not is_known_caller:
+                client_name = "client"
 
             system_prompt = build_system_prompt(
                 client_data, persona, caller_memory, call_lang, now, hours
@@ -1494,12 +1862,15 @@ async def handle_asterisk_conn(
             system_prompt_tokens = estimate_tokens(full_system_text)
 
             clog.info(
-                "[%s] client=%s persona=%s lang=%s phone=%s sys=%d tok",
+                "[%s] client=%s persona=%s lang=%s phone=%s caller=%s "
+                "prewarmed=%s sys=%d tok",
                 call_id,
                 client_id,
                 persona.persona_name,
                 call_lang,
                 target_phone,
+                client_name if is_known_caller else "unknown",
+                prewarmed,
                 system_prompt_tokens,
             )
 
@@ -1509,7 +1880,7 @@ async def handle_asterisk_conn(
                 websocket=socket,
                 params=FastAPIWebsocketParams(
                     audio_in_enabled=True,
-                    audio_in_filter=RNNoiseFilter(),
+                    audio_in_filter=build_audio_filter(),
                     audio_out_enabled=True,
                     audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
                     add_wav_header=False,
@@ -1644,10 +2015,12 @@ async def handle_asterisk_conn(
                 llm.register_function("Booking_tool", process_booking)
 
             recovery = InterruptionRecoveryProcessor(context, delay=persona.recovery_delay)
+            probe = InboundAudioProbe()
 
             pipeline = Pipeline(
                 [
                     transport.input(),
+                    probe,
                     context_aggregator.user(),
                     llm,
                     usage,
@@ -1668,38 +2041,53 @@ async def handle_asterisk_conn(
             )
             recovery.task = task
 
+            who = f"{client_name}" if is_known_caller else "an unknown caller"
+            name_rule = (
+                f'Address the caller by name ("{client_name}") once at the start.'
+                if is_known_caller
+                else "You do NOT know the caller's name. Address them neutrally. "
+                "Never invent or guess a name. Ask for it only if the conversation needs it."
+            )
+
             if is_outbound:
                 greeting = (
-                    f"SYSTEM EVENT: The person ({client_name}) answered your outbound call. "
-                    f"Goal of this call: {purpose}. Caller language: {call_lang}. "
+                    f"SYSTEM EVENT: {who} answered your outbound call. "
+                    f"Goal of this call: {purpose}. Language: {call_lang}. {name_rule} "
                     "Open the conversation in character."
                 )
             elif time_context == "very_recent":
                 greeting = (
-                    f"SYSTEM EVENT: {client_name} called back after a couple of minutes. "
-                    f"Do not greet again. Language: {call_lang}. Say the line dropped and continue."
+                    f"SYSTEM EVENT: {who} called back after a couple of minutes. "
+                    f"Do not greet again. Language: {call_lang}. {name_rule} "
+                    "Say the line dropped and continue where you left off."
                 )
             elif time_context == "same_day":
                 greeting = (
-                    f"SYSTEM EVENT: {client_name} is calling again today. Language: {call_lang}. "
-                    "Use RECENT memory and ask what else you can help with."
+                    f"SYSTEM EVENT: {who} is calling again today. Language: {call_lang}. "
+                    f"{name_rule} Use RECENT memory and ask what else you can help with."
                 )
             else:
                 greeting = (
-                    f"SYSTEM EVENT: Inbound call from {client_name}. Language: {call_lang}. "
-                    "Open the conversation. If RECENT memory exists, do not re-ask known facts."
+                    f"SYSTEM EVENT: Inbound call from {who}. Language: {call_lang}. "
+                    f"{name_rule} Open the conversation. "
+                    "If RECENT memory exists, do not re-ask what you already know."
                 )
 
             context.add_message({"role": "user", "content": greeting})
             await task.queue_frames([LLMRunFrame()])
 
             runner = PipelineRunner()
+            watchdog = asyncio.create_task(audio_stall_watchdog(call_id, socket, probe))
             try:
                 await asyncio.wait_for(runner.run(task), timeout=MAX_CALL_SECONDS)
             except asyncio.TimeoutError:
                 clog.warning("[%s] max call duration reached, terminating", call_id)
                 with contextlib.suppress(Exception):
                     await task.queue_frames([CancelFrame()])
+            finally:
+                watchdog.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watchdog
 
         except (asyncio.IncompleteReadError, ConnectionResetError, asyncio.TimeoutError) as exc:
             clog.info("[%s] connection closed: %s", call_id, type(exc).__name__)
