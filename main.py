@@ -150,6 +150,14 @@ AUDIO_STALL_SECONDS = _env_float("AUDIO_STALL_SECONDS", 10.0)
 DUMP_INPUT_AUDIO = _env_bool("DUMP_INPUT_AUDIO", True)
 
 PIPELINE_SAMPLE_RATE = _env_int("PIPELINE_SAMPLE_RATE", 16000)
+
+# АРУ на входе. Проверено экспериментом 02.09: одна и та же чистая фраза
+# распознаётся Gemini идеально на -17 dBFS и превращается в испанский мусор
+# на -27 dBFS. Голос по GSM приходит на -25..-29. Подтягиваем к цели.
+INPUT_AGC = _env_bool("INPUT_AGC", True)
+INPUT_TARGET_DBFS = _env_float("INPUT_TARGET_DBFS", -20.0)
+INPUT_MAX_GAIN_DB = _env_float("INPUT_MAX_GAIN_DB", 24.0)
+INPUT_MIN_GAIN_DB = _env_float("INPUT_MIN_GAIN_DB", 0.0)
 OUT_CHUNK_SIZE = _env_int("OUT_CHUNK_SIZE", 640)
 OUT_VOLUME = _env_float("OUT_VOLUME", 0.75)
 
@@ -172,7 +180,10 @@ MAX_CALL_SECONDS = _env_int("MAX_CALL_SECONDS", 900)
 # трубку на 40-й секунде. Ниже этого порога end_call игнорируется.
 MIN_SECONDS_BEFORE_END_CALL = _env_int("MIN_SECONDS_BEFORE_END_CALL", 25)
 # Значения из исходной рабочей версии, характером не управляются.
-VAD_SILENCE_MS = _env_int("VAD_SILENCE_MS", 1000)
+VAD_SILENCE_MS = _env_int("VAD_SILENCE_MS", 1500)
+# high = рубит реплику на первой паузе, обрывки по 0.5 с, на которых Gemini
+# не может определить язык. low = ждёт, пока человек договорит.
+VAD_END_SENSITIVITY = os.getenv("VAD_END_SENSITIVITY", "low").strip().lower()
 RECOVERY_DELAY_S = _env_float("RECOVERY_DELAY_S", 4.0)
 IDLE_TIMEOUT_SECONDS = _env_float("IDLE_TIMEOUT_SECONDS", 20.0)
 PERSONA_CACHE_TTL = _env_int("PERSONA_CACHE_TTL", 60)
@@ -280,6 +291,60 @@ else:
         return _audioop.ratecv(data, 2, 1, src, dst, state)
 
 
+# --- автоматическая регулировка усиления -------------------------------------
+
+
+class InputAGC:
+    """
+    Подтягивает речь к целевому уровню. Уровень оценивается скользящим окном
+    по звучащим кадрам (не по каждому кадру), усиление меняется медленно —
+    без «дыхания» и без искажений. Никогда не ослабляет ниже min_gain.
+    """
+
+    def __init__(
+        self,
+        target_dbfs: float = -18.0,
+        max_gain_db: float = 24.0,
+        min_gain_db: float = 0.0,
+        speech_floor_dbfs: float = -45.0,
+    ) -> None:
+        self.target = 32768.0 * 10 ** (target_dbfs / 20)
+        self.max_gain = 10 ** (max_gain_db / 20)
+        self.min_gain = 10 ** (min_gain_db / 20)
+        self.floor = 32768.0 * 10 ** (speech_floor_dbfs / 20)
+        self.gain = min(self.max_gain, max(self.min_gain, 10 ** (8.0 / 20)))
+        self.level: float | None = None
+        self.applied: list[float] = []
+
+    def process(self, data: bytes, adapt: bool = True) -> bytes:
+        if len(data) < 4:
+            return data
+        import numpy as np
+
+        a = np.frombuffer(data[: len(data) // 2 * 2], dtype="<i2").astype(np.float32)
+        rms = float(np.sqrt(np.mean(a * a))) if a.size else 0.0
+        if adapt and rms > self.floor:
+            # окно ~0.3 с речи
+            self.level = rms if self.level is None else self.level * 0.93 + rms * 0.07
+            desired = min(self.max_gain, max(self.min_gain, self.target / self.level))
+            self.gain += (desired - self.gain) * 0.12
+            self.applied.append(self.gain)
+        out = a * self.gain
+        lim = 0.75 * 32767.0
+        over = np.abs(out) > lim
+        if over.any():
+            out[over] = np.sign(out[over]) * (lim + (np.abs(out[over]) - lim) * 0.2)
+        return np.clip(out, -32767, 32767).astype("<i2").tobytes()
+
+    @property
+    def average_gain_db(self) -> float:
+        import numpy as np
+
+        if not self.applied:
+            return 0.0
+        return round(20 * float(np.log10(float(np.mean(self.applied)))), 1)
+
+
 # --- шумоподавление -----------------------------------------------------------
 # 2026-09-02: pyrnnoise упал на `Graph.__init__() got an unexpected keyword
 # argument 'rate'` (несовместимость с PyAV после пересборки образа) и унёс с
@@ -356,6 +421,70 @@ def build_audio_filter():
     except Exception as exc:
         log.error("RNNoiseFilter construction failed (%s) — running without it", exc)
         return None
+
+
+def analyze_pcm(data: bytes, rate: int) -> dict[str, Any]:
+    """
+    Числа вместо ушей. Что смотреть:
+      rms_dbfs        < -35  -> слишком тихо, ASR не слышит
+      clipped_pct     > 1    -> перегруз, искажения
+      dropout_runs    > 5    -> пропадают куски звука (рваная речь)
+      speech_band_pct < 60   -> в звуке мало речи, много мусора
+      above_4k_pct    > 15   -> для 8 кГц линии там быть нечего: артефакты
+    """
+    import numpy as np
+
+    a = np.frombuffer(data[: len(data) // 2 * 2], dtype="<i2").astype(np.float32)
+    n = int(a.size)
+    if n < rate:
+        return {"error": "too short", "samples": n}
+
+    def dbfs(x: float) -> float:
+        return round(20 * float(np.log10(max(x, 1.0) / 32768.0)), 1)
+
+    rms = float(np.sqrt(np.mean(a * a)))
+    peak = float(np.max(np.abs(a)))
+    clipped = float(np.mean(np.abs(a) >= 32700)) * 100
+
+    frame = int(rate * 0.02)
+    nf = n // frame
+    frames = a[: nf * frame].reshape(nf, frame)
+    frame_rms = np.sqrt(np.mean(frames * frames, axis=1))
+    silence_thr = 32768 * 10 ** (-50 / 20)
+    silence_pct = float(np.mean(frame_rms < silence_thr)) * 100
+    zero_frames = np.all(frames == 0, axis=1)
+    dropout_runs = int(np.sum(np.diff(np.concatenate(([0], zero_frames.astype(int)))) == 1))
+
+    seg = a[: min(n, rate * 30)]
+    spec = np.abs(np.fft.rfft(seg * np.hanning(seg.size))) ** 2
+    freqs = np.fft.rfftfreq(seg.size, 1.0 / rate)
+    total = float(np.sum(spec)) or 1.0
+    speech = float(np.sum(spec[(freqs > 300) & (freqs < 3400)])) / total * 100
+    above_4k = float(np.sum(spec[freqs > 4000])) / total * 100
+    below_100 = float(np.sum(spec[freqs < 100])) / total * 100
+
+    return {
+        "duration_s": round(n / rate, 1),
+        "rms_dbfs": dbfs(rms),
+        "peak_dbfs": dbfs(peak),
+        "clipped_pct": round(clipped, 2),
+        "silence_pct": round(silence_pct, 1),
+        "dropout_runs": dropout_runs,
+        "zero_frames_pct": round(float(np.mean(zero_frames)) * 100, 1),
+        "dc_offset": round(float(np.mean(a)), 1),
+        "speech_band_pct": round(speech, 1),
+        "above_4k_pct": round(above_4k, 1),
+        "below_100hz_pct": round(below_100, 1),
+    }
+
+
+def read_wav_or_raw(path: str, default_rate: int) -> tuple[bytes, int]:
+    try:
+        with wave.open(path, "rb") as w:
+            return w.readframes(w.getnframes()), w.getframerate()
+    except Exception:
+        with open(path, "rb") as f:
+            return f.read(), default_rate
 
 
 # =============================================================================
@@ -1105,6 +1234,13 @@ class AsteriskAudioSocket:
         self.next_send_time = time.time()
         self._resample_state: Any = None
         self.last_rx_ts = 0.0  # для сторожа входящего аудио
+        self.rx_bytes = 0
+        self.last_tx_ts = 0.0  # когда бот последний раз что-то говорил
+        self.agc = (
+            InputAGC(INPUT_TARGET_DBFS, INPUT_MAX_GAIN_DB, INPUT_MIN_GAIN_DB)
+            if INPUT_AGC
+            else None
+        )
 
     async def accept(self) -> None:
         return None
@@ -1131,11 +1267,16 @@ class AsteriskAudioSocket:
         # Asterisk отдаёт 8 кГц — тянем до частоты пайплайна, иначе Gemini
         # слышит замедленную речь и «угадывает» чужой язык.
         self.last_rx_ts = time.time()
+        self.rx_bytes += len(data)
 
         if ASTERISK_INPUT_RATE != PIPELINE_SAMPLE_RATE:
             data, self._resample_state = pcm_resample(
                 data, self._resample_state, ASTERISK_INPUT_RATE, PIPELINE_SAMPLE_RATE
             )
+        if self.agc is not None:
+            # пока бот говорит (и полсекунды после), уровень не подстраиваем —
+            # в это время на входе в основном эхо его же голоса
+            data = self.agc.process(data, adapt=(time.time() - self.last_tx_ts) > 0.6)
         return data
 
     async def receive(self) -> dict:
@@ -1170,6 +1311,7 @@ class AsteriskAudioSocket:
                 header = bytes([AS_TYPE_AUDIO_OUT]) + len(chunk).to_bytes(2, "big")
                 self.writer.write(header + chunk)
                 await self.writer.drain()
+                self.last_tx_ts = time.time()
         except Exception as exc:
             log.warning("audio send failed: %s", exc)
             self.client_state = WebSocketState.DISCONNECTED
@@ -1502,16 +1644,16 @@ def build_system_prompt(
     # Раньше здесь стояло жёсткое "Speak only in: XX", которое перебивало
     # более разумное правило из промпта клиента.
     blocks.append("<LANGUAGE>")
-    blocks.append(f"Start the call in {lang.upper()} and stay there by default.")
     blocks.append(
-        "Switch languages only when the caller has clearly and deliberately spoken "
-        "another language for two full turns in a row. Then switch completely and stay "
-        "in the new language for the rest of the call."
+        f"Start the call in {lang.upper()}. The caller may speak ANY language — "
+        "understand and answer them in whatever language they actually use."
     )
     blocks.append(
-        "Never switch because of a single word, a fragment, a greeting, or speech you "
-        "did not understand. If the audio is unclear, assume the caller is still using "
-        "the current language and ask them to repeat."
+        "This is a GSM line: audio is narrow-band and muffled. Never decide the caller's "
+        "language from a single word or a fragment — wait for a full sentence. Switch "
+        "languages only after the caller has clearly used another one for a full turn; "
+        "then stay in it. If something was unclear, ask them to repeat in the current "
+        "language instead of guessing."
     )
     blocks.append("</LANGUAGE>")
     blocks.append("")
@@ -1872,6 +2014,7 @@ async def handle_asterisk_conn(
     started_at = dt.datetime.now(dt.timezone.utc)
     start_ts = time.time()
     counted_client: Optional[str] = None
+    socket: Optional[AsteriskAudioSocket] = None
 
     if _call_semaphore.locked():
         clog.warning("[%s] concurrency limit reached, rejecting", call_id)
@@ -2033,7 +2176,11 @@ async def handle_asterisk_conn(
                     voice=persona.voice_model,
                     system_instruction=system_prompt,
                     vad=GeminiVADParams(
-                        end_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                        end_sensitivity=(
+                            types.EndSensitivity.END_SENSITIVITY_HIGH
+                            if VAD_END_SENSITIVITY == "high"
+                            else types.EndSensitivity.END_SENSITIVITY_LOW
+                        ),
                         silence_duration_ms=VAD_SILENCE_MS,
                         disabled=False,
                     ),
@@ -2263,7 +2410,13 @@ async def handle_asterisk_conn(
             wav_path = os.path.join(
                 ASTERISK_RECORDING_PATH, f"{session_uuid}.{ASTERISK_RECORDING_EXT}"
             )
-            clog.info("[%s] call finished, %ss, turns=%s", call_id, duration, usage.turns)
+            clog.info(
+                "[%s] call finished, %ss, turns=%s, входное усиление в среднем %+.1f дБ",
+                call_id,
+                duration,
+                usage.turns,
+                socket.agc.average_gain_db if (socket and socket.agc) else 0.0,
+            )
 
             if context is not None and client_id:
                 transcript, user_replies = build_transcript(context.messages)
@@ -2284,6 +2437,41 @@ async def handle_asterisk_conn(
                 async def post_processing() -> None:
                     await asyncio.sleep(0.5)
                     if DUMP_INPUT_AUDIO:
+                        # 1) Что ушло в Gemini (после ресемплинга и фильтра)
+                        try:
+                            stats = analyze_pcm(b"".join(probe.dump), PIPELINE_SAMPLE_RATE)
+                            ratio = (
+                                round(probe.bytes_seen / socket.rx_bytes, 2)
+                                if socket.rx_bytes
+                                else 0
+                            )
+                            log.info(
+                                "[%s] АНАЛИЗ ЗВУКА ДЛЯ GEMINI: %s | байт сокет=%d пайплайн=%d "
+                                "отношение=%.2f (ожидается %.1f)",
+                                call_id,
+                                json.dumps(stats, ensure_ascii=False),
+                                socket.rx_bytes,
+                                probe.bytes_seen,
+                                ratio,
+                                PIPELINE_SAMPLE_RATE / ASTERISK_INPUT_RATE,
+                            )
+                        except Exception as exc:
+                            log.warning("[%s] analyze (gemini) failed: %s", call_id, exc)
+                        # 2) Что записал сам Asterisk — до Python
+                        try:
+                            if await asyncio.to_thread(os.path.exists, wav_path):
+                                raw, rate = await asyncio.to_thread(
+                                    read_wav_or_raw, wav_path, 16000
+                                )
+                                log.info(
+                                    "[%s] АНАЛИЗ ЗАПИСИ ASTERISK (%d Hz): %s",
+                                    call_id,
+                                    rate,
+                                    json.dumps(analyze_pcm(raw, rate), ensure_ascii=False),
+                                )
+                        except Exception as exc:
+                            log.warning("[%s] analyze (asterisk) failed: %s", call_id, exc)
+
                         dump_path = f"/tmp/gemini_input_{call_id}.wav"
                         if probe.write_wav(dump_path):
                             url = await upload_debug_wav(client_id, dump_path)
@@ -2317,15 +2505,4 @@ async def handle_asterisk_conn(
                             status,
                             tz_name,
                             usage_stats,
-                        )
-                    except Exception as exc:
-                        log.error("[%s] post-processing failed: %s", call_id, exc)
-                    finally:
-                        with contextlib.suppress(Exception):
-                            if await asyncio.to_thread(os.path.exists, wav_path):
-                                await asyncio.to_thread(os.remove, wav_path)
-                        gc.collect()
-
-                asyncio.create_task(post_processing())
-            else:
-                gc.collect()
+ 
