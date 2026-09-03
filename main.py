@@ -1081,9 +1081,26 @@ async def run_archivist_and_notify_n8n(
     call_status: str,
     tz_name: str,
     usage_stats: dict | None = None,
+    audio_path: str | None = None,
 ) -> None:
     if not chat_history.strip() or phone == "Necunoscut":
         return
+
+    # Субтитры Gemini Live ненадёжны: модель понимает звук верно, а субтитры
+    # к нему пишет отдельный слабый механизм. Поэтому архивариусу отдаём саму
+    # запись — полная модель слушает весь разговор и пишет нормальную расшифровку.
+    audio_part = None
+    if audio_path:
+        try:
+            if await asyncio.to_thread(os.path.exists, audio_path):
+                size = await asyncio.to_thread(os.path.getsize, audio_path)
+                if 0 < size <= 18_000_000:
+                    wav_bytes = await asyncio.to_thread(lambda: open(audio_path, "rb").read())
+                    audio_part = types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")
+                else:
+                    log.warning("[archivist] recording %d bytes — too big, using subtitles", size)
+        except Exception as exc:
+            log.warning("[archivist] cannot attach recording (%s), using subtitles", exc)
 
     today = dt.datetime.now(tz_for(tz_name)).strftime("%Y-%m-%d")
     clean_phone = "".join(filter(str.isdigit, str(phone)))
@@ -1096,7 +1113,9 @@ CORE IDENTITY: {old_memory.get('core') or 'Нет данных'}
 SHORT TERM: {old_memory.get('short') or 'Нет данных'}
 LONG TERM: {old_memory.get('long') or 'Нет данных'}
 
-ТРАНСКРИПТ ЗВОНКА:
+{"АУДИОЗАПИСЬ РАЗГОВОРА ПРИЛОЖЕНА. Реплики бота (AI) в субтитрах ниже точные. Реплики клиента (Client) в субтитрах часто искажены и могут быть на случайных языках — ИГНОРИРУЙ их текст и слушай, что клиент реально сказал в записи." if audio_part else "Аудиозаписи нет, работай по субтитрам."}
+
+СУБТИТРЫ ЗВОНКА:
 {chat_history}
 
 ИНСТРУКЦИЯ (выведи СТРОГО JSON, без markdown):
@@ -1108,8 +1127,9 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
 6. next_step: следующий шаг (перезвонить, отправить КП и т.д.).
 7. language: язык, на котором РЕАЛЬНО говорил клиент (ro/ru/en).
 8. client_name: имя клиента, если он его назвал. Иначе пустая строка.
+9. transcript: точная расшифровка всего разговора по записи, в формате "Client: ..." / "AI: ...", на языке оригинала каждой реплики. Если записи нет — верни субтитры как есть.
 
-{{"core_identity":"...","short_term_context":"...","long_term_context":"...","summary":"...","sentiment":"...","next_step":"...","language":"...","client_name":"..."}}
+{{"core_identity":"...","short_term_context":"...","long_term_context":"...","summary":"...","sentiment":"...","next_step":"...","language":"...","client_name":"...","transcript":"..."}}
 """
 
     data: dict[str, Any] = {}
@@ -1118,7 +1138,7 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
         try:
             response = await client.aio.models.generate_content(
                 model=model,
-                contents=prompt,
+                contents=[audio_part, prompt] if audio_part else prompt,
                 config=types.GenerateContentConfig(response_mime_type="application/json"),
             )
             data = json.loads(response.text.strip())
@@ -1174,7 +1194,7 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
         "end_client_name": client_name,
         "end_client_phone": phone,
         "status": call_status,
-        "transcript": chat_history,
+        "transcript": (data.get("transcript") or "").strip() or chat_history,
         "summary": json.dumps(
             {
                 "client_name": client_name,
@@ -1701,6 +1721,12 @@ def build_system_prompt(
             "ЧТО ПОРТРЕТ НЕ ОТМЕНЯЕТ: рабочие часы для встреч с людьми, запрет "
             "выдумывать факты, цены и даты, запрет зачитывать ссылки вслух, правила "
             "работы с инструментами и язык разговора."
+        )
+        blocks.append(
+            "ПРОЩАНИЕ: когда клиент прощается или говорит, что перезвонит позже — "
+            "максимум ОДНО короткое предложение (уточнить удобное время или предложить "
+            "позвонить самому, не оба), затем тепло попрощаться. Не задавай цепочку "
+            "вопросов и не удерживай — настойчивость на прощание не распространяется."
         )
         blocks.append("</PRIORITY>")
 
@@ -2526,6 +2552,7 @@ async def handle_asterisk_conn(
                             status,
                             tz_name,
                             usage_stats,
+                            audio_path=wav_path,
                         )
                     except Exception as exc:
                         log.error("[%s] post-processing failed: %s", call_id, exc)
@@ -2538,4 +2565,3 @@ async def handle_asterisk_conn(
                 asyncio.create_task(post_processing())
             else:
                 gc.collect()
-                       
