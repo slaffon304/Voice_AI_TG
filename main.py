@@ -1598,7 +1598,8 @@ def build_system_prompt(
         blocks.append(
             "The contact card has no name. Check <CALLER_MEMORY> below: if a name is "
             "recorded there, that IS the caller's name — use it and do not ask again. "
-            "Only if memory has no name either: never invent one, ask only when needed."
+            "Only if memory has no name either: ask how to address them in your first or "
+            "second reply, once, then use the name for the rest of the call. Never invent one."
         )
     blocks.append("</CALLER>")
     blocks.append("")
@@ -1727,6 +1728,30 @@ def build_system_prompt(
             "максимум ОДНО короткое предложение (уточнить удобное время или предложить "
             "позвонить самому, не оба), затем тепло попрощаться. Не задавай цепочку "
             "вопросов и не удерживай — настойчивость на прощание не распространяется."
+        )
+        blocks.append("")
+        blocks.append("ПРОГРЕВ И КОНСУЛЬТАЦИЯ (новый звонящий):")
+        blocks.append("1. Поздоровайся, спроси имя.")
+        blocks.append(
+            "2. Узнай, какой у него бизнес и какую задачу хочет решить — один-два "
+            "вопроса, не анкета."
+        )
+        blocks.append(
+            "3. Консультируй под его случай: конкретный пример, как это работает у "
+            "такого бизнеса, что даёт, сколько стоит — если спросят или уместно. "
+            "Общие фразы про «автоматизацию с ИИ» — запрещены."
+        )
+        blocks.append(
+            "4. Специалиста или встречу предлагай только после консультации, и только "
+            "когда клиент проявил интерес или сам попросил. Ответ в одну строчку и "
+            "«хотите поговорить со специалистом?» — это не консультация, так не делай."
+        )
+        blocks.append(
+            "5. Возражение отрабатывай через пользу для его бизнеса, а не через "
+            "передачу человеку."
+        )
+        blocks.append(
+            "Для известного клиента — продолжай по памяти с того места, где остановились."
         )
         blocks.append("</PRIORITY>")
 
@@ -2391,8 +2416,8 @@ async def handle_asterisk_conn(
             name_rule = (
                 f"Обращайся к нему по имени ({client_name}) один раз в начале."
                 if is_known_caller
-                else "Имени ты не знаешь. Обращайся нейтрально. "
-                "НИКОГДА не выдумывай и не угадывай имя."
+                else "Имени ты не знаешь. Спроси, как обращаться, в первой-второй "
+                "реплике, один раз, дальше — по имени. НИКОГДА не выдумывай имя."
             )
             lang_rule = (
                 f"ПЕРВАЯ ЖЕ ТВОЯ ФРАЗА ДОЛЖНА БЫТЬ НА {lang_word} ЯЗЫКЕ. "
