@@ -158,6 +158,14 @@ INPUT_AGC = _env_bool("INPUT_AGC", True)
 INPUT_TARGET_DBFS = _env_float("INPUT_TARGET_DBFS", -20.0)
 INPUT_MAX_GAIN_DB = _env_float("INPUT_MAX_GAIN_DB", 24.0)
 INPUT_MIN_GAIN_DB = _env_float("INPUT_MIN_GAIN_DB", 0.0)
+# Порог фона. Всё, что тише голоса звонящего на BACKGROUND_GATE_DB, приглушается
+# на BACKGROUND_ATTEN_DB перед отправкой в Gemini — голоса на заднем плане
+# перестают засчитываться как «клиент заговорил». BACKGROUND_HOLD_MS — сколько
+# держать «открыто» после последнего громкого кадра, чтобы не рвать паузы
+# внутри слов. 0 в BACKGROUND_GATE_DB выключает порог.
+BACKGROUND_GATE_DB = _env_float("BACKGROUND_GATE_DB", 10.0)
+BACKGROUND_ATTEN_DB = _env_float("BACKGROUND_ATTEN_DB", 15.0)
+BACKGROUND_HOLD_MS = _env_int("BACKGROUND_HOLD_MS", 300)
 OUT_CHUNK_SIZE = _env_int("OUT_CHUNK_SIZE", 640)
 OUT_VOLUME = _env_float("OUT_VOLUME", 0.75)
 
@@ -184,6 +192,10 @@ VAD_SILENCE_MS = _env_int("VAD_SILENCE_MS", 1500)
 # high = рубит реплику на первой паузе, обрывки по 0.5 с, на которых Gemini
 # не может определить язык. low = ждёт, пока человек договорит.
 VAD_END_SENSITIVITY = os.getenv("VAD_END_SENSITIVITY", "low").strip().lower()
+# Детектор НАЧАЛА речи у Gemini. start=low — нужна уверенная речь, а не всплеск;
+# prefix_padding — сколько мс речь должна длиться, прежде чем засчитается.
+VAD_START_SENSITIVITY = os.getenv("VAD_START_SENSITIVITY", "low").strip().lower()
+VAD_PREFIX_PADDING_MS = _env_int("VAD_PREFIX_PADDING_MS", 400)
 RECOVERY_DELAY_S = _env_float("RECOVERY_DELAY_S", 4.0)
 IDLE_TIMEOUT_SECONDS = _env_float("IDLE_TIMEOUT_SECONDS", 20.0)
 PERSONA_CACHE_TTL = _env_int("PERSONA_CACHE_TTL", 60)
@@ -296,10 +308,16 @@ else:
 
 class InputAGC:
     """
-    Подтягивает речь к целевому уровню. Уровень оценивается скользящим окном
-    по звучащим кадрам (не по каждому кадру), усиление меняется медленно —
-    без «дыхания» и без искажений. Никогда не ослабляет ниже min_gain.
+    Подтягивает речь звонящего к целевому уровню и приглушает фон.
+
+    Два измерителя: средний уровень речи (для усиления) и пиковый (для порога
+    фона). Оба учатся ТОЛЬКО по переднему плану — иначе усилитель подстроится
+    под голоса на заднем плане и поднимет их. Решение «фон / не фон» принимается
+    с упреждением в несколько кадров, чтобы не резать начала слов. Никогда не
+    ослабляет речь ниже min_gain, пики мягко ограничивает.
     """
+
+    LOOKAHEAD = 3  # кадров по 20 мс
 
     def __init__(
         self,
@@ -313,8 +331,19 @@ class InputAGC:
         self.min_gain = 10 ** (min_gain_db / 20)
         self.floor = 32768.0 * 10 ** (speech_floor_dbfs / 20)
         self.gain = min(self.max_gain, max(self.min_gain, 10 ** (8.0 / 20)))
-        self.level: float | None = None
+        self.level: float | None = None   # средний уровень речи
+        self.peak: float | None = None    # пиковый уровень речи
         self.applied: list[float] = []
+        # порог фона
+        self.gate_ratio = 10 ** (-BACKGROUND_GATE_DB / 20) if BACKGROUND_GATE_DB > 0 else 0.0
+        self.gate_atten = 10 ** (-BACKGROUND_ATTEN_DB / 20)
+        self.hold_frames = max(1, int(BACKGROUND_HOLD_MS / 20))
+        self._hold = 0
+        self._env: float | None = None
+        self._queue: list[Any] = []
+        self._fg: list[bool] = []
+        self.gated_frames = 0
+        self.total_frames = 0
 
     def process(self, data: bytes, adapt: bool = True, attenuate_db: float = 0.0) -> bytes:
         if len(data) < 4:
@@ -323,14 +352,45 @@ class InputAGC:
 
         a = np.frombuffer(data[: len(data) // 2 * 2], dtype="<i2").astype(np.float32)
         rms = float(np.sqrt(np.mean(a * a))) if a.size else 0.0
-        if adapt and rms > self.floor:
-            # окно ~0.3 с речи
-            self.level = rms if self.level is None else self.level * 0.93 + rms * 0.07
+        self.total_frames += 1
+
+        # огибающая: быстро вверх, медленно вниз
+        self._env = rms if self._env is None else max(rms, self._env * 0.85)
+        foreground = (
+            self.peak is None
+            or self.gate_ratio == 0.0
+            or self._env >= self.peak * self.gate_ratio
+        )
+
+        # учимся только по переднему плану
+        if adapt and rms > self.floor and foreground:
+            if self.level is None:
+                self.level, self.peak = rms, rms
+            else:
+                self.level = self.level * 0.93 + rms * 0.07
+                self.peak = max(rms, self.peak * 0.985)
             desired = min(self.max_gain, max(self.min_gain, self.target / self.level))
             self.gain += (desired - self.gain) * 0.12
             self.applied.append(self.gain)
+
+        # упреждение: решение по кадру принимаем, видя следующие LOOKAHEAD кадров
+        self._queue.append(a)
+        self._fg.append(foreground)
+        if len(self._queue) <= self.LOOKAHEAD:
+            return b""
+        a_out = self._queue.pop(0)
+        if any(self._fg[: self.LOOKAHEAD + 1]):
+            self._hold = self.hold_frames
+        elif self._hold > 0:
+            self._hold -= 1
+        self._fg.pop(0)
+
         gain = self.gain * (10 ** (-attenuate_db / 20)) if attenuate_db else self.gain
-        out = a * gain
+        if self.gate_ratio and self.peak is not None and self._hold == 0:
+            gain *= self.gate_atten
+            self.gated_frames += 1
+
+        out = a_out * gain
         lim = 0.75 * 32767.0
         over = np.abs(out) > lim
         if over.any():
@@ -1681,8 +1741,15 @@ def build_system_prompt(
         "in a language the caller has NOT been speaking in this call, or (c) makes no "
         "sense in the flow of the conversation — treat it as MISHEARD, not as new "
         "information. Do not act on it: do not change topic, do not say goodbye, do "
-        "not switch language, do not call any tool. Say briefly that you did not "
-        "catch that and ask them to repeat, in the language you have been using."
+        "not switch language, do not call any tool."
+    )
+    blocks.append(
+        "WHAT TO DO WITH A SUSPICIOUS TURN: the caller often has people talking in the "
+        "background — that is what such fragments usually are. If it arrived while you "
+        "were in the middle of an answer, CONTINUE that answer from where you stopped, "
+        "as if nothing happened. If you were not mid-answer, say briefly that you did "
+        "not catch that and ask them to repeat — ALWAYS in the language you have been "
+        "speaking in this call, never in the language the fragment appeared to be in."
     )
     blocks.append(
         "Switch languages only after the caller has clearly spoken a full, meaningful "
@@ -1759,15 +1826,29 @@ def build_system_prompt(
 
 
 def build_vad_params() -> GeminiVADParams:
-    return GeminiVADParams(
-        end_sensitivity=(
-            types.EndSensitivity.END_SENSITIVITY_HIGH
-            if VAD_END_SENSITIVITY == "high"
-            else types.EndSensitivity.END_SENSITIVITY_LOW
-        ),
-        silence_duration_ms=VAD_SILENCE_MS,
-        disabled=False,
+    end = (
+        types.EndSensitivity.END_SENSITIVITY_HIGH
+        if VAD_END_SENSITIVITY == "high"
+        else types.EndSensitivity.END_SENSITIVITY_LOW
     )
+    start = (
+        types.StartSensitivity.START_SENSITIVITY_HIGH
+        if VAD_START_SENSITIVITY == "high"
+        else types.StartSensitivity.START_SENSITIVITY_LOW
+    )
+    try:
+        return GeminiVADParams(
+            start_sensitivity=start,
+            end_sensitivity=end,
+            prefix_padding_ms=VAD_PREFIX_PADDING_MS,
+            silence_duration_ms=VAD_SILENCE_MS,
+            disabled=False,
+        )
+    except TypeError as exc:
+        log.warning("GeminiVADParams: %s — using end/silence only", exc)
+        return GeminiVADParams(
+            end_sensitivity=end, silence_duration_ms=VAD_SILENCE_MS, disabled=False
+        )
 
 
 def build_tools(client_data: dict, readable_hours: str) -> list[dict]:
@@ -2482,12 +2563,15 @@ async def handle_asterisk_conn(
             wav_path = os.path.join(
                 ASTERISK_RECORDING_PATH, f"{session_uuid}.{ASTERISK_RECORDING_EXT}"
             )
+            agc = socket.agc if socket else None
             clog.info(
-                "[%s] call finished, %ss, turns=%s, входное усиление в среднем %+.1f дБ",
+                "[%s] call finished, %ss, turns=%s, входное усиление в среднем %+.1f дБ, "
+                "приглушено как фон %.0f%% кадров",
                 call_id,
                 duration,
                 usage.turns,
-                socket.agc.average_gain_db if (socket and socket.agc) else 0.0,
+                agc.average_gain_db if agc else 0.0,
+                (100.0 * agc.gated_frames / agc.total_frames) if (agc and agc.total_frames) else 0.0,
             )
 
             if context is not None and client_id:
