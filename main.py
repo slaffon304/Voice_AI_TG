@@ -153,7 +153,7 @@ AUDIO_STALL_SECONDS = _env_float("AUDIO_STALL_SECONDS", 10.0)
 DEAD_AIR_SECONDS = _env_float("DEAD_AIR_SECONDS", 50.0)
 # ВРЕМЕННАЯ ДИАГНОСТИКА. Пишет в WAV ровно тот звук, который получает Gemini,
 # и кладёт в Supabase рядом с записью разговора. Убрать, когда починим звук.
-DUMP_INPUT_AUDIO = _env_bool("DUMP_INPUT_AUDIO", True)
+DUMP_INPUT_AUDIO = _env_bool("DUMP_INPUT_AUDIO", False)
 
 PIPELINE_SAMPLE_RATE = _env_int("PIPELINE_SAMPLE_RATE", 16000)
 
@@ -847,13 +847,9 @@ async def get_caller_memory(client_id: str, phone: str) -> tuple[dict, str]:
     if not phone or phone == "Necunoscut":
         return default, "first_time"
     clean = "".join(filter(str.isdigit, str(phone)))
-    rows = await sb_select(
-        "person_memory",
-        {
-            "client_id": f"eq.{client_id}",
-            "phone": f"eq.{clean}",
-            "select": "core_identity,short_term_context,long_term_context,last_interaction_at",
-        },
+    rows = await sb_rpc(
+        "person_memory_get",
+        {"p_client_id": client_id, "p_phone": phone},
         timeout=2.5,
     )
     if not rows:
@@ -1226,21 +1222,17 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
         }
 
     try:
-        db = create_client(SUPABASE_URL, SUPABASE_KEY)
-        await asyncio.to_thread(
-            db.table("person_memory")
-            .upsert(
-                {
-                    "client_id": client_id,
-                    "phone": clean_phone,
-                    "core_identity": data.get("core_identity", ""),
-                    "short_term_context": data.get("short_term_context", ""),
-                    "long_term_context": data.get("long_term_context", ""),
-                    "last_interaction_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                },
-                on_conflict="client_id,phone",
-            )
-            .execute
+        await sb_rpc(
+            "person_memory_upsert",
+            {
+                "p_client_id": client_id,
+                "p_phone": phone,
+                "p_core": data.get("core_identity", ""),
+                "p_short": data.get("short_term_context", ""),
+                "p_long": data.get("long_term_context", ""),
+                "p_channel": "voice",
+            },
+            timeout=5.0,
         )
         log.info("[archivist] memory saved for %s", clean_phone)
     except Exception as exc:
