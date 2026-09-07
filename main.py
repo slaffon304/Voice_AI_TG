@@ -844,7 +844,7 @@ async def get_caller_memory(client_id: str, phone: str) -> tuple[dict, str]:
         return default, "first_time"
     clean = "".join(filter(str.isdigit, str(phone)))
     rows = await sb_select(
-        "caller_memories",
+        "person_memory",
         {
             "client_id": f"eq.{client_id}",
             "phone": f"eq.{clean}",
@@ -1224,7 +1224,7 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
     try:
         db = create_client(SUPABASE_URL, SUPABASE_KEY)
         await asyncio.to_thread(
-            db.table("caller_memories")
+            db.table("person_memory")
             .upsert(
                 {
                     "client_id": client_id,
@@ -2058,7 +2058,7 @@ async def get_client_uuid(
         ctx = await prewarm_call_context(client_id, formatted)
         if not ctx:
             return Response(content="not_found", media_type="text/plain")
-            ctx["project_id"] = project_id
+        ctx["project_id"] = project_id
         await redis_client.setex(
             f"call_context:{call_uuid}", 300, json.dumps(ctx, default=str)
         )
