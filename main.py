@@ -2622,7 +2622,8 @@ async def handle_asterisk_conn(
             with contextlib.suppress(Exception):
                 writer.close()
 
-            duration = int(max(0.0, activity.last_activity_ts - start_ts))
+            last_ts = activity.last_activity_ts if activity else time.time()
+            duration = int(max(0.0, last_ts - start_ts))
             direction = "outbound" if is_outbound else "inbound"
             wav_path = os.path.join(
                 ASTERISK_RECORDING_PATH, f"{session_uuid}.{ASTERISK_RECORDING_EXT}"
