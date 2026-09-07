@@ -61,6 +61,8 @@ from pipecat.frames.frames import (
     LLMRunFrame,
     MetricsFrame,
     OutputAudioRawFrame,
+    TranscriptionFrame,
+    InterimTranscriptionFrame,
     UserStartedSpeakingFrame,
 )
 from pipecat.metrics.metrics import LLMUsageMetricsData
@@ -147,6 +149,8 @@ ASTERISK_INPUT_RATE = _env_int("ASTERISK_INPUT_RATE", 16000)
 ENABLE_RNNOISE = _env_bool("ENABLE_RNNOISE", True)
 # Сторож: сколько секунд тишины в пайплайне при живом сокете считать поломкой.
 AUDIO_STALL_SECONDS = _env_float("AUDIO_STALL_SECONDS", 10.0)
+# Сторож мёртвого эфира: столько секунд без речи с обеих сторон — бот кладёт трубку.
+DEAD_AIR_SECONDS = _env_float("DEAD_AIR_SECONDS", 50.0)
 # ВРЕМЕННАЯ ДИАГНОСТИКА. Пишет в WAV ровно тот звук, который получает Gemini,
 # и кладёт в Supabase рядом с записью разговора. Убрать, когда починим звук.
 DUMP_INPUT_AUDIO = _env_bool("DUMP_INPUT_AUDIO", True)
@@ -1482,6 +1486,47 @@ class InboundAudioProbe(FrameProcessor):
             log.warning("input dump failed: %s", exc)
             return False
 
+class ActivityProbe(FrameProcessor):
+    """Запоминает момент последней речи — бота или клиента. Тишина не считается."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_activity_ts = time.time()
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(
+            frame,
+            (
+                OutputAudioRawFrame,        # бот говорит
+                TranscriptionFrame,         # клиент сказал — есть расшифровка
+                InterimTranscriptionFrame,
+                InterruptionFrame,          # Gemini услышал речь и перебил бота
+                UserStartedSpeakingFrame,
+            ),
+        ):
+            self.last_activity_ts = time.time()
+        await self.push_frame(frame, direction)
+
+
+async def dead_air_watchdog(call_id: str, activity: "ActivityProbe", task: PipelineTask) -> None:
+    """Раз в 5 с: если DEAD_AIR_SECONDS никто не говорил — завершаем звонок."""
+    try:
+        while True:
+            await asyncio.sleep(5.0)
+            silent_for = time.time() - activity.last_activity_ts
+            if silent_for >= DEAD_AIR_SECONDS:
+                log.warning(
+                    "[%s] DEAD AIR: no speech from either side for %.0fs — hanging up",
+                    call_id,
+                    silent_for,
+                )
+                with contextlib.suppress(Exception):
+                    await task.queue_frames([CancelFrame()])
+                return
+    except asyncio.CancelledError:
+        pass
+
 
 async def audio_stall_watchdog(
     call_id: str, socket: "AsteriskAudioSocket", probe: InboundAudioProbe
@@ -2479,6 +2524,7 @@ async def handle_asterisk_conn(
 
             recovery = InterruptionRecoveryProcessor(context, delay=RECOVERY_DELAY_S)
             probe = InboundAudioProbe()
+            activity = ActivityProbe()
 
             pipeline = Pipeline(
                 [
@@ -2488,6 +2534,7 @@ async def handle_asterisk_conn(
                     llm,
                     usage,
                     recovery,
+                    activity,
                     transport.output(),
                     context_aggregator.assistant(),
                 ]
@@ -2545,6 +2592,7 @@ async def handle_asterisk_conn(
 
             runner = PipelineRunner()
             watchdog = asyncio.create_task(audio_stall_watchdog(call_id, socket, probe))
+            dead_air = asyncio.create_task(dead_air_watchdog(call_id, activity, task))
             try:
                 await asyncio.wait_for(runner.run(task), timeout=MAX_CALL_SECONDS)
             except asyncio.TimeoutError:
@@ -2553,8 +2601,11 @@ async def handle_asterisk_conn(
                     await task.queue_frames([CancelFrame()])
             finally:
                 watchdog.cancel()
+                dead_air.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await watchdog
+                with contextlib.suppress(asyncio.CancelledError):
+                    await dead_air
 
         except (asyncio.IncompleteReadError, ConnectionResetError, asyncio.TimeoutError) as exc:
             clog.info("[%s] connection closed: %s", call_id, type(exc).__name__)
@@ -2571,7 +2622,7 @@ async def handle_asterisk_conn(
             with contextlib.suppress(Exception):
                 writer.close()
 
-            duration = int(time.time() - start_ts)
+            duration = int(max(0.0, activity.last_activity_ts - start_ts))
             direction = "outbound" if is_outbound else "inbound"
             wav_path = os.path.join(
                 ASTERISK_RECORDING_PATH, f"{session_uuid}.{ASTERISK_RECORDING_EXT}"
