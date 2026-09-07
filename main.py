@@ -197,8 +197,8 @@ VAD_END_SENSITIVITY = os.getenv("VAD_END_SENSITIVITY", "low").strip().lower()
 # Детектор НАЧАЛА речи у Gemini. start=low — нужна уверенная речь, а не всплеск;
 # prefix_padding — сколько мс речь должна длиться, прежде чем засчитается.
 VAD_START_SENSITIVITY = os.getenv("VAD_START_SENSITIVITY", "low").strip().lower()
-VAD_PREFIX_PADDING_MS = _env_int("VAD_PREFIX_PADDING_MS", 400)
-RECOVERY_DELAY_S = _env_float("RECOVERY_DELAY_S", 4.0)
+VAD_PREFIX_PADDING_MS = _env_int("VAD_PREFIX_PADDING_MS", 800)
+RECOVERY_DELAY_S = _env_float("RECOVERY_DELAY_S", 2.5)
 IDLE_TIMEOUT_SECONDS = _env_float("IDLE_TIMEOUT_SECONDS", 20.0)
 PERSONA_CACHE_TTL = _env_int("PERSONA_CACHE_TTL", 60)
 
