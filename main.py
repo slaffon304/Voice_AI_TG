@@ -24,6 +24,7 @@ import contextlib
 import datetime as dt
 import gc
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -124,6 +125,7 @@ AUDIOSOCKET_HOST = os.getenv("AUDIOSOCKET_HOST", "0.0.0.0")
 AUDIOSOCKET_PORT = _env_int("AUDIOSOCKET_PORT", 8085)
 
 N8N_BASE_URL = (os.getenv("N8N_BASE_URL") or "").rstrip("/")
+N8N_WEBHOOK_SECRET = os.getenv("N8N_WEBHOOK_SECRET", "")
 KOMMO_SUBDOMAIN = os.getenv("KOMMO_SUBDOMAIN")
 KOMMO_ACCESS_TOKEN = os.getenv("KOMMO_ACCESS_TOKEN")
 
@@ -1142,6 +1144,7 @@ async def run_archivist_and_notify_n8n(
     tz_name: str,
     usage_stats: dict | None = None,
     audio_path: str | None = None,
+    project_id: str = "",
 ) -> None:
     if not chat_history.strip() or phone == "Necunoscut":
         return
@@ -1251,6 +1254,7 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
         return
     payload = {
         "client_id": client_id,
+        "project_id": project_id,
         "end_client_name": client_name,
         "end_client_phone": phone,
         "status": call_status,
@@ -1274,7 +1278,12 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
         **(usage_stats or {}),
     }
     try:
-        await http().post(f"{N8N_BASE_URL}/post-call-summary", json=payload, timeout=10.0)
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if N8N_WEBHOOK_SECRET:
+            sig = hmac.new(N8N_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+            headers["X-Signature"] = f"sha256={sig}"
+        await http().post(f"{N8N_BASE_URL}/post-call-summary", content=body, headers=headers, timeout=10.0)
         log.info("[archivist] report sent to n8n")
     except Exception as exc:
         log.error("[archivist] n8n post failed: %s", exc)
@@ -2030,12 +2039,13 @@ async def get_client_uuid(
         return Response(content="error", media_type="text/plain")
 
     rows = await sb_select(
-        "bot_channels", {"identifier": f"eq.{identifier}", "select": "client_id"}
+        "bot_channels", {"identifier": f"eq.{identifier}", "select": "client_id,project_id"}
     )
     if not rows:
         return Response(content="not_found", media_type="text/plain")
 
     client_id = str(rows[0].get("client_id"))
+    project_id = str(rows[0].get("project_id") or "")
     formatted = format_phone(extract_real_phone(ani, all_id, from_hdr, phone))
 
     # Без Redis работаем по-старому: отдаём client_id, бот резолвит сам.
@@ -2048,6 +2058,7 @@ async def get_client_uuid(
         ctx = await prewarm_call_context(client_id, formatted)
         if not ctx:
             return Response(content="not_found", media_type="text/plain")
+            ctx["project_id"] = project_id
         await redis_client.setex(
             f"call_context:{call_uuid}", 300, json.dumps(ctx, default=str)
         )
@@ -2071,6 +2082,7 @@ class OutboundCallRequest(BaseModel):
     client_name: str = "client"
     custom_context: str = ""
     lang: str = DEFAULT_LANG
+    project_id: str = ""
 
 
 @app.post("/api/dial")
@@ -2096,6 +2108,7 @@ async def initiate_outbound_call(req: OutboundCallRequest, _: str = Depends(veri
                         "call_purpose": req.call_purpose,
                         "custom_context": req.custom_context,
                         "lang": req.lang,
+                        "project_id": req.project_id,
                     }
                 ),
             )
@@ -2662,6 +2675,7 @@ async def handle_asterisk_conn(
                             tz_name,
                             usage_stats,
                             audio_path=wav_path,
+                            project_id=call_ctx.get("project_id") or "",
                         )
                     except Exception as exc:
                         log.error("[%s] post-processing failed: %s", call_id, exc)
