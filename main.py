@@ -2134,20 +2134,23 @@ async def initiate_outbound_call(req: OutboundCallRequest, _: str = Depends(veri
 
     if redis_client:
         with contextlib.suppress(Exception):
+            # Тот же прогрев, что у входящего: карточка, память, персонаж — заранее.
+            ctx = await prewarm_call_context(req.client_id, formatted_phone) or {}
+            contact_name = (ctx.get("contact") or {}).get("name") or ""
+            ctx.update(
+                {
+                    "client_id": req.client_id,
+                    "target_phone": formatted_phone,
+                    "client_name": req.client_name if req.client_name != "client" else (contact_name or "client"),
+                    "call_purpose": req.call_purpose,
+                    "custom_context": req.custom_context,
+                    "lang": req.lang,
+                    "project_id": req.project_id,
+                    "direction": "outbound",
+                }
+            )
             await redis_client.setex(
-                f"call_context:{call_uuid}",
-                600,
-                json.dumps(
-                    {
-                        "client_id": req.client_id,
-                        "target_phone": formatted_phone,
-                        "client_name": req.client_name,
-                        "call_purpose": req.call_purpose,
-                        "custom_context": req.custom_context,
-                        "lang": req.lang,
-                        "project_id": req.project_id,
-                    }
-                ),
+                f"call_context:{call_uuid}", 600, json.dumps(ctx, default=str)
             )
 
     payload = {
