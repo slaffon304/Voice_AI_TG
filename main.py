@@ -2154,7 +2154,7 @@ async def initiate_outbound_call(req: OutboundCallRequest, _: str = Depends(veri
             )
 
     payload = {
-        "endpoint": f"PJSIP/{formatted_phone}{ASTERISK_ENDPOINT_SUFFIX}",
+        "endpoint": f"PJSIP/{''.join(filter(str.isdigit, formatted_phone))}{ASTERISK_ENDPOINT_SUFFIX}",
         "extension": "s",
         "context": "outbound-ai",
         "priority": 1,
