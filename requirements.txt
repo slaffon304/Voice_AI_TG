@@ -9,3 +9,4 @@ google-genai
 redis
 audiolab==0.5.1
 av<18
+numpy
