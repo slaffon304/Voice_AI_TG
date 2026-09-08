@@ -38,11 +38,13 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Response, Security
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, Security, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from starlette.websockets import WebSocketState
+from starlette.websockets import WebSocketDisconnect
+import numpy as np
 
 import redis.asyncio as redis
 from google import genai
@@ -1145,6 +1147,8 @@ async def run_archivist_and_notify_n8n(
     usage_stats: dict | None = None,
     audio_path: str | None = None,
     project_id: str = "",
+    web_id: str = "",
+    platform: str = "gsm_voice",
 ) -> None:
     if not chat_history.strip() or phone == "Necunoscut":
         return
@@ -1222,18 +1226,33 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
         }
 
     try:
-        await sb_rpc(
-            "person_memory_upsert",
-            {
-                "p_client_id": client_id,
-                "p_phone": phone,
-                "p_core": data.get("core_identity", ""),
-                "p_short": data.get("short_term_context", ""),
-                "p_long": data.get("long_term_context", ""),
-                "p_channel": "voice",
-            },
-            timeout=5.0,
-        )
+        if web_id:
+            await sb_rpc(
+                "person_memory_upsert_web",
+                {
+                    "p_client_id": client_id,
+                    "p_web_id": web_id,
+                    "p_phone": phone or "",
+                    "p_name": str(data.get("client_name") or client_name or "").strip(),
+                    "p_core": data.get("core_identity", ""),
+                    "p_short": data.get("short_term_context", ""),
+                    "p_long": data.get("long_term_context", ""),
+                },
+                timeout=5.0,
+            )
+        else:
+            await sb_rpc(
+                "person_memory_upsert",
+                {
+                    "p_client_id": client_id,
+                    "p_phone": phone,
+                    "p_core": data.get("core_identity", ""),
+                    "p_short": data.get("short_term_context", ""),
+                    "p_long": data.get("long_term_context", ""),
+                    "p_channel": "voice",
+                },
+                timeout=5.0,
+            )
         log.info("[archivist] memory saved for %s", clean_phone)
     except Exception as exc:
         log.error("[archivist] memory save failed: %s", exc)
@@ -1243,7 +1262,7 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
     # Один звонок с мусорным ASR прописал клиенту english, и следующий звонок
     # бот начал по-английски. Пишем только имя.
     learned_name = str(data.get("client_name") or "").strip()
-    if learned_name:
+    if learned_name and not web_id:
         await ensure_end_client(client_id, phone, learned_name, "")
 
     if not N8N_BASE_URL:
@@ -1251,6 +1270,7 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
     payload = {
         "client_id": client_id,
         "project_id": project_id,
+        "web_id": web_id,
         "end_client_name": client_name,
         "end_client_phone": phone,
         "status": call_status,
@@ -1267,7 +1287,7 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
         ),
         "audio_url": audio_url,
         "system_instructions_length": sys_length,
-        "platform": "gsm_voice",
+        "platform": platform,
         "direction": direction,
         # Расход звонка идёт тем же вебхуком — n8n пишет его в call_logs,
         # отдельная таблица не нужна.
@@ -2178,6 +2198,554 @@ async def initiate_outbound_call(req: OutboundCallRequest, _: str = Depends(veri
             with contextlib.suppress(Exception):
                 await redis_client.delete(f"call_context:{call_uuid}")
         return {"status": "error", "message": str(exc)}
+
+# =============================================================================
+# WEB VOICE — голосовой виджет на сайте.
+# Тот же звонок, что и по GSM: персонаж, память, инструменты, архивариус,
+# подпись, биллинг. Отличается только транспорт (браузер) и ключ человека
+# (visitor_id из браузера вместо номера телефона).
+# Вставляется в main.py целиком, перед  @app.get("/api/persona/{client_id}/preview")
+# =============================================================================
+
+WEB_OUTPUT_SAMPLE_RATE = _env_int("WEB_OUTPUT_SAMPLE_RATE", 24000)  # виджет играет 24 кГц
+
+
+class WebAudioMixer:
+    """Сводит микрофон посетителя (16 кГц) и голос бота (24 кГц) в один WAV 24 кГц моно."""
+
+    def __init__(self, output_path: str) -> None:
+        self.output_path = output_path
+        self.target_rate = WEB_OUTPUT_SAMPLE_RATE
+        self._wav = None
+        self._ai_buffer = np.array([], dtype=np.int16)
+
+    def add_ai_audio(self, frame: OutputAudioRawFrame) -> None:
+        chunk = np.frombuffer(frame.audio, dtype=np.int16)
+        self._ai_buffer = np.concatenate((self._ai_buffer, chunk))
+
+    def add_user_audio(self, frame: InputAudioRawFrame) -> None:
+        self._init_wav()
+        user = np.frombuffer(frame.audio, dtype=np.int16)
+        if len(user) == 0:
+            return
+        n = int(len(user) * (self.target_rate / max(frame.sample_rate, 1)))
+        x = np.arange(len(user))
+        x_new = np.linspace(0, len(user) - 1, n)
+        user_rs = np.interp(x_new, x, user).astype(np.int16)
+
+        ai = np.zeros(n, dtype=np.int16)
+        if len(self._ai_buffer) > 0:
+            take = min(n, len(self._ai_buffer))
+            ai[:take] = self._ai_buffer[:take]
+            self._ai_buffer = self._ai_buffer[take:]
+
+        mixed = np.clip(user_rs.astype(np.int32) + ai.astype(np.int32), -32768, 32767).astype(np.int16)
+        self._wav.writeframes(mixed.tobytes())
+
+    def _init_wav(self) -> None:
+        if self._wav is None:
+            self._wav = wave.open(self.output_path, "wb")
+            self._wav.setnchannels(1)
+            self._wav.setsampwidth(2)
+            self._wav.setframerate(self.target_rate)
+
+    def close(self) -> None:
+        if self._wav and len(self._ai_buffer) > 0:
+            self._wav.writeframes(self._ai_buffer.tobytes())
+            self._ai_buffer = np.array([], dtype=np.int16)
+        if self._wav:
+            self._wav.close()
+            self._wav = None
+
+
+class WebUserAudioCatcher(FrameProcessor):
+    def __init__(self, mixer: WebAudioMixer) -> None:
+        super().__init__()
+        self.mixer = mixer
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame):
+            with contextlib.suppress(Exception):
+                self.mixer.add_user_audio(frame)
+        await self.push_frame(frame, direction)
+
+
+class WebAIAudioCatcher(FrameProcessor):
+    def __init__(self, mixer: WebAudioMixer) -> None:
+        super().__init__()
+        self.mixer = mixer
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, OutputAudioRawFrame):
+            with contextlib.suppress(Exception):
+                self.mixer.add_ai_audio(frame)
+        await self.push_frame(frame, direction)
+
+
+def _time_context_from(last_at: Any) -> str:
+    if not last_at:
+        return "first_time"
+    try:
+        last = dt.datetime.fromisoformat(str(last_at).replace("Z", "+00:00"))
+        delta = (dt.datetime.now(dt.timezone.utc) - last).total_seconds() / 60
+        return "very_recent" if delta < 15 else ("same_day" if delta < 1440 else "new_day")
+    except ValueError:
+        return "first_time"
+
+
+async def get_web_visitor_context(client_id: str, visitor_id: str) -> tuple[dict, dict, str]:
+    """Карточка и память посетителя по идентификатору браузера (person_memory_get_web)."""
+    contact: dict = {"found": False, "name": "", "lang": "", "phone": ""}
+    memory: dict = {"core": "", "short": "", "long": ""}
+    if not visitor_id:
+        return contact, memory, "first_time"
+    try:
+        rows = await sb_rpc(
+            "person_memory_get_web",
+            {"p_client_id": client_id, "p_web_id": visitor_id},
+            timeout=2.5,
+        )
+    except Exception as exc:
+        log.warning("web visitor lookup failed: %s", exc)
+        return contact, memory, "first_time"
+    if not rows:
+        return contact, memory, "first_time"
+    rec = rows[0]
+    contact = {
+        "found": bool(rec.get("end_client_id")),
+        "name": rec.get("name") or "",
+        "lang": rec.get("language") or "",
+        "phone": rec.get("phone") or "",
+    }
+    memory = {
+        "core": rec.get("core_identity") or "",
+        "short": rec.get("short_term_context") or "",
+        "long": rec.get("long_term_context") or "",
+    }
+    return contact, memory, _time_context_from(rec.get("last_interaction_at"))
+
+
+@app.websocket("/ws")
+async def web_voice_endpoint(
+    websocket: WebSocket,
+    client_id: str = Query(None),
+    project_id: str = Query(""),
+    visitor_id: str = Query(""),
+) -> None:
+    call_id = uuid.uuid4().hex[:8]
+    clog = logging.LoggerAdapter(log, {})
+    clog.info("[%s] incoming WEB voice session client=%s visitor=%s", call_id, client_id, visitor_id[:12])
+
+    if not client_id:
+        await websocket.close(code=1008, reason="Missing client_id")
+        return
+    visitor_id = re.sub(r"[^A-Za-z0-9_\-]", "", visitor_id or "")[:64]
+
+    if _call_semaphore.locked():
+        clog.warning("[%s] concurrency limit reached, rejecting web session", call_id)
+        await websocket.close(code=1013, reason="Busy")
+        return
+
+    context: Optional[LLMContext] = None
+    usage = UsageAggregator()
+    activity: ActivityProbe | None = None
+    counted_client: Optional[str] = None
+    system_prompt_tokens = 0
+    system_instructions_length = 0
+    started_at = dt.datetime.now(dt.timezone.utc)
+    start_ts = time.time()
+    tz_name = DEFAULT_TZ
+    client_name = "client"
+    is_known_caller = False
+    learned_phone = ""
+    caller_memory: dict = {"core": "", "short": "", "long": ""}
+    wav_path = f"/tmp/web_{call_id}.wav"
+    mixer = WebAudioMixer(wav_path)
+
+    async with _call_semaphore:
+        try:
+            client_data, persona_row = await asyncio.gather(
+                get_client_data(client_id), get_persona_row(client_id)
+            )
+            if not client_data:
+                clog.warning("[%s] client %s not found", call_id, client_id)
+                await websocket.close(code=1008, reason="Client not found")
+                return
+
+            status = str(client_data.get("subscription_status_assistent", "")).strip().lower()
+            if status in ("false", "0", "none", "null", "inactive", "expired", ""):
+                clog.info("[%s] subscription inactive for %s", call_id, client_id)
+                await websocket.close(code=1008, reason="Subscription inactive")
+                return
+
+            if _calls_per_client.get(client_id, 0) >= MAX_CALLS_PER_CLIENT:
+                clog.warning("[%s] per-client limit hit for %s", call_id, client_id)
+                await websocket.close(code=1013, reason="Busy")
+                return
+            _calls_per_client[client_id] = _calls_per_client.get(client_id, 0) + 1
+            counted_client = client_id
+
+            if not project_id:
+                with contextlib.suppress(Exception):
+                    rows = await sb_select(
+                        "saas_projects",
+                        {"client_id": f"eq.{client_id}", "select": "id", "limit": "1"},
+                        timeout=2.5,
+                    )
+                    if rows:
+                        project_id = str(rows[0].get("id") or "")
+
+            persona = Persona.from_row(persona_row)
+            contact, caller_memory, time_context = await get_web_visitor_context(client_id, visitor_id)
+
+            tz_name = client_data.get("timezone") or DEFAULT_TZ
+            hours = parse_working_hours(client_data.get("working_hours"))
+            now = dt.datetime.now(tz_for(tz_name))
+
+            client_name = (contact.get("name") or "").strip()
+            call_lang = contact.get("lang") or persona.language or DEFAULT_LANG
+            is_known_caller = bool(client_name)
+            if not is_known_caller:
+                client_name = "client"
+            known_phone = contact.get("phone") or ""
+
+            system_prompt = build_system_prompt(
+                client_data,
+                persona,
+                caller_memory,
+                call_lang,
+                now,
+                hours,
+                caller_phone=known_phone or "Necunoscut",
+                caller_name=client_name if is_known_caller else "",
+            )
+            system_prompt += (
+                "\n\nCHANNEL: this is a voice chat from the company's WEBSITE, not a phone call. "
+                "You do not know the visitor's phone number unless it is stated above or the visitor gives it. "
+                "To hand over to a manager or to book, ask for a phone number and use save_lead."
+            )
+            _, readable_hours = office_state(hours, now)
+            tools = [{"function_declarations": build_tools(client_data, readable_hours)}]
+            full_system_text = system_prompt + json.dumps(tools, ensure_ascii=False)
+            system_instructions_length = len(full_system_text)
+            system_prompt_tokens = estimate_tokens(full_system_text)
+
+            clog.info(
+                "[%s] WEB client=%s persona=%s lang=%s visitor=%s caller=%s memory=%s sys=%d tok",
+                call_id, client_id, persona.persona_name, call_lang, visitor_id[:12],
+                client_name if is_known_caller else "unknown",
+                "yes" if any(caller_memory.values()) else "no",
+                system_prompt_tokens,
+            )
+
+            await websocket.accept()
+            # Инструменты GSM глушат микрофон через socket.is_muted; для браузера это не нужно,
+            # но атрибут должен существовать.
+            websocket.is_muted = False  # type: ignore[attr-defined]
+            socket = websocket
+
+            transport = FastAPIWebsocketTransport(
+                websocket=websocket,
+                params=FastAPIWebsocketParams(
+                    audio_in_enabled=True,
+                    audio_out_enabled=True,
+                    audio_out_sample_rate=WEB_OUTPUT_SAMPLE_RATE,
+                    add_wav_header=False,
+                    serializer=RawPCMFrameSerializer(),
+                ),
+            )
+
+            context = LLMContext(messages=[])
+            context_aggregator = LLMContextAggregatorPair(
+                context=context,
+                realtime_service_mode=True,
+                user_params=LLMUserAggregatorParams(
+                    user_turn_strategies=ExternalUserTurnStrategies()
+                ),
+            )
+
+            llm = GeminiLiveLLMService(
+                api_key=GEMINI_API_KEY,
+                tools=tools,
+                settings=GeminiLiveLLMService.Settings(
+                    model=GEMINI_MODEL,
+                    voice=persona.voice_model,
+                    system_instruction=system_prompt,
+                    vad=build_vad_params(),
+                ),
+            )
+
+            task: Optional[PipelineTask] = None
+            saved_lead_hashes: set[str] = set()
+            tg_chat = client_data.get("tg_chat_id_notify")
+            company = client_data.get("company_name") or "Companie"
+
+            async def call_n8n(path: str, params: dict, arguments: dict, timeout: float):
+                url = f"{N8N_BASE_URL}/{path}"
+                resp = await http().post(url, params=params, json=arguments, timeout=timeout)
+                resp.raise_for_status()
+                return resp.json()
+
+            async def process_save_lead(fn: FunctionCallParams):
+                nonlocal learned_phone
+                phone_arg = str(fn.arguments.get("client_phone") or "").strip()
+                if phone_arg:
+                    learned_phone = phone_arg
+                elif known_phone:
+                    fn.arguments["client_phone"] = known_phone
+                digest = hashlib.sha1(
+                    json.dumps(fn.arguments, sort_keys=True, ensure_ascii=False).encode()
+                ).hexdigest()
+                if digest in saved_lead_hashes:
+                    await fn.result_callback({"status": "success", "message": "Deja salvat."})
+                    return
+                try:
+                    result = await call_n8n(
+                        "save_lead",
+                        {"client_id": client_id, "tg_chat_id": tg_chat or ""},
+                        fn.arguments,
+                        5.0,
+                    )
+                    saved_lead_hashes.add(digest)
+                    await fn.result_callback(result)
+                except asyncio.CancelledError:
+                    with contextlib.suppress(Exception):
+                        await fn.result_callback({"status": "cancelled"})
+                    raise
+                except Exception as exc:
+                    await send_tg_alert(
+                        tg_chat,
+                        f"⚠️ <b>Eroare API (save_lead)</b>\n🏢 {company}\n🔧 <code>{exc}</code>",
+                    )
+                    await fn.result_callback({"error": f"Eroare CRM: {exc}"})
+
+            async def process_booking(fn: FunctionCallParams):
+                nonlocal learned_phone
+                phone_arg = str(fn.arguments.get("phone") or "").strip()
+                if phone_arg:
+                    learned_phone = phone_arg
+                try:
+                    result = await call_n8n(
+                        "booking",
+                        {
+                            "client_id": client_id,
+                            "google_calendar_id": client_data.get("google_calendar_id") or "",
+                        },
+                        fn.arguments,
+                        10.0,
+                    )
+                    await fn.result_callback(result)
+                except asyncio.CancelledError:
+                    with contextlib.suppress(Exception):
+                        await fn.result_callback({"status": "cancelled"})
+                    raise
+                except Exception as exc:
+                    await send_tg_alert(
+                        tg_chat,
+                        f"⚠️ <b>Eroare API (Booking_tool)</b>\n🏢 {company}\n🔧 <code>{exc}</code>",
+                    )
+                    await fn.result_callback({"status": "error", "message": str(exc)})
+
+            async def process_sms(fn: FunctionCallParams):
+                try:
+                    await call_n8n("send_sms", {"client_id": client_id}, fn.arguments, 5.0)
+                    await fn.result_callback({"status": "success", "message": "SMS trimis"})
+                except asyncio.CancelledError:
+                    with contextlib.suppress(Exception):
+                        await fn.result_callback({"status": "cancelled"})
+                    raise
+                except Exception as exc:
+                    await send_tg_alert(
+                        tg_chat,
+                        f"⚠️ <b>Eroare API (send_sms)</b>\n🏢 {company}\n🔧 <code>{exc}</code>",
+                    )
+                    await fn.result_callback({"status": "error", "message": str(exc)})
+
+            async def process_end_call(fn: FunctionCallParams):
+                elapsed = time.time() - start_ts
+                if elapsed < MIN_SECONDS_BEFORE_END_CALL:
+                    await fn.result_callback(
+                        {
+                            "status": "rejected",
+                            "message": (
+                                "Nu închide acum. Clientul nu și-a luat rămas-bun clar. "
+                                "Cere-i să repete și continuă conversația."
+                            ),
+                        }
+                    )
+                    return
+                await fn.result_callback({"status": "success", "message": "Call ended"})
+
+                async def delayed_end():
+                    await asyncio.sleep(3.5)
+                    if task:
+                        await task.queue_frames([CancelFrame()])
+
+                asyncio.create_task(delayed_end())
+
+            llm.register_function("save_lead", process_save_lead)
+            llm.register_function("send_sms", process_sms)
+            llm.register_function("end_call", process_end_call)
+            if client_data.get("google_calendar_id"):
+                llm.register_function("Booking_tool", process_booking)
+
+            recovery = InterruptionRecoveryProcessor(context, delay=RECOVERY_DELAY_S)
+            activity = ActivityProbe()
+            user_catcher = WebUserAudioCatcher(mixer)
+            ai_catcher = WebAIAudioCatcher(mixer)
+
+            pipeline = Pipeline(
+                [
+                    transport.input(),
+                    user_catcher,
+                    context_aggregator.user(),
+                    llm,
+                    usage,
+                    recovery,
+                    activity,
+                    ai_catcher,
+                    transport.output(),
+                    context_aggregator.assistant(),
+                ]
+            )
+
+            task = PipelineTask(
+                pipeline,
+                params=PipelineParams(
+                    allow_interruptions=True,
+                    idle_timeout=IDLE_TIMEOUT_SECONDS,
+                    enable_metrics=True,
+                    enable_usage_metrics=True,
+                ),
+            )
+            recovery.task = task
+
+            lang_names = {"ro": "РУМЫНСКОМ", "ru": "РУССКОМ", "en": "АНГЛИЙСКОМ"}
+            lang_word = lang_names.get(call_lang, call_lang.upper())
+            who = client_name if is_known_caller else "посетитель сайта"
+            name_rule = (
+                f"Обращайся к нему по имени ({client_name}) один раз в начале."
+                if is_known_caller
+                else "Имени ты не знаешь. Спроси, как обращаться, в первой-второй "
+                "реплике, один раз, дальше — по имени. НИКОГДА не выдумывай имя."
+            )
+            lang_rule = (
+                f"ПЕРВАЯ ЖЕ ТВОЯ ФРАЗА ДОЛЖНА БЫТЬ НА {lang_word} ЯЗЫКЕ. "
+                "Это указание написано по-русски, но отвечать на нём НЕ НАДО."
+            )
+            notice_rule = "В первой фразе коротко предупреди, что разговор может записываться."
+
+            if time_context == "very_recent":
+                greeting = (
+                    f"SYSTEM EVENT: {who} вернулся в голосовой чат на сайте спустя пару минут. "
+                    f"Не здоровайся заново. {lang_rule} {name_rule} Продолжай суть."
+                )
+            elif time_context == "same_day":
+                greeting = (
+                    f"SYSTEM EVENT: {who} открыл голосовой чат на сайте повторно за сегодня. "
+                    f"{lang_rule} {name_rule} Опирайся на память RECENT. Веди разговор сам, согласно портрету."
+                )
+            else:
+                greeting = (
+                    f"SYSTEM EVENT: {who} открыл голосовой чат на сайте компании. {lang_rule} "
+                    f"{notice_rule} {name_rule} Начни диалог согласно портрету. "
+                    "Если есть память RECENT, не переспрашивай известное."
+                )
+
+            context.add_message({"role": "user", "content": greeting})
+            await task.queue_frames([LLMRunFrame()])
+
+            runner = PipelineRunner()
+            dead_air = asyncio.create_task(dead_air_watchdog(call_id, activity, task))
+            try:
+                await asyncio.wait_for(runner.run(task), timeout=MAX_CALL_SECONDS)
+            except asyncio.TimeoutError:
+                clog.warning("[%s] max call duration reached, terminating", call_id)
+                with contextlib.suppress(Exception):
+                    await task.queue_frames([CancelFrame()])
+            finally:
+                dead_air.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await dead_air
+
+        except (WebSocketDisconnect, ConnectionResetError, asyncio.TimeoutError) as exc:
+            clog.info("[%s] web session closed: %s", call_id, type(exc).__name__)
+        except Exception as exc:
+            clog.exception("[%s] web session failed: %s", call_id, exc)
+        finally:
+            if counted_client:
+                _calls_per_client[counted_client] = max(
+                    0, _calls_per_client.get(counted_client, 1) - 1
+                )
+                if _calls_per_client[counted_client] == 0:
+                    _calls_per_client.pop(counted_client, None)
+
+            with contextlib.suppress(Exception):
+                mixer.close()
+            with contextlib.suppress(Exception):
+                if websocket.client_state == WebSocketState.CONNECTED:
+                    await websocket.close()
+
+            last_ts = activity.last_activity_ts if activity else time.time()
+            duration = int(max(0.0, last_ts - start_ts))
+            clog.info("[%s] web session finished, %ss, turns=%s", call_id, duration, usage.turns)
+
+            if context is not None and client_id:
+                transcript, user_replies = build_transcript(context.messages)
+                if transcript:
+                    clog.info("[%s] ДИАЛОГ:\n%s", call_id, transcript)
+                text_in, audio_in, cost = usage.cost(system_prompt_tokens)
+                usage_stats = {
+                    "started_at": started_at.isoformat(),
+                    "ended_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "duration_seconds": duration,
+                    "turns": usage.turns,
+                    "input_tokens": usage.prompt_tokens,
+                    "output_tokens": usage.completion_tokens,
+                    "total_cost_usd": round(cost, 6),
+                }
+
+                async def post_processing() -> None:
+                    await asyncio.sleep(0.5)
+                    try:
+                        if user_replies == 0:
+                            call_status, audio_url = "inbound_dropped", ""
+                        else:
+                            call_status = "completed"
+                            audio_url = await upload_audio_to_supabase(client_id, wav_path) or ""
+                        await run_archivist_and_notify_n8n(
+                            client_id,
+                            learned_phone or known_phone,
+                            client_name,
+                            caller_memory,
+                            transcript,
+                            audio_url,
+                            system_instructions_length,
+                            "inbound",
+                            call_status,
+                            tz_name,
+                            usage_stats,
+                            audio_path=wav_path,
+                            project_id=project_id or "",
+                            web_id=visitor_id,
+                            platform="web_voice",
+                        )
+                    except Exception as exc:
+                        log.error("[%s] web post-processing failed: %s", call_id, exc)
+                    finally:
+                        with contextlib.suppress(Exception):
+                            if await asyncio.to_thread(os.path.exists, wav_path):
+                                await asyncio.to_thread(os.remove, wav_path)
+                        gc.collect()
+
+                asyncio.create_task(post_processing())
+            else:
+                with contextlib.suppress(Exception):
+                    if os.path.exists(wav_path):
+                        os.remove(wav_path)
+                gc.collect()
 
 
 @app.get("/api/persona/{client_id}/preview")
