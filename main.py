@@ -2637,6 +2637,15 @@ async def web_voice_endpoint(
             )
             recovery.task = task
 
+            # Браузер закрыл соединение (кнопка «стоп», закрытая вкладка) — завершаем сразу,
+            # не дожидаясь сторожа мёртвого эфира.
+            @transport.event_handler("on_client_disconnected")
+            async def _on_web_client_disconnected(_transport, _client):
+                clog.info("[%s] browser closed the connection", call_id)
+                if task:
+                    with contextlib.suppress(Exception):
+                        await task.queue_frames([CancelFrame()])
+
             lang_names = {"ro": "РУМЫНСКОМ", "ru": "РУССКОМ", "en": "АНГЛИЙСКОМ"}
             lang_word = lang_names.get(call_lang, call_lang.upper())
             who = client_name if is_known_caller else "посетитель сайта"
