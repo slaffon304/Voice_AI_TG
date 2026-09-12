@@ -807,7 +807,7 @@ async def get_client_data(client_id: str) -> dict | None:
                 "subscription_status_assistent,system_message,timezone,working_hours,"
                 "crm_provider,crm_config,"
                 "saas_projects(tg_chat_id_notify,google_calendar_id,"
-                "project_name,business_context,bot_goal,bot_tone)"
+                "project_name,business_context,bot_goal,tone)"
             ),
         },
     )
@@ -826,7 +826,7 @@ async def get_client_data(client_id: str) -> dict | None:
         ("project_name", "company_name"),
         ("business_context", "business_context"),
         ("bot_goal", "bot_goal"),
-        ("bot_tone", "tone"),
+        ("tone", "tone"),
     ):
         valoare = (first.get(cheie_proiect) or "").strip()
         if valoare:
