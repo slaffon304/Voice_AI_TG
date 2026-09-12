@@ -803,7 +803,7 @@ async def get_client_data(client_id: str) -> dict | None:
         {
             "id": f"eq.{client_id}",
             "select": (
-                "company_name,business_context,tone,bot_goal,"
+                "company_name,"
                 "subscription_status_assistent,system_message,timezone,working_hours,"
                 "crm_provider,crm_config,"
                 "saas_projects(tg_chat_id_notify,google_calendar_id,"
