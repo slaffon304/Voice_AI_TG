@@ -806,7 +806,8 @@ async def get_client_data(client_id: str) -> dict | None:
                 "company_name,business_context,tone,bot_goal,"
                 "subscription_status_assistent,system_message,timezone,working_hours,"
                 "crm_provider,crm_config,"
-                "saas_projects(tg_chat_id_notify,google_calendar_id)"
+                "saas_projects(tg_chat_id_notify,google_calendar_id,"
+                "project_name,business_context,bot_goal,bot_tone)"
             ),
         },
     )
@@ -817,6 +818,20 @@ async def get_client_data(client_id: str) -> dict | None:
     first = projects[0] if projects else {}
     rec["tg_chat_id_notify"] = first.get("tg_chat_id_notify")
     rec["google_calendar_id"] = first.get("google_calendar_id")
+
+    # Что знает компания и как ведёт себя робот — это данные проекта.
+    # На клиенте остались старые копии; они отстают от базы знаний,
+    # которую клиент правит в дашборде.
+    for cheie_proiect, cheie_client in (
+        ("project_name", "company_name"),
+        ("business_context", "business_context"),
+        ("bot_goal", "bot_goal"),
+        ("bot_tone", "tone"),
+    ):
+        valoare = (first.get(cheie_proiect) or "").strip()
+        if valoare:
+            rec[cheie_client] = valoare
+
     return rec
 
 
