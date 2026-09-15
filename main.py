@@ -64,6 +64,7 @@ from pipecat.frames.frames import (
     MetricsFrame,
     OutputAudioRawFrame,
     TranscriptionFrame,
+    TTSSpeakFrame,
     InterimTranscriptionFrame,
     UserStartedSpeakingFrame,
 )
@@ -2518,6 +2519,18 @@ async def web_voice_endpoint(
                 resp.raise_for_status()
                 return resp.json()
 
+            # Инструменты работают до десяти секунд. Без предупреждения
+            # человек слышит тишину, говорит «алё» и обрывает вызов.
+            async def spune_ca_lucram() -> None:
+                fraze = {
+                    "ru": "Секунду, проверяю.",
+                    "en": "One moment, let me check.",
+                }
+
+                await task.queue_frames([
+                    TTSSpeakFrame(fraze.get(lang, "O secundă, verific.")),
+                ])
+
             async def process_save_lead(fn: FunctionCallParams):
                 nonlocal learned_phone
                 phone_arg = str(fn.arguments.get("client_phone") or "").strip()
@@ -2556,6 +2569,7 @@ async def web_voice_endpoint(
                 phone_arg = str(fn.arguments.get("phone") or "").strip()
                 if phone_arg:
                     learned_phone = phone_arg
+                await spune_ca_lucram()
                 try:
                     result = await call_n8n(
                         "booking",
@@ -3013,6 +3027,7 @@ async def handle_asterisk_conn(
                 return resp.json()
 
             async def process_save_lead(fn: FunctionCallParams):
+                await spune_ca_lucram()
                 # Номер звонящего известен серверу. Модель указывает его только
                 # если клиент просит связаться по ДРУГОМУ номеру.
                 if not str(fn.arguments.get("client_phone") or "").strip():
@@ -3048,6 +3063,7 @@ async def handle_asterisk_conn(
                     socket.is_muted = False
 
             async def process_booking(fn: FunctionCallParams):
+                await spune_ca_lucram()
                 socket.is_muted = True
                 try:
                     result = await call_n8n(
