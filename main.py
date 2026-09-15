@@ -2528,7 +2528,7 @@ async def web_voice_endpoint(
                 }
 
                 await task.queue_frames([
-                    TTSSpeakFrame(fraze.get(lang, "O secundă, verific.")),
+                    TTSSpeakFrame(fraze.get(call_lang, "O secundă, verific.")),
                 ])
 
             async def process_save_lead(fn: FunctionCallParams):
