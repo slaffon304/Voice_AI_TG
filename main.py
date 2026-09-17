@@ -131,6 +131,8 @@ AUDIOSOCKET_PORT = _env_int("AUDIOSOCKET_PORT", 8085)
 
 N8N_BASE_URL = (os.getenv("N8N_BASE_URL") or "").rstrip("/")
 N8N_WEBHOOK_SECRET = os.getenv("N8N_WEBHOOK_SECRET", "")
+# Пропуск Cloudflare: пусто — проверка не делается, и виджет работает как раньше.
+TURNSTILE_SECRET_KEY = os.getenv("TURNSTILE_SECRET_KEY", "")
 KOMMO_SUBDOMAIN = os.getenv("KOMMO_SUBDOMAIN")
 KOMMO_ACCESS_TOKEN = os.getenv("KOMMO_ACCESS_TOKEN")
 
@@ -2385,6 +2387,34 @@ async def get_web_visitor_context(client_id: str, visitor_id: str) -> tuple[dict
     return contact, memory, _time_context_from(rec.get("last_interaction_at"))
 
 
+async def _propusk_valabil(token: str, ip: str) -> bool:
+    """Пропуск Cloudflare — настоящий?
+
+    Скрипт, который подключается напрямую, такой пропуск получить не
+    может: его выдаёт браузер после проверки. Без ключа в настройках
+    проверка не делается вовсе.
+    """
+    if not TURNSTILE_SECRET_KEY:
+        return True
+
+    if not token:
+        return False
+
+    try:
+        resp = await http().post(
+            "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            data={"secret": TURNSTILE_SECRET_KEY, "response": token, "remoteip": ip},
+            timeout=5.0,
+        )
+
+        return bool(resp.json().get("success"))
+    except Exception as exc:
+        # Cloudflare не ответил — не запираем живых людей из-за чужого сбоя.
+        log.warning("turnstile nu raspunde: %s", exc)
+
+        return True
+
+
 async def _este_blocat(visitor_id: str, ip: str) -> bool:
     """Метка браузера или адрес лежат в чёрном списке?
 
@@ -2505,6 +2535,7 @@ async def web_voice_endpoint(
     websocket: WebSocket,
     key: str = Query(""),
     visitor_id: str = Query(""),
+    t: str = Query(""),
 ) -> None:
     call_id = uuid.uuid4().hex[:8]
     clog = logging.LoggerAdapter(log, {})
@@ -2579,6 +2610,11 @@ async def web_voice_endpoint(
     if await _este_blocat(visitor_id, ip):
         clog.warning("[%s] blocat: visitor=%s ip=%s", call_id, visitor_id[:12], ip)
         await websocket.close(code=1008, reason="Blocked")
+        return
+
+    if not await _propusk_valabil(t, ip):
+        clog.warning("[%s] propusk invalid de la %s", call_id, ip)
+        await websocket.close(code=1008, reason="Verification failed")
         return
 
     depasit = await _peste_limita(visitor_id, ip)
