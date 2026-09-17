@@ -795,6 +795,27 @@ async def sb_select(table: str, params: dict[str, str], timeout: float = 5.0) ->
         return []
 
 
+async def sb_insert(table: str, row: dict, timeout: float = 5.0) -> bool:
+    """Запись строки в таблицу. Нужна для чёрного списка."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return False
+
+    try:
+        resp = await http().post(
+            f"{SUPABASE_URL}/rest/v1/{table}",
+            headers={**sb_headers(), "Content-Type": "application/json"},
+            json=row,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+
+        return True
+    except Exception as exc:
+        log.warning("supabase insert %s failed: %s", table, exc)
+
+        return False
+
+
 async def sb_rpc(fn: str, payload: dict, timeout: float = 5.0) -> Any:
     """Вызов SQL-функции через PostgREST. Нужен там, где фильтр — выражение."""
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -1983,9 +2004,15 @@ def build_tools(client_data: dict, readable_hours: str) -> list[dict]:
             "description": (
                 "Încheie apelul. Folosește DOAR după ce clientul și-a luat rămas-bun clar "
                 "și fără echivoc. Dacă nu ai înțeles ce a spus, cere-i să repete — "
-                "NU închide. OBLIGATORIU: spune o scurtă frază de rămas-bun înainte."
+                "NU închide. OBLIGATORIU: spune o scurtă frază de rămas-bun înainte. "
+                "Pune reason='abuse' doar când închizi din cauza insistenței pe teme "
+                "interzise, după al treilea refuz. În rest lasă reason gol."
             ),
-            "parameters": {"type": "object", "properties": {}, "required": []},
+            "parameters": {
+                "type": "object",
+                "properties": {"reason": {"type": "string"}},
+                "required": [],
+            },
         },
     ]
     if client_data.get("google_calendar_id"):
@@ -2358,6 +2385,62 @@ async def get_web_visitor_context(client_id: str, visitor_id: str) -> tuple[dict
     return contact, memory, _time_context_from(rec.get("last_interaction_at"))
 
 
+async def _este_blocat(visitor_id: str, ip: str) -> bool:
+    """Метка браузера или адрес лежат в чёрном списке?
+
+    Проверяем до всего остального: кто заблокирован, до модели и до
+    расходов не доходит вовсе.
+    """
+    conditii = []
+
+    if visitor_id:
+        conditii.append(f"visitor_id.eq.{visitor_id}")
+
+    if ip:
+        conditii.append(f"ip.eq.{ip}")
+
+    if not conditii:
+        return False
+
+    randuri = await sb_select(
+        "voice_blocklist",
+        {"or": "(" + ",".join(conditii) + ")", "select": "until", "limit": "5"},
+        timeout=2.0,
+    )
+
+    acum = dt.datetime.now(dt.timezone.utc)
+
+    for rand in randuri:
+        pana = rand.get("until")
+
+        if not pana:
+            return True
+
+        with contextlib.suppress(Exception):
+            if dt.datetime.fromisoformat(str(pana).replace("Z", "+00:00")) > acum:
+                return True
+
+    return False
+
+
+async def _blocheaza(client_id: str, visitor_id: str, ip: str, motiv: str) -> None:
+    """Заносит метку браузера и адрес в чёрный список — оба сразу.
+
+    Метка ловит того, кто вернётся из того же браузера; адрес — того,
+    кто откроет окно инкогнито или другой браузер на том же устройстве.
+    """
+    await sb_insert(
+        "voice_blocklist",
+        {
+            "client_id": client_id or None,
+            "visitor_id": visitor_id or None,
+            "ip": ip or None,
+            "reason": motiv,
+        },
+    )
+    log.warning("blocat: visitor=%s ip=%s motiv=%s", visitor_id[:12], ip, motiv)
+
+
 async def _peste_limita(visitor_id: str, ip: str) -> str:
     """Проверяет и увеличивает суточные счётчики звонков с сайта.
 
@@ -2493,6 +2576,11 @@ async def web_voice_endpoint(
 
     # Счётчики живут в Redis, а не в памяти бота: иначе любой перезапуск
     # обнуляет их, и достаточно дождаться выката, чтобы начать заново.
+    if await _este_blocat(visitor_id, ip):
+        clog.warning("[%s] blocat: visitor=%s ip=%s", call_id, visitor_id[:12], ip)
+        await websocket.close(code=1008, reason="Blocked")
+        return
+
     depasit = await _peste_limita(visitor_id, ip)
 
     if depasit:
@@ -2761,7 +2849,16 @@ async def web_voice_endpoint(
 
             async def process_end_call(fn: FunctionCallParams):
                 elapsed = time.time() - start_ts
-                if elapsed < MIN_SECONDS_BEFORE_END_CALL:
+                abuz = str(fn.arguments.get("reason") or "").strip().lower() == "abuse"
+
+                if abuz:
+                    # Marca browserului și adresa merg amândouă în lista neagră:
+                    # una îl prinde în același browser, cealaltă în incognito.
+                    await _blocheaza(client_id, visitor_id, visitor_meta["visitor_ip"], "abuse")
+
+                # Praga de douăzeci și cinci de secunde apără de închideri din
+                # transcript greșit. La abuz nu se aplică: acolo închidem intenționat.
+                if elapsed < MIN_SECONDS_BEFORE_END_CALL and not abuz:
                     await fn.result_callback(
                         {
                             "status": "rejected",
