@@ -200,7 +200,11 @@ MAX_CALL_SECONDS = _env_int("MAX_CALL_SECONDS", 900)
 WEB_MAX_CALL_SECONDS = _env_int("WEB_MAX_CALL_SECONDS", 180)
 WEB_MAX_CALLS_PER_VISITOR = _env_int("WEB_MAX_CALLS_PER_VISITOR", 3)
 WEB_MAX_MINUTES_PER_DAY = _env_int("WEB_MAX_MINUTES_PER_DAY", 60)
+# Метка посетителя живёт в браузере: в окне инкогнито она всегда новая, и
+# счётчик обнуляется. Адрес при этом остаётся прежним, поэтому считаем и по нему.
+WEB_MAX_CALLS_PER_IP = _env_int("WEB_MAX_CALLS_PER_IP", 6)
 _web_visitor_calls: dict[str, tuple[str, int]] = {}
+_web_ip_calls: dict[str, tuple[str, int]] = {}
 # Раньше этого не было: бот принял мусорную расшифровку за прощание и положил
 # трубку на 40-й секунде. Ниже этого порога end_call игнорируется.
 MIN_SECONDS_BEFORE_END_CALL = _env_int("MIN_SECONDS_BEFORE_END_CALL", 25)
@@ -2355,6 +2359,19 @@ async def get_web_visitor_context(client_id: str, visitor_id: str) -> tuple[dict
     return contact, memory, _time_context_from(rec.get("last_interaction_at"))
 
 
+async def refuza_politicos(websocket: WebSocket, motiv: str) -> None:
+    """Отказ, который виджет может показать человеку.
+
+    Если закрыть соединение до того, как оно установлено, браузер причину не
+    получит и напишет «ошибка сети». Поэтому принимаем, называем причину и
+    закрываем.
+    """
+    with contextlib.suppress(Exception):
+        await websocket.accept()
+        await websocket.send_json({"type": "refused", "reason": motiv})
+        await websocket.close(code=1000)
+
+
 @app.websocket("/ws")
 async def web_voice_endpoint(
     websocket: WebSocket,
@@ -2433,9 +2450,20 @@ async def web_voice_endpoint(
         seen_count = 0
     if visitor_id and seen_count >= WEB_MAX_CALLS_PER_VISITOR:
         clog.warning("[%s] visitor %s over daily call limit", call_id, visitor_id[:12])
-        await websocket.close(code=1008, reason="Daily limit reached")
+        await refuza_politicos(websocket, "daily_limit")
         return
+
+    ip = visitor_meta["visitor_ip"]
+    ip_day, ip_count = _web_ip_calls.get(ip, (today, 0))
+    if ip_day != today:
+        ip_count = 0
+    if ip and ip_count >= WEB_MAX_CALLS_PER_IP:
+        clog.warning("[%s] ip %s over daily call limit", call_id, ip)
+        await refuza_politicos(websocket, "daily_limit")
+        return
+
     _web_visitor_calls[visitor_id] = (today, seen_count + 1)
+    _web_ip_calls[ip] = (today, ip_count + 1)
 
     if _call_semaphore.locked():
         clog.warning("[%s] concurrency limit reached, rejecting web session", call_id)
@@ -2481,7 +2509,7 @@ async def web_voice_endpoint(
                     web_status = str(prow[0].get("web_subs_status") or "").strip().lower()
             if web_status not in ("active", "trial"):
                 clog.info("[%s] web channel inactive (status=%r) for project %s", call_id, web_status, project_id)
-                await websocket.close(code=1008, reason="Subscription inactive")
+                await refuza_politicos(websocket, "channel_off")
                 return
 
             # Потолок на весь сайт за сутки. Его не обойти сменой опознавателя.
@@ -2504,7 +2532,7 @@ async def web_voice_endpoint(
                 used = sum(int(r.get("duration_seconds") or 0) for r in used_rows)
                 if used >= WEB_MAX_MINUTES_PER_DAY * 60:
                     clog.warning("[%s] daily web budget spent for %s", call_id, client_id)
-                    await websocket.close(code=1008, reason="Daily limit reached")
+                    await refuza_politicos(websocket, "daily_limit")
                     return
             except Exception as exc:
                 clog.warning("[%s] daily budget check failed: %s", call_id, exc)
