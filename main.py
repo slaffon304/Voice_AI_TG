@@ -1575,6 +1575,50 @@ class ActivityProbe(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class AbuseProbe(FrameProcessor):
+    """Ловит того, кто зачитывает список вопросов, а не разговаривает.
+
+    Скрипт выдаёт себя двумя вещами: шлёт реплики, не дожидаясь ответа, и
+    повторяет одно и то же разными словами. Человек так не говорит.
+    """
+
+    # Сколько повторов терпим, прежде чем считать это неразговором.
+    PRAG_REPETARI = 3
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.replici: list[str] = []
+        self.repetari = 0
+
+    @staticmethod
+    def _cheie(text: str) -> str:
+        """Реплика без мелочей: только значимые слова, по алфавиту."""
+        cuvinte = re.findall(r"\w+", text.lower())
+
+        return " ".join(sorted(c for c in cuvinte if len(c) > 3))
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame):
+            text = (getattr(frame, "text", "") or "").strip()
+
+            if len(text) > 40:
+                cheie = self._cheie(text)
+
+                # Совпадение по половине значимых слов — уже повтор.
+                for veche in self.replici:
+                    comune = set(cheie.split()) & set(veche.split())
+
+                    if comune and len(comune) >= len(set(cheie.split())) * 0.5:
+                        self.repetari += 1
+                        break
+
+                self.replici.append(cheie)
+
+        await self.push_frame(frame, direction)
+
+
 async def dead_air_watchdog(call_id: str, activity: "ActivityProbe", task: PipelineTask) -> None:
     """Раз в 5 с: если DEAD_AIR_SECONDS никто не говорил — завершаем звонок."""
     try:
@@ -2930,11 +2974,13 @@ async def web_voice_endpoint(
             activity = ActivityProbe()
             user_catcher = WebUserAudioCatcher(mixer)
             ai_catcher = WebAIAudioCatcher(mixer)
+            abuse = AbuseProbe()
 
             pipeline = Pipeline(
                 [
                     transport.input(),
                     user_catcher,
+                    abuse,
                     context_aggregator.user(),
                     llm,
                     usage,
