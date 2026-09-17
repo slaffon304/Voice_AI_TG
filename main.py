@@ -1173,6 +1173,7 @@ async def run_archivist_and_notify_n8n(
     project_id: str = "",
     web_id: str = "",
     platform: str = "gsm_voice",
+    visitor_meta: dict | None = None,
 ) -> None:
     if not chat_history.strip() or phone == "Necunoscut":
         return
@@ -1313,6 +1314,7 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
         "system_instructions_length": sys_length,
         "platform": platform,
         "direction": direction,
+        **(visitor_meta or {}),
         # Расход звонка идёт тем же вебхуком — n8n пишет его в call_logs,
         # отдельная таблица не нужна.
         **(usage_stats or {}),
@@ -2361,7 +2363,23 @@ async def web_voice_endpoint(
     clog = logging.LoggerAdapter(log, {})
     key = re.sub(r"[^A-Za-z0-9_\-]", "", key or "")[:64]
     visitor_id = re.sub(r"[^A-Za-z0-9_\-]", "", visitor_id or "")[:64]
-    clog.info("[%s] incoming WEB voice session key=%s visitor=%s", call_id, key[:12], visitor_id[:12])
+
+    # Прокси передаёт настоящий адрес посетителя в заголовке: в нём может быть
+    # цепочка адресов, первый — сам посетитель. Браузер представляется сам.
+    forwarded = (websocket.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    visitor_meta = {
+        "visitor_ip": forwarded or (websocket.client.host if websocket.client else ""),
+        "visitor_agent": (websocket.headers.get("user-agent") or "")[:300],
+    }
+    clog.info(
+        "[%s] incoming WEB voice session key=%s visitor=%s ip=%s origin=%s ua=%s",
+        call_id,
+        key[:12],
+        visitor_id[:12],
+        visitor_meta["visitor_ip"] or "-",
+        websocket.headers.get("origin") or "-",
+        visitor_meta["visitor_agent"][:60] or "-",
+    )
 
     if not key:
         await websocket.close(code=1008, reason="Missing widget key")
@@ -2846,6 +2864,7 @@ async def web_voice_endpoint(
                             project_id=project_id or "",
                             web_id=visitor_id,
                             platform="web_voice",
+                            visitor_meta=visitor_meta,
                         )
                     except Exception as exc:
                         log.error("[%s] web post-processing failed: %s", call_id, exc)
