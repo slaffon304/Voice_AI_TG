@@ -2514,11 +2514,16 @@ async def web_voice_endpoint(
 
             # Потолок на весь сайт за сутки. Его не обойти сменой опознавателя.
             try:
-                # Без «плюса» в конце: в адресе он означает пробел, и база
-                # такое время не принимает.
-                since = dt.datetime.now(dt.timezone.utc).replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                # Сутки считаем с пяти утра по местному времени, а не с
+                # полуночи: ночная атака иначе съедает весь рабочий день.
+                # Без «плюса» в конце: в адресе он означает пробел.
+                acum = dt.datetime.now(tz_for(DEFAULT_TZ))
+                start_zi = acum.replace(hour=5, minute=0, second=0, microsecond=0)
+
+                if acum < start_zi:
+                    start_zi -= dt.timedelta(days=1)
+
+                since = start_zi.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 used_rows = await sb_select(
                     "call_logs",
                     {
