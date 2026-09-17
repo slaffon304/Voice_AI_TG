@@ -2407,6 +2407,16 @@ async def web_voice_endpoint(
             await websocket.close(code=1008, reason="Origin not allowed")
             return
 
+    today = dt.date.today().isoformat()
+    seen_day, seen_count = _web_visitor_calls.get(visitor_id, (today, 0))
+    if seen_day != today:
+        seen_count = 0
+    if visitor_id and seen_count >= WEB_MAX_CALLS_PER_VISITOR:
+        clog.warning("[%s] visitor %s over daily call limit", call_id, visitor_id[:12])
+        await websocket.close(code=1008, reason="Daily limit reached")
+        return
+    _web_visitor_calls[visitor_id] = (today, seen_count + 1)
+
     if _call_semaphore.locked():
         clog.warning("[%s] concurrency limit reached, rejecting web session", call_id)
         await websocket.close(code=1013, reason="Busy")
