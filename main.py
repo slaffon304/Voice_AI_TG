@@ -193,6 +193,14 @@ ARCHIVIST_MODELS = [
 MAX_CONCURRENT_CALLS = _env_int("MAX_CONCURRENT_CALLS", 25)
 MAX_CALLS_PER_CLIENT = _env_int("MAX_CALLS_PER_CLIENT", 5)
 MAX_CALL_SECONDS = _env_int("MAX_CALL_SECONDS", 900)
+# Виджет на сайте открыт всем, поэтому у него свои пределы: разговор короче,
+# считанные звонки на посетителя и общий потолок минут в сутки на весь сайт.
+# Опознаватель посетителя приходит из браузера и легко меняется, так что
+# настоящая защита — именно суточный потолок.
+WEB_MAX_CALL_SECONDS = _env_int("WEB_MAX_CALL_SECONDS", 180)
+WEB_MAX_CALLS_PER_VISITOR = _env_int("WEB_MAX_CALLS_PER_VISITOR", 3)
+WEB_MAX_MINUTES_PER_DAY = _env_int("WEB_MAX_MINUTES_PER_DAY", 60)
+_web_visitor_calls: dict[str, tuple[str, int]] = {}
 # Раньше этого не было: бот принял мусорную расшифровку за прощание и положил
 # трубку на 40-й секунде. Ниже этого порога end_call игнорируется.
 MIN_SECONDS_BEFORE_END_CALL = _env_int("MIN_SECONDS_BEFORE_END_CALL", 25)
@@ -2364,7 +2372,12 @@ async def web_voice_endpoint(
     try:
         channel_rows = await sb_select(
             "bot_channels",
-            {"identifier": f"eq.{key}", "platform": "eq.web", "select": "client_id,project_id", "limit": "1"},
+            {
+                "identifier": f"eq.{key}",
+                "platform": "eq.web",
+                "select": "client_id,project_id,allowed_origins",
+                "limit": "1",
+            },
             timeout=2.5,
         )
     except Exception as exc:
@@ -2377,6 +2390,22 @@ async def web_voice_endpoint(
         return
     client_id = str(channel_rows[0]["client_id"])
     project_id = str(channel_rows[0].get("project_id") or "")
+
+    # Ключ виджета лежит открыто в коде страницы клиента: кто его скопировал,
+    # может звонить откуда угодно. Браузер сам сообщает, с какой страницы
+    # пришёл, и подделать это из обычного скрипта нельзя.
+    allowed = [
+        d.strip().lower()
+        for d in str(channel_rows[0].get("allowed_origins") or "").split(",")
+        if d.strip()
+    ]
+    if allowed:
+        origin = (websocket.headers.get("origin") or "").lower()
+        host = origin.split("://")[-1].split("/")[0].split(":")[0]
+        if host not in allowed:
+            clog.warning("[%s] origin %s not allowed for key %s", call_id, origin or "-", key[:12])
+            await websocket.close(code=1008, reason="Origin not allowed")
+            return
 
     if _call_semaphore.locked():
         clog.warning("[%s] concurrency limit reached, rejecting web session", call_id)
@@ -2424,6 +2453,29 @@ async def web_voice_endpoint(
                 clog.info("[%s] web channel inactive (status=%r) for project %s", call_id, web_status, project_id)
                 await websocket.close(code=1008, reason="Subscription inactive")
                 return
+
+            # Потолок на весь сайт за сутки. Его не обойти сменой опознавателя.
+            try:
+                since = dt.datetime.now(dt.timezone.utc).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                ).isoformat()
+                used_rows = await sb_select(
+                    "call_logs",
+                    {
+                        "client_id": f"eq.{client_id}",
+                        "platform": "eq.web_voice",
+                        "started_at": f"gte.{since}",
+                        "select": "duration_seconds",
+                    },
+                    timeout=2.5,
+                )
+                used = sum(int(r.get("duration_seconds") or 0) for r in used_rows)
+                if used >= WEB_MAX_MINUTES_PER_DAY * 60:
+                    clog.warning("[%s] daily web budget spent for %s", call_id, client_id)
+                    await websocket.close(code=1008, reason="Daily limit reached")
+                    return
+            except Exception as exc:
+                clog.warning("[%s] daily budget check failed: %s", call_id, exc)
 
             if _calls_per_client.get(client_id, 0) >= MAX_CALLS_PER_CLIENT:
                 clog.warning("[%s] per-client limit hit for %s", call_id, client_id)
@@ -2713,7 +2765,7 @@ async def web_voice_endpoint(
             runner = PipelineRunner()
             dead_air = asyncio.create_task(dead_air_watchdog(call_id, activity, task))
             try:
-                await asyncio.wait_for(runner.run(task), timeout=MAX_CALL_SECONDS)
+                await asyncio.wait_for(runner.run(task), timeout=WEB_MAX_CALL_SECONDS)
             except asyncio.TimeoutError:
                 clog.warning("[%s] max call duration reached, terminating", call_id)
                 with contextlib.suppress(Exception):
@@ -2894,6 +2946,12 @@ async def handle_asterisk_conn(
 
             if not client_id:
                 clog.warning("[%s] no client_id resolved", call_id)
+                return
+
+            # Со скрытого номера перезвонить нельзя, заявку записать не на кого,
+            # а разговор стоит денег. Такие входящие кладём сразу.
+            if not is_outbound and len(re.sub(r"\D", "", target_phone or "")) < 6:
+                clog.info("[%s] hidden caller number, dropping", call_id)
                 return
 
             # Лимит на клиента — защита от лавины звонков одного тенанта.
