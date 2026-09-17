@@ -2171,6 +2171,37 @@ app.add_middleware(
 )
 
 
+@app.get("/widget-config")
+async def widget_config(key: str = Query("")) -> dict:
+    """Настройки виджета по его ключу.
+
+    Виджет должен знать открытый ключ Cloudflare, а он у каждого клиента
+    свой. Секретного здесь не отдаём — открытый и так виден в коде страницы.
+    """
+    key = re.sub(r"[^A-Za-z0-9_\-]", "", key or "")[:64]
+
+    if not key:
+        return {"turnstile_site_key": ""}
+
+    try:
+        rows = await sb_select(
+            "bot_channels",
+            {
+                "identifier": f"eq.{key}",
+                "platform": "eq.web",
+                "select": "turnstile_site_key",
+                "limit": "1",
+            },
+            timeout=2.5,
+        )
+    except Exception as exc:
+        log.warning("widget-config a esuat: %s", exc)
+
+        return {"turnstile_site_key": ""}
+
+    return {"turnstile_site_key": (rows[0].get("turnstile_site_key") if rows else "") or ""}
+
+
 @app.get("/health")
 async def health() -> dict:
     return {
@@ -2467,14 +2498,17 @@ async def get_web_visitor_context(client_id: str, visitor_id: str) -> tuple[dict
     return contact, memory, _time_context_from(rec.get("last_interaction_at"))
 
 
-async def _propusk_valabil(token: str, ip: str) -> bool:
+async def _propusk_valabil(token: str, ip: str, secret: str = "") -> bool:
     """Пропуск Cloudflare — настоящий?
 
     Скрипт, который подключается напрямую, такой пропуск получить не
     может: его выдаёт браузер после проверки. Без ключа в настройках
     проверка не делается вовсе.
     """
-    if not TURNSTILE_SECRET_KEY:
+    # Ключ клиента главнее общего: пропуск выдан его виджетом Cloudflare.
+    cheie = secret or TURNSTILE_SECRET_KEY
+
+    if not cheie:
         return True
 
     if not token:
@@ -2485,7 +2519,7 @@ async def _propusk_valabil(token: str, ip: str) -> bool:
         # которого решалась проверка, а через прокси это часто не сходится.
         resp = await http().post(
             "https://challenges.cloudflare.com/turnstile/v0/siteverify",
-            data={"secret": TURNSTILE_SECRET_KEY, "response": token},
+            data={"secret": cheie, "response": token},
             timeout=5.0,
         )
         raspuns = resp.json()
@@ -2657,7 +2691,7 @@ async def web_voice_endpoint(
             {
                 "identifier": f"eq.{key}",
                 "platform": "eq.web",
-                "select": "client_id,project_id,allowed_origins",
+                "select": "client_id,project_id,allowed_origins,turnstile_secret_key",
                 "limit": "1",
             },
             timeout=2.5,
@@ -2698,7 +2732,7 @@ async def web_voice_endpoint(
         await websocket.close(code=1008, reason="Blocked")
         return
 
-    if not await _propusk_valabil(t, ip):
+    if not await _propusk_valabil(t, ip, str(channel_rows[0].get("turnstile_secret_key") or "")):
         clog.warning("[%s] propusk invalid de la %s", call_id, ip)
         await websocket.close(code=1008, reason="Verification failed")
         return
