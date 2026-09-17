@@ -2486,9 +2486,11 @@ async def web_voice_endpoint(
 
             # Потолок на весь сайт за сутки. Его не обойти сменой опознавателя.
             try:
+                # Без «плюса» в конце: в адресе он означает пробел, и база
+                # такое время не принимает.
                 since = dt.datetime.now(dt.timezone.utc).replace(
                     hour=0, minute=0, second=0, microsecond=0
-                ).isoformat()
+                ).strftime("%Y-%m-%dT%H:%M:%SZ")
                 used_rows = await sb_select(
                     "call_logs",
                     {
