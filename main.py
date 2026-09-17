@@ -203,8 +203,7 @@ WEB_MAX_MINUTES_PER_DAY = _env_int("WEB_MAX_MINUTES_PER_DAY", 60)
 # Метка посетителя живёт в браузере: в окне инкогнито она всегда новая, и
 # счётчик обнуляется. Адрес при этом остаётся прежним, поэтому считаем и по нему.
 WEB_MAX_CALLS_PER_IP = _env_int("WEB_MAX_CALLS_PER_IP", 6)
-_web_visitor_calls: dict[str, tuple[str, int]] = {}
-_web_ip_calls: dict[str, tuple[str, int]] = {}
+
 # Раньше этого не было: бот принял мусорную расшифровку за прощание и положил
 # трубку на 40-й секунде. Ниже этого порога end_call игнорируется.
 MIN_SECONDS_BEFORE_END_CALL = _env_int("MIN_SECONDS_BEFORE_END_CALL", 25)
@@ -2359,6 +2358,52 @@ async def get_web_visitor_context(client_id: str, visitor_id: str) -> tuple[dict
     return contact, memory, _time_context_from(rec.get("last_interaction_at"))
 
 
+async def _peste_limita(visitor_id: str, ip: str) -> str:
+    """Проверяет и увеличивает суточные счётчики звонков с сайта.
+
+    Возвращает пустую строку, если звонить можно, иначе — что именно
+    исчерпано. Сутки считаются с пяти утра по местному времени: ночная
+    атака иначе съедает весь рабочий день.
+
+    Без Redis счётчики не ведутся вовсе — остаются потолок минут и
+    остальные проверки.
+    """
+    if not redis_client:
+        return ""
+
+    acum = dt.datetime.now(tz_for(DEFAULT_TZ))
+    start_zi = acum.replace(hour=5, minute=0, second=0, microsecond=0)
+
+    if acum < start_zi:
+        start_zi -= dt.timedelta(days=1)
+
+    # Ключи живут до следующих пяти утра плюс час про запас.
+    ttl = int((start_zi + dt.timedelta(days=1) - acum).total_seconds()) + 3600
+    zi = start_zi.strftime("%Y%m%d")
+
+    for cheie, valoare, limita, nume in (
+        (f"web_calls:v:{zi}:{visitor_id}", visitor_id, WEB_MAX_CALLS_PER_VISITOR, "visitor"),
+        (f"web_calls:i:{zi}:{ip}", ip, WEB_MAX_CALLS_PER_IP, "ip"),
+    ):
+        if not valoare:
+            continue
+
+        try:
+            numar = await redis_client.incr(cheie)
+
+            if numar == 1:
+                await redis_client.expire(cheie, ttl)
+
+            if numar > limita:
+                return f"{nume} {valoare[:16]}"
+        except Exception as exc:
+            log.warning("limita zilnica: Redis nu raspunde: %s", exc)
+
+            return ""
+
+    return ""
+
+
 async def refuza_politicos(websocket: WebSocket, motiv: str) -> None:
     """Отказ, который виджет может показать человеку.
 
@@ -2444,26 +2489,16 @@ async def web_voice_endpoint(
             await websocket.close(code=1008, reason="Origin not allowed")
             return
 
-    today = dt.date.today().isoformat()
-    seen_day, seen_count = _web_visitor_calls.get(visitor_id, (today, 0))
-    if seen_day != today:
-        seen_count = 0
-    if visitor_id and seen_count >= WEB_MAX_CALLS_PER_VISITOR:
-        clog.warning("[%s] visitor %s over daily call limit", call_id, visitor_id[:12])
-        await refuza_politicos(websocket, "daily_limit")
-        return
-
     ip = visitor_meta["visitor_ip"]
-    ip_day, ip_count = _web_ip_calls.get(ip, (today, 0))
-    if ip_day != today:
-        ip_count = 0
-    if ip and ip_count >= WEB_MAX_CALLS_PER_IP:
-        clog.warning("[%s] ip %s over daily call limit", call_id, ip)
+
+    # Счётчики живут в Redis, а не в памяти бота: иначе любой перезапуск
+    # обнуляет их, и достаточно дождаться выката, чтобы начать заново.
+    depasit = await _peste_limita(visitor_id, ip)
+
+    if depasit:
+        clog.warning("[%s] %s over daily call limit", call_id, depasit)
         await refuza_politicos(websocket, "daily_limit")
         return
-
-    _web_visitor_calls[visitor_id] = (today, seen_count + 1)
-    _web_ip_calls[ip] = (today, ip_count + 1)
 
     if _call_semaphore.locked():
         clog.warning("[%s] concurrency limit reached, rejecting web session", call_id)
