@@ -813,10 +813,10 @@ async def get_client_data(client_id: str) -> dict | None:
             "id": f"eq.{client_id}",
             "select": (
                 "company_name,"
-                "subscription_status_assistent,system_message,timezone,working_hours,"
+                "system_message,timezone,working_hours,"
                 "crm_provider,crm_config,"
                 "saas_projects(tg_chat_id_notify,google_calendar_id,"
-                "project_name,business_context,bot_goal,tone)"
+                "project_name,business_context,bot_goal,tone,gsm_subs_status)"
             ),
         },
     )
@@ -827,6 +827,8 @@ async def get_client_data(client_id: str) -> dict | None:
     first = projects[0] if projects else {}
     rec["tg_chat_id_notify"] = first.get("tg_chat_id_notify")
     rec["google_calendar_id"] = first.get("google_calendar_id")
+    # Телефония включается своим выключателем на проекте, как остальные каналы.
+    rec["gsm_subs_status"] = first.get("gsm_subs_status")
 
     # Что знает компания и как ведёт себя робот — это данные проекта.
     # На клиенте остались старые копии; они отстают от базы знаний,
@@ -3007,9 +3009,9 @@ async def handle_asterisk_conn(
                 clog.warning("[%s] client %s not found", call_id, client_id)
                 return
 
-            status = str(client_data.get("subscription_status_assistent", "")).strip().lower()
-            if status in ("false", "0", "none", "null", "inactive", "expired", ""):
-                clog.info("[%s] subscription inactive for %s", call_id, client_id)
+            status = str(client_data.get("gsm_subs_status") or "").strip().lower()
+            if status not in ("active", "trial"):
+                clog.info("[%s] telephony disabled (status=%r) for %s", call_id, status, client_id)
                 return
 
             tz_name = client_data.get("timezone") or DEFAULT_TZ
