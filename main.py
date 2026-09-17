@@ -1619,6 +1619,42 @@ class AbuseProbe(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+async def abuse_watchdog(
+    call_id: str,
+    abuse: "AbuseProbe",
+    task: PipelineTask,
+    client_id: str,
+    visitor_id: str,
+    ip: str,
+) -> None:
+    """Раз в 5 с смотрит, не зачитывают ли нам список вопросов.
+
+    Модель считать попытки не умеет — в одном разговоре она отказывала семь
+    раз подряд и не прекращала. Здесь счёт точный, и обрыв не обсуждается.
+    """
+    try:
+        while True:
+            await asyncio.sleep(5.0)
+
+            if abuse.repetari < abuse.PRAG_REPETARI:
+                continue
+
+            log.warning(
+                "[%s] неразговор: %d повторов — обрываем и блокируем",
+                call_id,
+                abuse.repetari,
+            )
+
+            await _blocheaza(client_id, visitor_id, ip, "repetari")
+
+            with contextlib.suppress(Exception):
+                await task.queue_frames([CancelFrame()])
+
+            return
+    except asyncio.CancelledError:
+        pass
+
+
 async def dead_air_watchdog(call_id: str, activity: "ActivityProbe", task: PipelineTask) -> None:
     """Раз в 5 с: если DEAD_AIR_SECONDS никто не говорил — завершаем звонок."""
     try:
@@ -3049,6 +3085,9 @@ async def web_voice_endpoint(
 
             runner = PipelineRunner()
             dead_air = asyncio.create_task(dead_air_watchdog(call_id, activity, task))
+            paza_abuz = asyncio.create_task(
+                abuse_watchdog(call_id, abuse, task, client_id, visitor_id, visitor_meta["visitor_ip"])
+            )
             try:
                 await asyncio.wait_for(runner.run(task), timeout=WEB_MAX_CALL_SECONDS)
             except asyncio.TimeoutError:
@@ -3057,8 +3096,11 @@ async def web_voice_endpoint(
                     await task.queue_frames([CancelFrame()])
             finally:
                 dead_air.cancel()
+                paza_abuz.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await dead_air
+                with contextlib.suppress(asyncio.CancelledError):
+                    await paza_abuz
 
         except (WebSocketDisconnect, ConnectionResetError, asyncio.TimeoutError) as exc:
             clog.info("[%s] web session closed: %s", call_id, type(exc).__name__)
