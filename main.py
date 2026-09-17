@@ -2401,13 +2401,19 @@ async def _propusk_valabil(token: str, ip: str) -> bool:
         return False
 
     try:
+        # Адрес не передаём: Cloudflare требует, чтобы он совпадал с тем, с
+        # которого решалась проверка, а через прокси это часто не сходится.
         resp = await http().post(
             "https://challenges.cloudflare.com/turnstile/v0/siteverify",
-            data={"secret": TURNSTILE_SECRET_KEY, "response": token, "remoteip": ip},
+            data={"secret": TURNSTILE_SECRET_KEY, "response": token},
             timeout=5.0,
         )
+        raspuns = resp.json()
 
-        return bool(resp.json().get("success"))
+        if not raspuns.get("success"):
+            log.warning("turnstile a refuzat: %s", raspuns.get("error-codes"))
+
+        return bool(raspuns.get("success"))
     except Exception as exc:
         # Cloudflare не ответил — не запираем живых людей из-за чужого сбоя.
         log.warning("turnstile nu raspunde: %s", exc)
