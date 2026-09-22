@@ -710,7 +710,17 @@ def build_personality_block(p: Persona, lang: str) -> str:
         "и эмоции СТРОГО под эти 10 показателей. Они важнее любых общих указаний "
         "о тоне ниже по промпту."
     )
-    out.append(f"МАНЕРА РЕЧИ: {_SPEECH_STYLE.get(lang, _SPEECH_STYLE['en'])}")
+    out.append(
+        "МАНЕРА РЕЧИ — по языку, на котором ты говоришь СЕЙЧАС, а не по языку "
+        "начала разговора:"
+    )
+    out.append(f"- по-русски: {_SPEECH_STYLE['ru']}")
+    out.append(f"- по-румынски: {_SPEECH_STYLE['ro']}")
+    out.append(f"- по-английски: {_SPEECH_STYLE['en']}")
+    out.append(
+        "Акцент и слова-связки одного языка никогда не переносятся в другой. "
+        "Русскую речь никогда не произноси и не пиши латиницей."
+    )
     out.append("</BEHAVIOR_ENGINE>")
 
     return "\n".join(out)
@@ -1220,6 +1230,8 @@ async def run_archivist_and_notify_n8n(
     web_id: str = "",
     platform: str = "gsm_voice",
     visitor_meta: dict | None = None,
+    lead_saved: bool = True,
+    tg_chat: str = "",
 ) -> None:
     if not chat_history.strip() or phone == "Necunoscut":
         return
@@ -1272,11 +1284,12 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
 4. summary: суть текущего звонка для менеджера.
 5. sentiment: настрой и возражения.
 6. next_step: следующий шаг (перезвонить, отправить КП и т.д.).
-7. language: язык, на котором РЕАЛЬНО говорил клиент (ro/ru/en).
+7. language: язык, на котором РЕАЛЬНО говорил клиент (ro/ru/en). Если клиент почти ничего не сказал или язык по записи не ясен — пустая строка.
 8. client_name: имя клиента, если он его назвал. Иначе пустая строка.
 9. transcript: расшифровка разговора по записи, в формате "Client: ..." / "AI: ...", на языке оригинала каждой реплики. Только реплики бота и слова клиента, обращённые к боту; фон (телевизор, посторонние разговоры) пропускай. Если записи нет — верни субтитры, убрав из них строки Client, которые явно не в тему разговора.
+10. callback_phone: номер телефона, который клиент САМ продиктовал в этом разговоре, чтобы с ним связались, — только цифры. Если не диктовал — пустая строка.
 
-{{"core_identity":"...","short_term_context":"...","long_term_context":"...","summary":"...","sentiment":"...","next_step":"...","language":"...","client_name":"...","transcript":"..."}}
+{{"core_identity":"...","short_term_context":"...","long_term_context":"...","summary":"...","sentiment":"...","next_step":"...","language":"...","client_name":"...","transcript":"...","callback_phone":"..."}}
 """
 
     data: dict[str, Any] = {}
@@ -1289,7 +1302,7 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
             "summary": "Разговор не состоялся: собеседник не сказал ни слова.",
             "sentiment": "—",
             "next_step": "—",
-            "language": DEFAULT_LANG,
+            "language": "",
         }
     else:
         for attempt, model in enumerate(ARCHIVIST_MODELS):
@@ -1313,7 +1326,7 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
                 "summary": "Ошибка генерации саммари: все модели недоступны.",
                 "sentiment": "Неизвестно",
                 "next_step": "Связаться вручную",
-                "language": DEFAULT_LANG,
+                "language": "",
             }
 
     try:
@@ -1352,6 +1365,27 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
             log.info("[archivist] memory saved for %s", clean_phone or f"web {web_id[:12]}")
     except Exception as exc:
         log.error("[archivist] memory save failed: %s", exc)
+
+    # Страховка: посетитель сайта продиктовал номер, а бот заявку не сохранил.
+    # Бот может сказать «номер сохранён», не вызвав save_lead, — тогда
+    # заявку отправляем сами, по расшифровке архивариуса.
+    telefon_zayavki = "".join(filter(str.isdigit, str(data.get("callback_phone") or "")))
+    if web_id and not lead_saved and len(telefon_zayavki) >= 8 and N8N_BASE_URL:
+        try:
+            resp = await http().post(
+                f"{N8N_BASE_URL}/save_lead",
+                params={"client_id": client_id, "tg_chat_id": tg_chat or ""},
+                json={
+                    "client_name": str(data.get("client_name") or client_name or "").strip(),
+                    "client_phone": telefon_zayavki,
+                    "request_summary": str(data.get("summary") or "").strip(),
+                },
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+            log.info("[archivist] заявку сохранили после звонка — бот её не сохранил")
+        except Exception as exc:
+            log.error("[archivist] страховочная заявка не ушла: %s", exc)
 
     # Дописываем в карточку то, что удалось узнать за разговор.
     # Язык НЕ записываем: он выводится из расшифровки, а она сейчас ненадёжна.
@@ -1711,17 +1745,20 @@ COMENZI_LIMBA = {
     "ru": (
         "SYSTEM EVENT: собеседник говорит по-русски. Ответь на его последнюю "
         "реплику по-русски и дальше до конца разговора говори только по-русски. "
-        "Не извиняйся и не объясняй смену языка."
+        "Не извиняйся и не объясняй смену языка. Манера речи — русская: без "
+        "румынских слов-связок и без румынского акцента."
     ),
     "ro": (
         "SYSTEM EVENT: собеседник говорит по-румынски. Ответь на его последнюю "
         "реплику по-румынски и дальше до конца разговора говори только по-румынски. "
-        "Не извиняйся и не объясняй смену языка."
+        "Не извиняйся и не объясняй смену языка. Манера речи — румынская: без "
+        "русских слов-связок и без русского акцента."
     ),
     "en": (
         "SYSTEM EVENT: the caller speaks English. Answer their last line in English "
         "and keep speaking only English until the end of the call. Do not apologise "
-        "for or explain the switch."
+        "for or explain the switch. Use an English manner of speech: no Romanian or "
+        "Russian fillers and no Romanian or Russian accent."
     ),
 }
 
@@ -1927,6 +1964,13 @@ COMANDA_LA_REVEDERE = (
     "SYSTEM EVENT: собеседник так и не ответил. Одной короткой фразой, на языке "
     "разговора, скажи, что не слышишь его, предложи перезвонить или написать и "
     "попрощайся. Больше ничего не говори — после этой фразы звонок завершится."
+)
+
+# Начало разговора — одно правило для телефона и сайта.
+AVERTIZARE_INREGISTRARE = "В первой фразе коротко предупреди, что разговор может записываться."
+PRIMA_FRAZA = (
+    "Первая реплика — не длиннее двух коротких предложений и не больше одного вопроса. "
+    "Память не пересказывай: тему прошлого разговора назови двумя-тремя словами."
 )
 
 
@@ -2272,6 +2316,11 @@ def build_system_prompt(
         "проверяю.» or «One moment, let me check.» — and only then call the tool. "
         "Say nothing else before the tool call."
     )
+    blocks.append(
+        "Never tell the caller that something is saved, recorded, booked, passed on or "
+        "scheduled unless the tool that does it was called in THIS call and returned "
+        "success. If you have not called it yet, call it now, and only then confirm."
+    )
     blocks.append("</TOOLS>")
     blocks.append("")
 
@@ -2300,7 +2349,8 @@ def build_system_prompt(
         blocks.append(
             "ЧТО ПОРТРЕТ НЕ ОТМЕНЯЕТ: рабочие часы для встреч с людьми, запрет "
             "выдумывать факты, цены и даты, запрет зачитывать ссылки вслух, правила "
-            "работы с инструментами и язык разговора."
+            "работы с инструментами, язык разговора, а также длину первой реплики и "
+            "предупреждение о записи из указания в начале разговора."
         )
         blocks.append(
             "ПРОЩАНИЕ: когда клиент прощается или говорит, что перезвонит позже — "
@@ -3106,6 +3156,8 @@ async def web_voice_endpoint(
     is_known_caller = False
     learned_phone = ""
     known_phone = ""
+    saved_lead_hashes: set[str] = set()
+    tg_chat = ""
     caller_memory: dict = {"core": "", "short": "", "long": ""}
     wav_path = f"/tmp/web_{call_id}.wav"
     mixer = WebAudioMixer(wav_path)
@@ -3445,23 +3497,25 @@ async def web_voice_endpoint(
                 f"ПЕРВАЯ ЖЕ ТВОЯ ФРАЗА ДОЛЖНА БЫТЬ НА {lang_word} ЯЗЫКЕ. "
                 "Это указание написано по-русски, но отвечать на нём НЕ НАДО."
             )
-            notice_rule = "В первой фразе коротко предупреди, что разговор может записываться."
+            notice_rule = AVERTIZARE_INREGISTRARE
 
             if time_context == "very_recent":
                 greeting = (
                     f"SYSTEM EVENT: {who} вернулся в голосовой чат на сайте спустя пару минут. "
-                    f"Не здоровайся заново. {lang_rule} {name_rule} Продолжай суть."
+                    f"Не здоровайся заново. {lang_rule} {notice_rule} {name_rule} Продолжай суть. "
+                    f"{PRIMA_FRAZA}"
                 )
             elif time_context == "same_day":
                 greeting = (
                     f"SYSTEM EVENT: {who} открыл голосовой чат на сайте повторно за сегодня. "
-                    f"{lang_rule} {name_rule} Опирайся на память RECENT. Веди разговор сам, согласно портрету."
+                    f"{lang_rule} {notice_rule} {name_rule} Опирайся на память RECENT. "
+                    f"Веди разговор сам, согласно портрету. {PRIMA_FRAZA}"
                 )
             else:
                 greeting = (
                     f"SYSTEM EVENT: {who} открыл голосовой чат на сайте компании. {lang_rule} "
                     f"{notice_rule} {name_rule} Начни диалог согласно портрету. "
-                    "Если есть память RECENT, не переспрашивай известное."
+                    f"Если есть память RECENT, не переспрашивай известное. {PRIMA_FRAZA}"
                 )
 
             context.add_message({"role": "user", "content": greeting})
@@ -3535,7 +3589,7 @@ async def web_voice_endpoint(
                         await run_archivist_and_notify_n8n(
                             client_id,
                             learned_phone or known_phone,
-                            client_name,
+                            client_name if is_known_caller else "",
                             caller_memory,
                             transcript,
                             audio_url,
@@ -3549,6 +3603,8 @@ async def web_voice_endpoint(
                             web_id=visitor_id,
                             platform="web_voice",
                             visitor_meta=visitor_meta,
+                            lead_saved=bool(saved_lead_hashes),
+                            tg_chat=tg_chat or "",
                         )
                     except Exception as exc:
                         log.error("[%s] web post-processing failed: %s", call_id, exc)
@@ -3956,26 +4012,29 @@ async def handle_asterisk_conn(
                 "Это указание написано по-русски, но отвечать на нём НЕ НАДО."
             )
 
+            notice_rule = AVERTIZARE_INREGISTRARE
+
             if is_outbound:
                 greeting = (
                     f"SYSTEM EVENT: {who} ответил на твой исходящий звонок. "
-                    f"Цель звонка: {purpose}. {lang_rule} {name_rule} "
-                    "Начни разговор строго в своём характере по портрету."
+                    f"Цель звонка: {purpose}. {lang_rule} {notice_rule} {name_rule} "
+                    f"Начни разговор строго в своём характере по портрету. {PRIMA_FRAZA}"
                 )
             elif time_context == "very_recent":
                 greeting = (
                     f"SYSTEM EVENT: {who} перезвонил спустя пару минут. Не здоровайся заново. "
-                    f"{lang_rule} {name_rule} Скажи, что связь прервалась, и продолжай суть."
+                    f"{lang_rule} {notice_rule} {name_rule} Скажи, что связь прервалась, и продолжай суть. "
+                    f"{PRIMA_FRAZA}"
                 )
             elif time_context == "same_day":
                 greeting = (
-                    f"SYSTEM EVENT: {who} звонит сегодня повторно. {lang_rule} {name_rule} "
-                    "Опирайся на память RECENT. Веди разговор сам, согласно портрету."
+                    f"SYSTEM EVENT: {who} звонит сегодня повторно. {lang_rule} {notice_rule} {name_rule} "
+                    f"Опирайся на память RECENT. Веди разговор сам, согласно портрету. {PRIMA_FRAZA}"
                 )
             else:
                 greeting = (
-                    f"SYSTEM EVENT: Входящий звонок, {who}. {lang_rule} {name_rule} "
-                    "Начни диалог согласно портрету. Если есть память RECENT, не переспрашивай известное."
+                    f"SYSTEM EVENT: Входящий звонок, {who}. {lang_rule} {notice_rule} {name_rule} "
+                    f"Начни диалог согласно портрету. Если есть память RECENT, не переспрашивай известное. {PRIMA_FRAZA}"
                 )
 
             context.add_message({"role": "user", "content": greeting})
