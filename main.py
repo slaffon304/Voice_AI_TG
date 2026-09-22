@@ -159,15 +159,20 @@ ENABLE_RNNOISE = _env_bool("ENABLE_RNNOISE", True)
 AUDIO_STALL_SECONDS = _env_float("AUDIO_STALL_SECONDS", 10.0)
 # Тишина в звонке. Пока собеседник не сказал ни слова, ждём недолго: он мог
 # не расслышать приветствие или уже положил трубку, а линия занята.
-SILENCE_ASK_NEW = 8.0      # столько тишины — бот спрашивает «вы меня слышите?»
-SILENCE_BYE_NEW = 8.0      # столько после вопроса — прощается и кладёт трубку
+SILENCE_ASK_NEW = 5.0      # столько тишины — бот спрашивает «вы меня слышите?»
+SILENCE_BYE_NEW = 5.0      # столько после вопроса — прощается и кладёт трубку
 # Разговор уже идёт — человек может задуматься или что-то искать.
-SILENCE_ASK_TALK = 20.0    # столько тишины — бот спрашивает, на линии ли он
-SILENCE_BYE_TALK = 15.0    # столько после вопроса — прощается и кладёт трубку
+SILENCE_ASK_TALK = 10.0    # столько тишины — бот спрашивает, на линии ли он
+SILENCE_BYE_TALK = 8.0     # столько после вопроса — прощается и кладёт трубку
 # Собеседник перебил бота и замолчал — через столько бот мягко продолжает сам.
-# Меньше нельзя: слова человека доходят до бота в конце фразы, и бот начал бы
-# продолжать поверх того, кто ещё говорит.
-RESUME_AFTER_INTERRUPT = 5.0
+RESUME_AFTER_INTERRUPT = 2.5
+# Голос собеседника бот замечает сразу, по громкости, а не в конце фразы:
+# звук громче этого порога хотя бы VOICE_MIN_S — человек говорит, тишины нет.
+# На телефоне голос выровнен по громкости, фон приглушён; на сайте громкость
+# выравнивает браузер. Порог не сработает — бот узнает о голосе, как раньше,
+# в конце фразы.
+VOICE_DBFS = -33.0
+VOICE_MIN_S = 0.2
 # ВРЕМЕННАЯ ДИАГНОСТИКА. Пишет в WAV ровно тот звук, который получает Gemini,
 # и кладёт в Supabase рядом с записью разговора. Убрать, когда починим звук.
 DUMP_INPUT_AUDIO = _env_bool("DUMP_INPUT_AUDIO", False)
@@ -1634,21 +1639,39 @@ class ActivityProbe(FrameProcessor):
         self.caller_spoke = False
         self.last_caller_ts = 0.0
         self.last_interruption_ts = 0.0
+        # Работает ли сейчас инструмент. Каждый инструмент на время работы
+        # глушит голос собеседника — на это глушение и смотрим. Подключается
+        # при сборке звонка; пока не подключено — инструментов нет.
+        self.busy = lambda: False
 
     def mark_caller(self) -> None:
-        """Собеседник что-то сказал."""
+        """Собеседник что-то сказал — пришла расшифровка его слов."""
         now = time.time()
         self.last_activity_ts = now
         self.last_caller_ts = now
         self.caller_spoke = True
 
+    def mark_voice(self) -> None:
+        """Слышен голос собеседника — он говорит прямо сейчас.
+
+        Отличается от mark_caller: слова ещё не расшифрованы, поэтому ни
+        «человек уже говорил», ни ответ на вопрос бота это не засчитывает —
+        только останавливает счётчик тишины.
+        """
+        self.last_activity_ts = time.time()
+
     def silent_for(self) -> float:
-        """Сколько секунд длится тишина. Пока бот звучит — тишины нет.
+        """Сколько секунд длится тишина. Пока бот звучит или работает
+        инструмент — тишины нет.
 
         Если сигнал «замолчал» потерялся, дольше полутора минут бота
         говорящим не считаем — иначе звонок никогда не закончился бы.
         """
         now = time.time()
+        if self.busy():
+            # Тишина после инструмента считается от его конца, а не от начала.
+            self.last_activity_ts = now
+            return 0.0
         if self.bot_speaking and now - self.bot_started_ts < 90.0:
             return 0.0
         return now - self.last_activity_ts
@@ -1747,6 +1770,8 @@ class CallerProbe(FrameProcessor):
         self.activity = activity
         self.lang = (lang or "").lower()[:2]
         self.call_id = call_id
+        self.voice_rms = 32768.0 * 10 ** (VOICE_DBFS / 20)
+        self.loud_s = 0.0      # сколько секунд подряд звук громче порога
 
     async def command(self, text: str) -> None:
         """Команда боту — он сразу ответит по ней вслух."""
@@ -1755,8 +1780,30 @@ class CallerProbe(FrameProcessor):
             FrameDirection.DOWNSTREAM,
         )
 
+    def _listen(self, frame: InputAudioRawFrame) -> None:
+        """Громче порога дольше VOICE_MIN_S — собеседник говорит."""
+        data = frame.audio
+        rate = frame.sample_rate or 16000
+        if len(data) < 4:
+            return
+
+        a = np.frombuffer(data[: len(data) // 2 * 2], dtype="<i2").astype(np.float32)
+        rms = float(np.sqrt(np.mean(a * a)))
+        seconds = len(a) / rate / max(1, frame.num_channels)
+
+        if rms >= self.voice_rms:
+            self.loud_s += seconds
+            if self.loud_s >= VOICE_MIN_S:
+                self.activity.mark_voice()
+        else:
+            self.loud_s = 0.0
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
+
+        if isinstance(frame, InputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
+            with contextlib.suppress(Exception):
+                self._listen(frame)
 
         if isinstance(frame, TranscriptionFrame) and direction == FrameDirection.UPSTREAM:
             text = (getattr(frame, "text", "") or "").strip()
@@ -1900,6 +1947,11 @@ async def dead_air_watchdog(
             if not activity.bot_started_ts and now - nachalo < 20.0:
                 continue
 
+            # Бот ещё не заговорил в ответ на прошлую команду — вторую не шлём,
+            # иначе он ответит дважды подряд. Но ждём не дольше 6 секунд.
+            if komanda_ts and activity.bot_started_ts < komanda_ts and now - komanda_ts < 6.0:
+                continue
+
             # Собеседник заговорил после вопроса — всё сначала.
             if etap != "ждём" and activity.last_caller_ts > komanda_ts:
                 etap = "ждём"
@@ -1915,6 +1967,7 @@ async def dead_air_watchdog(
                     prodolzhil = perebil
                     log.info("[%s] перебил и замолчал — бот продолжает сам", call_id)
                     await caller.command(COMANDA_CONTINUA)
+                    komanda_ts = now
                     continue
 
                 prag = SILENCE_ASK_TALK if activity.caller_spoke else SILENCE_ASK_NEW
@@ -3305,6 +3358,7 @@ async def web_voice_endpoint(
             user_catcher = WebUserAudioCatcher(mixer)
             ai_catcher = WebAIAudioCatcher(mixer)
             abuse = AbuseProbe()
+            activity.busy = lambda: user_catcher.muted
 
             # Защита от чтеца и CallerProbe стоят между памятью разговора и
             # Gemini: только здесь видны слова собеседника, и только отсюда
@@ -3825,6 +3879,7 @@ async def handle_asterisk_conn(
             probe = InboundAudioProbe()
             activity = ActivityProbe()
             caller = CallerProbe(activity, call_lang, call_id)
+            activity.busy = lambda: socket.is_muted
 
             # CallerProbe стоит между памятью разговора и Gemini: только здесь
             # видны слова собеседника, и только отсюда Gemini посреди звонка
