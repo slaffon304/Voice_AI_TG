@@ -56,10 +56,13 @@ try:
 except Exception:  # зависимость pyrnnoise/PyAV может быть несовместима после пересборки
     RNNoiseFilter = None  # type: ignore[assignment]
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     CancelFrame,
     Frame,
     InputAudioRawFrame,
     InterruptionFrame,
+    LLMMessagesAppendFrame,
     LLMRunFrame,
     MetricsFrame,
     OutputAudioRawFrame,
@@ -154,8 +157,17 @@ ASTERISK_INPUT_RATE = _env_int("ASTERISK_INPUT_RATE", 16000)
 ENABLE_RNNOISE = _env_bool("ENABLE_RNNOISE", True)
 # Сторож: сколько секунд тишины в пайплайне при живом сокете считать поломкой.
 AUDIO_STALL_SECONDS = _env_float("AUDIO_STALL_SECONDS", 10.0)
-# Сторож мёртвого эфира: столько секунд без речи с обеих сторон — бот кладёт трубку.
-DEAD_AIR_SECONDS = _env_float("DEAD_AIR_SECONDS", 50.0)
+# Тишина в звонке. Пока собеседник не сказал ни слова, ждём недолго: он мог
+# не расслышать приветствие или уже положил трубку, а линия занята.
+SILENCE_ASK_NEW = 8.0      # столько тишины — бот спрашивает «вы меня слышите?»
+SILENCE_BYE_NEW = 8.0      # столько после вопроса — прощается и кладёт трубку
+# Разговор уже идёт — человек может задуматься или что-то искать.
+SILENCE_ASK_TALK = 20.0    # столько тишины — бот спрашивает, на линии ли он
+SILENCE_BYE_TALK = 15.0    # столько после вопроса — прощается и кладёт трубку
+# Собеседник перебил бота и замолчал — через столько бот мягко продолжает сам.
+# Меньше нельзя: слова человека доходят до бота в конце фразы, и бот начал бы
+# продолжать поверх того, кто ещё говорит.
+RESUME_AFTER_INTERRUPT = 5.0
 # ВРЕМЕННАЯ ДИАГНОСТИКА. Пишет в WAV ровно тот звук, который получает Gemini,
 # и кладёт в Supabase рядом с записью разговора. Убрать, когда починим звук.
 DUMP_INPUT_AUDIO = _env_bool("DUMP_INPUT_AUDIO", False)
@@ -218,7 +230,6 @@ VAD_END_SENSITIVITY = os.getenv("VAD_END_SENSITIVITY", "low").strip().lower()
 # prefix_padding — сколько мс речь должна длиться, прежде чем засчитается.
 VAD_START_SENSITIVITY = os.getenv("VAD_START_SENSITIVITY", "low").strip().lower()
 VAD_PREFIX_PADDING_MS = _env_int("VAD_PREFIX_PADDING_MS", 800)
-RECOVERY_DELAY_S = _env_float("RECOVERY_DELAY_S", 2.5)
 IDLE_TIMEOUT_SECONDS = _env_float("IDLE_TIMEOUT_SECONDS", 20.0)
 PERSONA_CACHE_TTL = _env_int("PERSONA_CACHE_TTL", 60)
 
@@ -1603,25 +1614,162 @@ class InboundAudioProbe(FrameProcessor):
             return False
 
 class ActivityProbe(FrameProcessor):
-    """Запоминает момент последней речи — бота или клиента. Тишина не считается."""
+    """Запоминает момент последней речи — бота или клиента. Тишина не считается.
+
+    Бот говорит, пока его реально слышно: от «начал» до «замолчал». Gemini
+    присылает звук быстрее, чем тот звучит, поэтому момент прихода звука —
+    не конец речи; раньше из-за этого терялся хвост каждой фразы бота.
+
+    Слова собеседника сюда сообщает CallerProbe: Gemini отдаёт их назад по
+    цепочке, и до этого узла они сами не доходят.
+    """
 
     def __init__(self) -> None:
         super().__init__()
-        self.last_activity_ts = time.time()
+        now = time.time()
+        self.last_activity_ts = now
+        self.bot_speaking = False
+        self.bot_started_ts = 0.0
+        self.bot_stopped_ts = 0.0
+        self.caller_spoke = False
+        self.last_caller_ts = 0.0
+        self.last_interruption_ts = 0.0
+
+    def mark_caller(self) -> None:
+        """Собеседник что-то сказал."""
+        now = time.time()
+        self.last_activity_ts = now
+        self.last_caller_ts = now
+        self.caller_spoke = True
+
+    def silent_for(self) -> float:
+        """Сколько секунд длится тишина. Пока бот звучит — тишины нет.
+
+        Если сигнал «замолчал» потерялся, дольше полутора минут бота
+        говорящим не считаем — иначе звонок никогда не закончился бы.
+        """
+        now = time.time()
+        if self.bot_speaking and now - self.bot_started_ts < 90.0:
+            return 0.0
+        return now - self.last_activity_ts
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
-        if isinstance(
-            frame,
-            (
-                OutputAudioRawFrame,        # бот говорит
-                TranscriptionFrame,         # клиент сказал — есть расшифровка
-                InterimTranscriptionFrame,
-                InterruptionFrame,          # Gemini услышал речь и перебил бота
-                UserStartedSpeakingFrame,
-            ),
-        ):
-            self.last_activity_ts = time.time()
+        now = time.time()
+        if isinstance(frame, BotStartedSpeakingFrame):
+            self.bot_speaking = True
+            self.bot_started_ts = now
+            self.last_activity_ts = now
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            self.bot_speaking = False
+            self.bot_stopped_ts = now
+            self.last_activity_ts = now
+        elif isinstance(frame, InterruptionFrame):
+            # Gemini услышал речь собеседника и оборвал бота.
+            self.last_interruption_ts = now
+            self.last_activity_ts = now
+        elif isinstance(frame, OutputAudioRawFrame):
+            self.last_activity_ts = now
+        await self.push_frame(frame, direction)
+
+
+# Команды боту, когда собеседник заговорил на другом языке.
+COMENZI_LIMBA = {
+    "ru": (
+        "SYSTEM EVENT: собеседник говорит по-русски. Ответь на его последнюю "
+        "реплику по-русски и дальше до конца разговора говори только по-русски. "
+        "Не извиняйся и не объясняй смену языка."
+    ),
+    "ro": (
+        "SYSTEM EVENT: собеседник говорит по-румынски. Ответь на его последнюю "
+        "реплику по-румынски и дальше до конца разговора говори только по-румынски. "
+        "Не извиняйся и не объясняй смену языка."
+    ),
+    "en": (
+        "SYSTEM EVENT: the caller speaks English. Answer their last line in English "
+        "and keep speaking only English until the end of the call. Do not apologise "
+        "for or explain the switch."
+    ),
+}
+
+_RO_SEMNE = set("ăâîșşțţ")
+_RO_CUVINTE = {
+    "da", "nu", "vreau", "bună", "buna", "ziua", "salut", "mulțumesc", "multumesc",
+    "este", "pentru", "sunt", "aveți", "aveti", "cât", "cat", "costă", "costa",
+    "și", "si", "care", "unde", "când", "cand", "vă", "rog", "îmi", "imi",
+    "foarte", "bine", "acum", "aș", "trebuie", "puteți", "puteti", "doresc",
+}
+_EN_CUVINTE = {
+    "the", "and", "you", "hello", "please", "what", "want", "need", "how", "much",
+    "are", "can", "does", "thank", "thanks", "price", "yes", "speak", "english",
+    "would", "like", "have", "your", "about",
+}
+
+
+def limba_replicii(text: str) -> str | None:
+    """На каком языке сказана реплика собеседника: ru, ro, en или None.
+
+    Субтитры Gemini к речи собеседника бывают мусорными, поэтому коротким
+    обрывкам не верим — нужно не меньше трёх слов, и язык должен читаться
+    уверенно: русский по кириллице, румынский и английский по характерным
+    словам.
+    """
+    cuvinte = re.findall(r"[^\W\d_]+", text.lower())
+    if len(cuvinte) < 3:
+        return None
+
+    litere = "".join(cuvinte)
+    chirilice = sum(1 for c in litere if "а" <= c <= "я" or c in "ёіїєґ")
+
+    if chirilice >= len(litere) * 0.7:
+        return "ru"
+    if chirilice > len(litere) * 0.1:
+        return None
+    if any(c in _RO_SEMNE for c in litere) or len(set(cuvinte) & _RO_CUVINTE) >= 2:
+        return "ro"
+    if len(set(cuvinte) & _EN_CUVINTE) >= 2:
+        return "en"
+    return None
+
+
+class CallerProbe(FrameProcessor):
+    """Слышит собеседника и передаёт боту команды посреди звонка.
+
+    Стоит между узлом памяти разговора и Gemini, и это единственное место,
+    где видны слова собеседника: Gemini отдаёт их назад по цепочке, а узел
+    памяти забирает себе и дальше не передаёт. Отсюда же — единственный путь,
+    которым Gemini посреди звонка принимает команду: прямо ему, минуя память
+    разговора. Из памяти он посреди звонка берёт только результаты инструментов.
+    """
+
+    def __init__(self, activity: ActivityProbe, lang: str, call_id: str) -> None:
+        super().__init__()
+        self.activity = activity
+        self.lang = (lang or "").lower()[:2]
+        self.call_id = call_id
+
+    async def command(self, text: str) -> None:
+        """Команда боту — он сразу ответит по ней вслух."""
+        await self.push_frame(
+            LLMMessagesAppendFrame(messages=[{"role": "user", "content": text}]),
+            FrameDirection.DOWNSTREAM,
+        )
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, TranscriptionFrame) and direction == FrameDirection.UPSTREAM:
+            text = (getattr(frame, "text", "") or "").strip()
+
+            if text:
+                self.activity.mark_caller()
+                limba = limba_replicii(text)
+
+                if limba and limba != self.lang:
+                    log.info("[%s] собеседник говорит на '%s' — команда боту", self.call_id, limba)
+                    self.lang = limba
+                    await self.command(COMENZI_LIMBA[limba])
+
         await self.push_frame(frame, direction)
 
 
@@ -1705,21 +1853,99 @@ async def abuse_watchdog(
         pass
 
 
-async def dead_air_watchdog(call_id: str, activity: "ActivityProbe", task: PipelineTask) -> None:
-    """Раз в 5 с: если DEAD_AIR_SECONDS никто не говорил — завершаем звонок."""
+COMANDA_CONTINUA = (
+    "SYSTEM EVENT: The caller interrupted you and then went silent. "
+    "Softly take the initiative back in one short sentence."
+)
+COMANDA_AUZITI_NOU = (
+    "SYSTEM EVENT: собеседник молчит. Одной короткой фразой, на языке разговора, "
+    "спроси, слышит ли он тебя. Больше ничего не говори."
+)
+COMANDA_AUZITI_DISCUTIE = (
+    "SYSTEM EVENT: собеседник давно молчит. Одной короткой фразой, на языке "
+    "разговора, спроси, на линии ли он ещё. Больше ничего не говори."
+)
+COMANDA_LA_REVEDERE = (
+    "SYSTEM EVENT: собеседник так и не ответил. Одной короткой фразой, на языке "
+    "разговора, скажи, что не слышишь его, предложи перезвонить или написать и "
+    "попрощайся. Больше ничего не говори — после этой фразы звонок завершится."
+)
+
+
+async def dead_air_watchdog(
+    call_id: str, activity: "ActivityProbe", task: PipelineTask, caller: "CallerProbe"
+) -> None:
+    """Тишина в звонке: бот продолжает, переспрашивает, прощается, кладёт трубку.
+
+    Раньше бот молча клал трубку через 50 секунд тишины: всё это время линия
+    была занята, а человек, не расслышавший приветствие, не слышал ни слова.
+    Теперь голосом и короче:
+    — перебил бота и замолчал — бот мягко продолжает сам;
+    — тишина затянулась — бот спрашивает, слышат ли его;
+    — после вопроса снова тишина — бот прощается и кладёт трубку.
+    Пока собеседник не сказал ни слова, сроки короче.
+    """
+    etap = "ждём"         # ждём → спросили → попрощались
+    komanda_ts = 0.0      # когда отдана последняя команда
+    prodolzhil = 0.0      # на какое перебивание уже ответили
+    nachalo = time.time()
     try:
         while True:
-            await asyncio.sleep(5.0)
-            silent_for = time.time() - activity.last_activity_ts
-            if silent_for >= DEAD_AIR_SECONDS:
-                log.warning(
-                    "[%s] DEAD AIR: no speech from either side for %.0fs — hanging up",
-                    call_id,
-                    silent_for,
+            await asyncio.sleep(1.0)
+            tishina = activity.silent_for()
+            now = time.time()
+
+            # Пока бот не поздоровался, тишину не считаем: Gemini мог подключиться
+            # медленно. Но не дольше 20 секунд — вдруг приветствие не прозвучит вовсе.
+            if not activity.bot_started_ts and now - nachalo < 20.0:
+                continue
+
+            # Собеседник заговорил после вопроса — всё сначала.
+            if etap != "ждём" and activity.last_caller_ts > komanda_ts:
+                etap = "ждём"
+
+            if etap == "ждём":
+                perebil = activity.last_interruption_ts
+                if (
+                    perebil
+                    and perebil > activity.last_caller_ts
+                    and perebil != prodolzhil
+                    and tishina >= RESUME_AFTER_INTERRUPT
+                ):
+                    prodolzhil = perebil
+                    log.info("[%s] перебил и замолчал — бот продолжает сам", call_id)
+                    await caller.command(COMANDA_CONTINUA)
+                    continue
+
+                prag = SILENCE_ASK_TALK if activity.caller_spoke else SILENCE_ASK_NEW
+                if tishina >= prag:
+                    log.info("[%s] тишина %.0f с — бот переспрашивает", call_id, tishina)
+                    await caller.command(
+                        COMANDA_AUZITI_DISCUTIE if activity.caller_spoke else COMANDA_AUZITI_NOU
+                    )
+                    etap, komanda_ts = "спросили", now
+
+            elif etap == "спросили":
+                prag = SILENCE_BYE_TALK if activity.caller_spoke else SILENCE_BYE_NEW
+                # Тишина считается от конца вопроса: пока бот спрашивает, её нет.
+                if tishina >= prag and now - komanda_ts >= prag:
+                    log.info("[%s] на вопрос не ответили — бот прощается", call_id)
+                    await caller.command(COMANDA_LA_REVEDERE)
+                    etap, komanda_ts = "попрощались", now
+
+            elif etap == "попрощались":
+                # Кладём трубку, когда бот договорил прощание. Не прозвучало
+                # оно за 15 секунд — всё равно кладём, линию не держим.
+                dogovoril = (
+                    activity.bot_stopped_ts > komanda_ts
+                    and not activity.bot_speaking
+                    and now - activity.bot_stopped_ts >= 1.0
                 )
-                with contextlib.suppress(Exception):
-                    await task.queue_frames([CancelFrame()])
-                return
+                if dogovoril or now - komanda_ts >= 15.0:
+                    log.warning("[%s] DEAD AIR: собеседник не отвечает — бот положил трубку", call_id)
+                    with contextlib.suppress(Exception):
+                        await task.queue_frames([CancelFrame()])
+                    return
     except asyncio.CancelledError:
         pass
 
@@ -1750,47 +1976,6 @@ async def audio_stall_watchdog(
                 return
     except asyncio.CancelledError:
         pass
-
-
-class InterruptionRecoveryProcessor(FrameProcessor):
-    """Клиент перебил и замолчал — бот мягко возвращает инициативу."""
-
-    def __init__(self, context: LLMContext, delay: float = 4.0) -> None:
-        super().__init__()
-        self.context = context
-        self.delay = delay
-        self.task: Optional[PipelineTask] = None
-        self.is_interrupted = False
-        self.recovery_task: Optional[asyncio.Task] = None
-
-    async def _recovery_timer(self) -> None:
-        try:
-            await asyncio.sleep(self.delay)
-            if self.is_interrupted and self.task:
-                self.context.add_message(
-                    {
-                        "role": "user",
-                        "content": "SYSTEM EVENT: The caller interrupted you and then went "
-                        "silent. Softly take the initiative back in one short sentence.",
-                    }
-                )
-                await self.task.queue_frames([LLMRunFrame()])
-                self.is_interrupted = False
-        except asyncio.CancelledError:
-            pass
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
-        await super().process_frame(frame, direction)
-        if isinstance(frame, InterruptionFrame):
-            self.is_interrupted = True
-            if self.recovery_task:
-                self.recovery_task.cancel()
-            self.recovery_task = asyncio.create_task(self._recovery_timer())
-        elif isinstance(frame, (OutputAudioRawFrame, InputAudioRawFrame, UserStartedSpeakingFrame)):
-            if self.recovery_task:
-                self.recovery_task.cancel()
-            self.is_interrupted = False
-        await self.push_frame(frame, direction)
 
 
 # =============================================================================
@@ -2011,6 +2196,19 @@ def build_system_prompt(
         "is not a goodbye — ask if there is anything else you can help with."
     )
     blocks.append("</LANGUAGE>")
+    blocks.append("")
+
+    # Инструменты работают до десяти секунд. Отдельного синтеза речи в цепочке
+    # нет — говорит только Gemini, поэтому предупредить может только он сам.
+    blocks.append("<TOOLS>")
+    blocks.append(
+        "Tools (save_lead, Booking_tool, send_sms) take a few seconds. BEFORE calling "
+        "any of them, say ONE short phrase in the language of the conversation so the "
+        "caller does not sit in silence — for example «O secundă, verific.», «Секунду, "
+        "проверяю.» or «One moment, let me check.» — and only then call the tool. "
+        "Say nothing else before the tool call."
+    )
+    blocks.append("</TOOLS>")
     blocks.append("")
 
     # Последний блок промпта. Клиентский system_prompt содержит жёсткие указания
@@ -2490,12 +2688,18 @@ class WebUserAudioCatcher(FrameProcessor):
     def __init__(self, mixer: WebAudioMixer) -> None:
         super().__init__()
         self.mixer = mixer
+        # Пока работает инструмент, голос посетителя до Gemini не доходит:
+        # иначе «алло?» в паузе оборвёт вызов. Так же сделано на телефоне.
+        # Запись разговора забирает звук раньше — в ней остаётся настоящий голос.
+        self.muted = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if isinstance(frame, InputAudioRawFrame):
             with contextlib.suppress(Exception):
                 self.mixer.add_user_audio(frame)
+            if self.muted:
+                frame.audio = b"\x00" * len(frame.audio)
         await self.push_frame(frame, direction)
 
 
@@ -2972,18 +3176,9 @@ async def web_voice_endpoint(
                 resp.raise_for_status()
                 return resp.json()
 
-            # Инструменты работают до десяти секунд. Без предупреждения
-            # человек слышит тишину, говорит «алё» и обрывает вызов.
-            async def spune_ca_lucram() -> None:
-                fraze = {
-                    "ru": "Секунду, проверяю.",
-                    "en": "One moment, let me check.",
-                }
-
-                await task.queue_frames([
-                    TTSSpeakFrame(fraze.get(call_lang, "O secundă, verific.")),
-                ])
-
+            # Инструменты работают до десяти секунд. Предупреждает о паузе сам
+            # Gemini — правило в блоке <TOOLS> инструкции, а голос посетителя на
+            # это время глушится, чтобы «алло?» в паузе не оборвал вызов.
             async def process_save_lead(fn: FunctionCallParams):
                 nonlocal learned_phone
                 phone_arg = str(fn.arguments.get("client_phone") or "").strip()
@@ -2997,6 +3192,7 @@ async def web_voice_endpoint(
                 if digest in saved_lead_hashes:
                     await fn.result_callback({"status": "success", "message": "Deja salvat."})
                     return
+                user_catcher.muted = True
                 try:
                     result = await call_n8n(
                         "save_lead",
@@ -3016,13 +3212,15 @@ async def web_voice_endpoint(
                         f"⚠️ <b>Eroare API (save_lead)</b>\n🏢 {company}\n🔧 <code>{exc}</code>",
                     )
                     await fn.result_callback({"error": f"Eroare CRM: {exc}"})
+                finally:
+                    user_catcher.muted = False
 
             async def process_booking(fn: FunctionCallParams):
                 nonlocal learned_phone
                 phone_arg = str(fn.arguments.get("phone") or "").strip()
                 if phone_arg:
                     learned_phone = phone_arg
-                await spune_ca_lucram()
+                user_catcher.muted = True
                 try:
                     result = await call_n8n(
                         "booking",
@@ -3044,8 +3242,11 @@ async def web_voice_endpoint(
                         f"⚠️ <b>Eroare API (Booking_tool)</b>\n🏢 {company}\n🔧 <code>{exc}</code>",
                     )
                     await fn.result_callback({"status": "error", "message": str(exc)})
+                finally:
+                    user_catcher.muted = False
 
             async def process_sms(fn: FunctionCallParams):
+                user_catcher.muted = True
                 try:
                     await call_n8n("send_sms", {"client_id": client_id}, fn.arguments, 5.0)
                     await fn.result_callback({"status": "success", "message": "SMS trimis"})
@@ -3059,6 +3260,8 @@ async def web_voice_endpoint(
                         f"⚠️ <b>Eroare API (send_sms)</b>\n🏢 {company}\n🔧 <code>{exc}</code>",
                     )
                     await fn.result_callback({"status": "error", "message": str(exc)})
+                finally:
+                    user_catcher.muted = False
 
             async def process_end_call(fn: FunctionCallParams):
                 elapsed = time.time() - start_ts
@@ -3097,21 +3300,24 @@ async def web_voice_endpoint(
             if client_data.get("google_calendar_id"):
                 llm.register_function("Booking_tool", process_booking)
 
-            recovery = InterruptionRecoveryProcessor(context, delay=RECOVERY_DELAY_S)
             activity = ActivityProbe()
+            caller = CallerProbe(activity, call_lang, call_id)
             user_catcher = WebUserAudioCatcher(mixer)
             ai_catcher = WebAIAudioCatcher(mixer)
             abuse = AbuseProbe()
 
+            # Защита от чтеца и CallerProbe стоят между памятью разговора и
+            # Gemini: только здесь видны слова собеседника, и только отсюда
+            # Gemini посреди звонка принимает команды.
             pipeline = Pipeline(
                 [
                     transport.input(),
                     user_catcher,
-                    abuse,
                     context_aggregator.user(),
+                    abuse,
+                    caller,
                     llm,
                     usage,
-                    recovery,
                     activity,
                     ai_catcher,
                     transport.output(),
@@ -3128,7 +3334,6 @@ async def web_voice_endpoint(
                     enable_usage_metrics=True,
                 ),
             )
-            recovery.task = task
 
             # Браузер закрыл соединение (кнопка «стоп», закрытая вкладка) — завершаем сразу,
             # не дожидаясь сторожа мёртвого эфира.
@@ -3175,7 +3380,7 @@ async def web_voice_endpoint(
             await task.queue_frames([LLMRunFrame()])
 
             runner = PipelineRunner()
-            dead_air = asyncio.create_task(dead_air_watchdog(call_id, activity, task))
+            dead_air = asyncio.create_task(dead_air_watchdog(call_id, activity, task, caller))
             paza_abuz = asyncio.create_task(
                 abuse_watchdog(call_id, abuse, task, client_id, visitor_id, visitor_meta["visitor_ip"])
             )
@@ -3505,7 +3710,6 @@ async def handle_asterisk_conn(
                 return resp.json()
 
             async def process_save_lead(fn: FunctionCallParams):
-                await spune_ca_lucram()
                 # Номер звонящего известен серверу. Модель указывает его только
                 # если клиент просит связаться по ДРУГОМУ номеру.
                 if not str(fn.arguments.get("client_phone") or "").strip():
@@ -3541,7 +3745,6 @@ async def handle_asterisk_conn(
                     socket.is_muted = False
 
             async def process_booking(fn: FunctionCallParams):
-                await spune_ca_lucram()
                 socket.is_muted = True
                 try:
                     result = await call_n8n(
@@ -3619,18 +3822,21 @@ async def handle_asterisk_conn(
             if client_data.get("google_calendar_id"):
                 llm.register_function("Booking_tool", process_booking)
 
-            recovery = InterruptionRecoveryProcessor(context, delay=RECOVERY_DELAY_S)
             probe = InboundAudioProbe()
             activity = ActivityProbe()
+            caller = CallerProbe(activity, call_lang, call_id)
 
+            # CallerProbe стоит между памятью разговора и Gemini: только здесь
+            # видны слова собеседника, и только отсюда Gemini посреди звонка
+            # принимает команды.
             pipeline = Pipeline(
                 [
                     transport.input(),
                     probe,
                     context_aggregator.user(),
+                    caller,
                     llm,
                     usage,
-                    recovery,
                     activity,
                     transport.output(),
                     context_aggregator.assistant(),
@@ -3646,7 +3852,6 @@ async def handle_asterisk_conn(
                     enable_usage_metrics=True,
                 ),
             )
-            recovery.task = task
 
             lang_names = {"ro": "РУМЫНСКОМ", "ru": "РУССКОМ", "en": "АНГЛИЙСКОМ"}
             lang_word = lang_names.get(call_lang, call_lang.upper())
@@ -3689,7 +3894,7 @@ async def handle_asterisk_conn(
 
             runner = PipelineRunner()
             watchdog = asyncio.create_task(audio_stall_watchdog(call_id, socket, probe))
-            dead_air = asyncio.create_task(dead_air_watchdog(call_id, activity, task))
+            dead_air = asyncio.create_task(dead_air_watchdog(call_id, activity, task, caller))
             try:
                 await asyncio.wait_for(runner.run(task), timeout=MAX_CALL_SECONDS)
             except asyncio.TimeoutError:
