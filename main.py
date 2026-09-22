@@ -2413,6 +2413,28 @@ def build_vad_params() -> GeminiVADParams:
         )
 
 
+# Фраза перед инструментом. Отдельного синтеза речи нет — говорит только
+# Gemini, поэтому правило стоит в описании каждого инструмента: описание
+# приходит модели вместе с инструментом и весит для неё больше инструкции.
+FRAZA_INAINTE = (
+    " Înainte de a apela instrumentul, spune cu voce tare o frază scurtă în limba "
+    "conversației — de exemplu «O secundă, verific.» sau «Секунду, проверяю.» — "
+    "și abia apoi apelează-l."
+)
+
+# Номер записи в календаре из ответа n8n на 'book'
+# («Бронь УСПЕШНО создана. ID записи: …»).
+_ID_ZAPISI = re.compile(r"ID записи:\s*([A-Za-z0-9_\-]+)")
+
+
+def id_zapisi(result: Any) -> str:
+    """Номер созданной записи из ответа Booking. Нет номера — пустая строка."""
+    if not result:
+        return ""
+    m = _ID_ZAPISI.search(json.dumps(result, ensure_ascii=False))
+    return m.group(1) if m else ""
+
+
 def build_tools(client_data: dict, readable_hours: str, web: bool = False) -> list[dict]:
     """Инструменты бота. На сайте номера собеседника нет, на телефоне есть.
 
@@ -2423,7 +2445,7 @@ def build_tools(client_data: dict, readable_hours: str, web: bool = False) -> li
     tools = [
         {
             "name": "save_lead",
-            "description": "Salvează datele de contact și motivul apelului în CRM.",
+            "description": "Salvează datele de contact și motivul apelului în CRM." + FRAZA_INAINTE,
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2439,6 +2461,13 @@ def build_tools(client_data: dict, readable_hours: str, web: bool = False) -> li
                         ),
                     },
                     "request_summary": {"type": "string"},
+                    "event_id": {
+                        "type": "string",
+                        "description": (
+                            "ID-ul programării din răspunsul Booking_tool la 'book', dacă "
+                            "ai programat ceva în această convorbire. Altfel lasă gol."
+                        ),
+                    },
                 },
                 "required": ["client_name", "request_summary"],
             },
@@ -2450,7 +2479,7 @@ def build_tools(client_data: dict, readable_hours: str, web: bool = False) -> li
                 "cunoști numărul vizitatorului: cere-i-l întâi, apoi trimite."
                 if web else
                 "Trimite un SMS clientului (linkuri, adrese, confirmări)."
-            ),
+            ) + FRAZA_INAINTE,
             "parameters": {
                 "type": "object",
                 "properties": {"phone": {"type": "string"}, "message": {"type": "string"}},
@@ -2482,23 +2511,43 @@ def build_tools(client_data: dict, readable_hours: str, web: bool = False) -> li
                     "CU UN OM. Poate fi folosit la ORICE oră, inclusiv noaptea — doar slotul "
                     f"programat trebuie să fie în intervalul: {readable_hours}. "
                     "NU folosi pentru consultația pe care o oferi tu însuți — aceea o dai "
-                    "imediat, oricând. Pentru 'book' transmite obligatoriu client_name, "
-                    "phone, request_summary, start_time și end_time."
+                    "imediat, oricând. "
+                    "Acțiuni: 'check' — verifică dacă ora e liberă; fă-l ÎNTOTDEAUNA înainte "
+                    "de 'book' și de 'reschedule'. "
+                    "'book' — programează: start_time este EXACT ora numită de client, "
+                    "end_time este start_time plus 30 de minute; transmite obligatoriu "
+                    "client_name, phone, request_summary, start_time și end_time; după 'book' "
+                    "salvează lead-ul cu save_lead și transmite-i event_id din răspuns. "
+                    "'lookup' — găsește programarea existentă a clientului după phone și "
+                    "întoarce event_id. "
+                    "'reschedule' — mută programarea existentă: event_id, noile start_time și "
+                    "end_time, plus client_name, phone și request_summary. "
+                    "'cancel' — anulează programarea după event_id. "
+                    "Dacă clientul vrea să MUTE o întâlnire, NU crea una nouă: 'lookup', apoi "
+                    "'check' pe noua oră, apoi 'reschedule'."
                     + (
                         " Pe site numărul vizitatorului nu se cunoaște: cere-i-l înainte "
                         "de 'book' și transmite-l în phone."
                         if web else ""
                     )
+                    + FRAZA_INAINTE
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {"type": "string", "enum": ["check", "book", "cancel"]},
+                        "action": {
+                            "type": "string",
+                            "enum": ["check", "book", "lookup", "reschedule", "cancel"],
+                        },
                         "phone": {"type": "string"},
                         "client_name": {"type": "string"},
                         "request_summary": {"type": "string"},
                         "start_time": {"type": "string", "description": "ISO 8601 cu fus orar"},
                         "end_time": {"type": "string", "description": "ISO 8601 cu fus orar"},
+                        "event_id": {
+                            "type": "string",
+                            "description": "ID-ul programării, din 'lookup' sau din răspunsul la 'book'",
+                        },
                     },
                     "required": ["action"],
                 },
@@ -3158,6 +3207,7 @@ async def web_voice_endpoint(
     known_phone = ""
     saved_lead_hashes: set[str] = set()
     tg_chat = ""
+    zapis_id = ""
     caller_memory: dict = {"core": "", "short": "", "long": ""}
     wav_path = f"/tmp/web_{call_id}.wav"
     mixer = WebAudioMixer(wav_path)
@@ -3325,6 +3375,9 @@ async def web_voice_endpoint(
                     learned_phone = phone_arg
                 elif known_phone:
                     fn.arguments["client_phone"] = known_phone
+                # Номер записи в календаре, созданной в этом разговоре, — в карточку.
+                if zapis_id and not str(fn.arguments.get("event_id") or "").strip():
+                    fn.arguments["event_id"] = zapis_id
                 digest = hashlib.sha1(
                     json.dumps(fn.arguments, sort_keys=True, ensure_ascii=False).encode()
                 ).hexdigest()
@@ -3355,10 +3408,19 @@ async def web_voice_endpoint(
                     user_catcher.muted = False
 
             async def process_booking(fn: FunctionCallParams):
-                nonlocal learned_phone
+                nonlocal learned_phone, zapis_id
                 phone_arg = str(fn.arguments.get("phone") or "").strip()
                 if phone_arg:
                     learned_phone = phone_arg
+                elif known_phone:
+                    fn.arguments["phone"] = known_phone
+                # Отмена и перенос записи, созданной в этом же разговоре.
+                if (
+                    fn.arguments.get("action") in ("cancel", "reschedule")
+                    and zapis_id
+                    and not str(fn.arguments.get("event_id") or "").strip()
+                ):
+                    fn.arguments["event_id"] = zapis_id
                 user_catcher.muted = True
                 try:
                     result = await call_n8n(
@@ -3370,6 +3432,7 @@ async def web_voice_endpoint(
                         fn.arguments,
                         10.0,
                     )
+                    zapis_id = id_zapisi(result) or zapis_id
                     await fn.result_callback(result)
                 except asyncio.CancelledError:
                     with contextlib.suppress(Exception):
@@ -3846,6 +3909,7 @@ async def handle_asterisk_conn(
             saved_lead_hashes: set[str] = set()
             tg_chat = client_data.get("tg_chat_id_notify")
             company = client_data.get("company_name") or "Companie"
+            zapis_id = ""
 
             async def call_n8n(path: str, params: dict, arguments: dict, timeout: float):
                 url = f"{N8N_BASE_URL}/{path}"
@@ -3858,6 +3922,9 @@ async def handle_asterisk_conn(
                 # если клиент просит связаться по ДРУГОМУ номеру.
                 if not str(fn.arguments.get("client_phone") or "").strip():
                     fn.arguments["client_phone"] = target_phone
+                # Номер записи в календаре, созданной в этом звонке, — в карточку.
+                if zapis_id and not str(fn.arguments.get("event_id") or "").strip():
+                    fn.arguments["event_id"] = zapis_id
                 # Дедуп: модель иногда зовёт save_lead дважды на один и тот же лид.
                 digest = hashlib.sha1(
                     json.dumps(fn.arguments, sort_keys=True, ensure_ascii=False).encode()
@@ -3889,6 +3956,17 @@ async def handle_asterisk_conn(
                     socket.is_muted = False
 
             async def process_booking(fn: FunctionCallParams):
+                nonlocal zapis_id
+                # Номер звонящего известен серверу — в запись и в поиск записи.
+                if not str(fn.arguments.get("phone") or "").strip():
+                    fn.arguments["phone"] = target_phone
+                # Отмена и перенос записи, созданной в этом же звонке.
+                if (
+                    fn.arguments.get("action") in ("cancel", "reschedule")
+                    and zapis_id
+                    and not str(fn.arguments.get("event_id") or "").strip()
+                ):
+                    fn.arguments["event_id"] = zapis_id
                 socket.is_muted = True
                 try:
                     result = await call_n8n(
@@ -3900,6 +3978,7 @@ async def handle_asterisk_conn(
                         fn.arguments,
                         10.0,
                     )
+                    zapis_id = id_zapisi(result) or zapis_id
                     await fn.result_callback(result)
                 except asyncio.CancelledError:
                     with contextlib.suppress(Exception):
@@ -3997,6 +4076,15 @@ async def handle_asterisk_conn(
                     enable_usage_metrics=True,
                 ),
             )
+
+            # Абонент положил трубку — Asterisk закрыл соединение. Завершаем
+            # звонок сразу, не дожидаясь сторожа тишины.
+            @transport.event_handler("on_client_disconnected")
+            async def _on_gsm_client_disconnected(_transport, _client):
+                clog.info("[%s] абонент положил трубку", call_id)
+                if task:
+                    with contextlib.suppress(Exception):
+                        await task.queue_frames([CancelFrame()])
 
             lang_names = {"ro": "РУМЫНСКОМ", "ru": "РУССКОМ", "en": "АНГЛИЙСКОМ"}
             lang_word = lang_names.get(call_lang, call_lang.upper())
