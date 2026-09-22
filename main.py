@@ -1639,6 +1639,10 @@ class ActivityProbe(FrameProcessor):
         self.caller_spoke = False
         self.last_caller_ts = 0.0
         self.last_interruption_ts = 0.0
+        # Когда боту в последний раз отдали команду. Gemini отвечает на неё так
+        # же, как на реплику человека: обрывает себя и сообщает «меня перебили».
+        # Это перебивание наше, не собеседника, — его не считаем.
+        self.command_ts = 0.0
         # Работает ли сейчас инструмент. Каждый инструмент на время работы
         # глушит голос собеседника — на это глушение и смотрим. Подключается
         # при сборке звонка; пока не подключено — инструментов нет.
@@ -1650,6 +1654,10 @@ class ActivityProbe(FrameProcessor):
         self.last_activity_ts = now
         self.last_caller_ts = now
         self.caller_spoke = True
+
+    def mark_command(self) -> None:
+        """Боту отдали команду."""
+        self.command_ts = time.time()
 
     def mark_voice(self) -> None:
         """Слышен голос собеседника — он говорит прямо сейчас.
@@ -1688,8 +1696,10 @@ class ActivityProbe(FrameProcessor):
             self.bot_stopped_ts = now
             self.last_activity_ts = now
         elif isinstance(frame, InterruptionFrame):
-            # Gemini услышал речь собеседника и оборвал бота.
-            self.last_interruption_ts = now
+            # Gemini оборвал бота. Если за две секунды до этого мы сами отдали
+            # команду — оборвала её она, а не собеседник.
+            if now - self.command_ts > 2.0:
+                self.last_interruption_ts = now
             self.last_activity_ts = now
         elif isinstance(frame, OutputAudioRawFrame):
             self.last_activity_ts = now
@@ -1775,6 +1785,7 @@ class CallerProbe(FrameProcessor):
 
     async def command(self, text: str) -> None:
         """Команда боту — он сразу ответит по ней вслух."""
+        self.activity.mark_command()
         await self.push_frame(
             LLMMessagesAppendFrame(messages=[{"role": "user", "content": text}]),
             FrameDirection.DOWNSTREAM,
@@ -2352,7 +2363,13 @@ def build_vad_params() -> GeminiVADParams:
         )
 
 
-def build_tools(client_data: dict, readable_hours: str) -> list[dict]:
+def build_tools(client_data: dict, readable_hours: str, web: bool = False) -> list[dict]:
+    """Инструменты бота. На сайте номера собеседника нет, на телефоне есть.
+
+    Описание приходит модели вместе с самим инструментом, поэтому для неё оно
+    весомее слов выше по тексту. Сказать на сайте «номер уже известен» — значит
+    заставить её этот номер выдумать.
+    """
     tools = [
         {
             "name": "save_lead",
@@ -2364,6 +2381,9 @@ def build_tools(client_data: dict, readable_hours: str) -> list[dict]:
                     "client_phone": {
                         "type": "string",
                         "description": (
+                            "Numărul vizitatorului NU este cunoscut: pe site nu se vede "
+                            "niciun număr de telefon. Cere-i numărul și scrie-l aici."
+                            if web else
                             "Doar dacă clientul cere să fie contactat pe ALT număr. "
                             "Numărul de la care sună este deja cunoscut — nu-l întreba."
                         ),
@@ -2375,7 +2395,12 @@ def build_tools(client_data: dict, readable_hours: str) -> list[dict]:
         },
         {
             "name": "send_sms",
-            "description": "Trimite un SMS clientului (linkuri, adrese, confirmări).",
+            "description": (
+                "Trimite un SMS clientului (linkuri, adrese, confirmări). Pe site nu "
+                "cunoști numărul vizitatorului: cere-i-l întâi, apoi trimite."
+                if web else
+                "Trimite un SMS clientului (linkuri, adrese, confirmări)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {"phone": {"type": "string"}, "message": {"type": "string"}},
@@ -2409,6 +2434,11 @@ def build_tools(client_data: dict, readable_hours: str) -> list[dict]:
                     "NU folosi pentru consultația pe care o oferi tu însuți — aceea o dai "
                     "imediat, oricând. Pentru 'book' transmite obligatoriu client_name, "
                     "phone, request_summary, start_time și end_time."
+                    + (
+                        " Pe site numărul vizitatorului nu se cunoaște: cere-i-l înainte "
+                        "de 'book' și transmite-l în phone."
+                        if web else ""
+                    )
                 ),
                 "parameters": {
                     "type": "object",
@@ -3170,9 +3200,13 @@ async def web_voice_endpoint(
                 "\n\nCHANNEL: this is a voice chat from the company's WEBSITE, not a phone call. "
                 "You do not know the visitor's phone number unless it is stated above or the visitor gives it. "
                 "To hand over to a manager or to book, ask for a phone number and use save_lead."
+                "\nPhone numbers and addresses in the company information are the COMPANY's "
+                "contacts, never the visitor's. If the visitor asks which number you see: on "
+                "the website you see none — say so plainly and ask them to tell you theirs. "
+                "Never guess a number and never read one out as if it were theirs."
             )
             _, readable_hours = office_state(hours, now)
-            tools = [{"function_declarations": build_tools(client_data, readable_hours)}]
+            tools = [{"function_declarations": build_tools(client_data, readable_hours, web=True)}]
             full_system_text = system_prompt + json.dumps(tools, ensure_ascii=False)
             system_instructions_length = len(full_system_text)
             system_prompt_tokens = estimate_tokens(full_system_text)
