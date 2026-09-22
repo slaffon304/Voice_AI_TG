@@ -226,7 +226,9 @@ PERSONA_CACHE_TTL = _env_int("PERSONA_CACHE_TTL", 60)
 PRICE_TEXT_IN = _env_float("PRICE_TEXT_IN", 0.75)
 PRICE_AUDIO_IN = _env_float("PRICE_AUDIO_IN", 3.00)
 PRICE_AUDIO_OUT = _env_float("PRICE_AUDIO_OUT", 12.00)
-
+# Сколько токенов Google насчитывает за секунду речи бота. Нужно, когда
+# ответ оборвался и Google не успел прислать расход сам.
+AUDIO_TOKENS_PER_SECOND = 25
 INTERNAL_TOKEN = os.getenv("INTERNAL_TOKEN")  # опционально защищает /get_uuid
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 
@@ -1225,6 +1227,11 @@ async def run_archivist_and_notify_n8n(
     today = dt.datetime.now(tz_for(tz_name)).strftime("%Y-%m-%d")
     clean_phone = "".join(filter(str.isdigit, str(phone)))
 
+    # Человек не сказал ни слова — разговора не было. Модель для отчёта не
+    # зовём и память не трогаем: писать нечего, а додумать модель может.
+    # Отчёт в n8n всё равно уходит — в нём факт звонка и его расход.
+    razgovor_gol = call_status in ("inbound_dropped", "outbound_short_call")
+
     prompt = f"""Ты ИИ-архивариус. Обнови память клиента и составь резюме звонка для CRM.
 Дата звонка: {today}. Направление: {direction}.
 
@@ -1237,6 +1244,10 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
 
 СУБТИТРЫ ЗВОНКА:
 {chat_history}
+
+ПРАВИЛА:
+- Пиши только то, что реально прозвучало. Ничего не додумывай: если бот не спросил имя — не пиши, что спросил; если клиент не назвал задачу — так и напиши.
+- summary, sentiment и next_step пиши на том языке, на котором шёл разговор.
 
 ИНСТРУКЦИЯ (выведи СТРОГО JSON, без markdown):
 1. core_identity: обнови, если клиент сообщил фундаментальный факт.
@@ -1254,32 +1265,45 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
 
     data: dict[str, Any] = {}
     client = genai.Client(api_key=GEMINI_API_KEY)
-    for attempt, model in enumerate(ARCHIVIST_MODELS):
-        try:
-            response = await client.aio.models.generate_content(
-                model=model,
-                contents=[audio_part, prompt] if audio_part else prompt,
-                config=types.GenerateContentConfig(response_mime_type="application/json"),
-            )
-            data = json.loads(response.text.strip())
-            break
-        except Exception as exc:
-            log.warning("archivist model %s failed: %s", model, exc)
-            if attempt < len(ARCHIVIST_MODELS) - 1:
-                await asyncio.sleep(2)
-    else:
+    if razgovor_gol:
         data = {
             "core_identity": old_memory.get("core", ""),
             "short_term_context": old_memory.get("short", ""),
             "long_term_context": old_memory.get("long", ""),
-            "summary": "Ошибка генерации саммари: все модели недоступны.",
-            "sentiment": "Неизвестно",
-            "next_step": "Связаться вручную",
+            "summary": "Разговор не состоялся: собеседник не сказал ни слова.",
+            "sentiment": "—",
+            "next_step": "—",
             "language": DEFAULT_LANG,
         }
+    else:
+        for attempt, model in enumerate(ARCHIVIST_MODELS):
+            try:
+                response = await client.aio.models.generate_content(
+                    model=model,
+                    contents=[audio_part, prompt] if audio_part else prompt,
+                    config=types.GenerateContentConfig(response_mime_type="application/json"),
+                )
+                data = json.loads(response.text.strip())
+                break
+            except Exception as exc:
+                log.warning("archivist model %s failed: %s", model, exc)
+                if attempt < len(ARCHIVIST_MODELS) - 1:
+                    await asyncio.sleep(2)
+        else:
+            data = {
+                "core_identity": old_memory.get("core", ""),
+                "short_term_context": old_memory.get("short", ""),
+                "long_term_context": old_memory.get("long", ""),
+                "summary": "Ошибка генерации саммари: все модели недоступны.",
+                "sentiment": "Неизвестно",
+                "next_step": "Связаться вручную",
+                "language": DEFAULT_LANG,
+            }
 
     try:
-        if web_id:
+        if razgovor_gol:
+            log.info("[archivist] пустой звонок — память не трогаем")
+        elif web_id:
             await sb_rpc(
                 "person_memory_upsert_web",
                 {
@@ -1306,7 +1330,10 @@ LONG TERM: {old_memory.get('long') or 'Нет данных'}
                 },
                 timeout=5.0,
             )
-        log.info("[archivist] memory saved for %s", clean_phone)
+        if not razgovor_gol:
+            # У посетителя сайта телефона нет — пишем его метку, иначе
+            # в журнале не понять, чья память записана.
+            log.info("[archivist] memory saved for %s", clean_phone or f"web {web_id[:12]}")
     except Exception as exc:
         log.error("[archivist] memory save failed: %s", exc)
 
@@ -1490,6 +1517,8 @@ class UsageAggregator(FrameProcessor):
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.turns = 0
+        # Секунды речи бота, за которые Google ещё не прислал расход.
+        self.unreported_audio_s = 0.0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -1499,7 +1528,28 @@ class UsageAggregator(FrameProcessor):
                     self.prompt_tokens += d.value.prompt_tokens
                     self.completion_tokens += d.value.completion_tokens
                     self.turns += 1
+                    self.unreported_audio_s = 0.0
+        elif isinstance(frame, OutputAudioRawFrame) and frame.sample_rate:
+            self.unreported_audio_s += len(frame.audio) / (
+                frame.sample_rate * max(1, frame.num_channels) * 2
+            )
         await self.push_frame(frame, direction)
+
+    def settle_cut_reply(self, system_prompt_tokens: int) -> None:
+        """Ответ оборвался — расход Google не прислал, но работу сделал.
+
+        Расход приходит только в конце ответа. Если собеседник положил
+        трубку или закрыл страницу посреди фразы, без досчёта звонок
+        записался бы бесплатным. Считаем по минимуму: инструкцию, которую
+        модель прочитала, и сказанные ботом секунды.
+        """
+        if self.unreported_audio_s < 0.3:
+            return
+
+        self.prompt_tokens += system_prompt_tokens
+        self.completion_tokens += int(self.unreported_audio_s * AUDIO_TOKENS_PER_SECOND)
+        self.turns += 1
+        self.unreported_audio_s = 0.0
 
     def cost(self, system_prompt_tokens: int) -> tuple[int, int, float]:
         turns = max(1, self.turns)
@@ -3169,6 +3219,7 @@ async def web_voice_endpoint(
                 transcript, user_replies = build_transcript(context.messages)
                 if transcript:
                     clog.info("[%s] ДИАЛОГ:\n%s", call_id, transcript)
+                usage.settle_cut_reply(system_prompt_tokens)
                 text_in, audio_in, cost = usage.cost(system_prompt_tokens)
                 usage_stats = {
                     "started_at": started_at.isoformat(),
@@ -3689,6 +3740,7 @@ async def handle_asterisk_conn(
                 transcript, user_replies = build_transcript(context.messages)
                 if transcript:
                     clog.info("[%s] ДИАЛОГ:\n%s", call_id, transcript)
+                usage.settle_cut_reply(system_prompt_tokens)
                 text_in, audio_in, cost = usage.cost(system_prompt_tokens)
 
                 usage_stats = {
