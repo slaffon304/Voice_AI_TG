@@ -234,6 +234,8 @@ WEB_CHAT_MAX_PER_SITE = _env_int("WEB_CHAT_MAX_PER_SITE", 1000)
 WEB_CHAT_SESSION_TTL = _env_int("WEB_CHAT_SESSION_TTL", 7200)
 # Голосовое сообщение: не больше этого размера в base64 (~1 минута речи).
 WEB_CHAT_MAX_AUDIO_B64 = _env_int("WEB_CHAT_MAX_AUDIO_B64", 1_500_000)
+# Картинка: виджет уменьшает её до 1280 точек, это ~200 КБ; запас с головой.
+WEB_CHAT_MAX_IMAGE_B64 = _env_int("WEB_CHAT_MAX_IMAGE_B64", 3_000_000)
 WEB_CHAT_MAX_TEXT = 2000
 
 # Раньше этого не было: бот принял мусорную расшифровку за прощание и положил
@@ -3317,7 +3319,7 @@ def _chat_raspuns(date: dict, origin: str, status: int = 200) -> Response:
 async def _chat_corp(request: Request) -> dict:
     try:
         raw = await request.body()
-        if len(raw) > WEB_CHAT_MAX_AUDIO_B64 + 20_000:
+        if len(raw) > max(WEB_CHAT_MAX_AUDIO_B64, WEB_CHAT_MAX_IMAGE_B64) + 20_000:
             return {}
         date = json.loads(raw.decode("utf-8") or "{}")
         return date if isinstance(date, dict) else {}
@@ -3464,9 +3466,16 @@ async def web_chat_message(request: Request) -> Response:
     audio = str(corp.get("audio") or "")
     audio_mime = re.sub(r"[^a-z0-9/;=.\-]", "", str(corp.get("audio_mime") or "").lower())[:60]
 
+    image = str(corp.get("image") or "")
+    image_mime = str(corp.get("image_mime") or "").lower()
+    if image_mime not in ("image/jpeg", "image/png", "image/webp"):
+        image_mime = "image/jpeg"
+
     if len(audio) > WEB_CHAT_MAX_AUDIO_B64:
         return _chat_raspuns({"refused": "too_long"}, origin)
-    if not text and not audio:
+    if len(image) > WEB_CHAT_MAX_IMAGE_B64:
+        return _chat_raspuns({"refused": "too_big"}, origin)
+    if not text and not audio and not image:
         return _chat_raspuns({"reply": ""}, origin)
 
     if await _este_blocat(visitor_id, ip):
@@ -3485,6 +3494,8 @@ async def web_chat_message(request: Request) -> Response:
         "text": text,
         "audio": audio,
         "audio_mime": audio_mime or "audio/webm",
+        "image": image,
+        "image_mime": image_mime,
         "page_lang": re.sub(r"[^a-z]", "", str(corp.get("lang") or "").lower())[:2],
         "visitor_ip": ip,
         "visitor_agent": (request.headers.get("user-agent") or "")[:300],
@@ -3507,9 +3518,13 @@ async def web_chat_message(request: Request) -> Response:
 
     if isinstance(raspuns, list):
         raspuns = raspuns[0] if raspuns else {}
-    reply = str((raspuns or {}).get("reply") or "").strip() if isinstance(raspuns, dict) else ""
+    raspuns = raspuns if isinstance(raspuns, dict) else {}
+    reply = str(raspuns.get("reply") or "").strip()
+    # Ответ на голосовое приходит из n8n и голосом: wav в base64.
+    audio_reply = raspuns.get("audio")
+    audio_reply = audio_reply if isinstance(audio_reply, str) else ""
 
-    return _chat_raspuns({"reply": reply}, origin)
+    return _chat_raspuns({"reply": reply, "audio": audio_reply}, origin)
 
 
 @app.websocket("/ws")
