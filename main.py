@@ -53,6 +53,8 @@ from google import genai
 from google.genai import types
 from supabase import Client, create_client
 
+from core import *
+
 try:
     from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
 except Exception:  # зависимость pyrnnoise/PyAV может быть несовместима после пересборки
@@ -4789,3 +4791,11 @@ async def handle_asterisk_conn(
                 asyncio.create_task(post_processing())
             else:
                 gc.collect()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    app_port = int(os.getenv("PORT", 3000))
+    if app_port == 8080:
+        app_port = 3000
+    uvicorn.run("main:app", host="0.0.0.0", port=app_port, reload=False)
