@@ -2,13 +2,20 @@
 Изолированный WebRTC + RTVI контур для «Сайта Будущего».
 
 Legacy GSM и /ws НЕ затрагиваются.
-Фаза 3.1: Анти-Диктовка.
-Фаза 3.2: Zero-Click Dwell Sensing.
-Фаза 3.3: ROI Calculator.
-Фаза 3.4: Live Screen Audit (контракт + поток).
-Фаза 3.5: Real-Time Sentiment UI Morphing.
-Фаза 2.5: UI Worker Protocol v1 — приём ui-snapshot + DOM-команды
-          (scroll_to, highlight, set_input_value, click).
+
+Стратегия продукта:
+  - Клиентам (серия) — Intent-Matched Widgets: готовые секции + умное управление.
+  - labupgrade.ai (концепт) — расширяемый payload с components для Prompt-to-Component.
+
+Реализовано:
+  Фаза 3.1 Анти-Диктовка
+  Фаза 3.2 Zero-Click Dwell Sensing
+  Фаза 3.3 ROI Calculator
+  Фаза 3.4 Live Screen Audit
+  Фаза 3.5 Real-Time Sentiment UI Morphing
+  Фаза 2.5 UI protocol: ui-snapshot + DOM-команды (scroll_to, highlight,
+            set_input_value, click) через RTVIUICommandFrame
+
 Защита /api/offer: origin, blacklist, Turnstile, суточные лимиты.
 """
 
@@ -96,10 +103,12 @@ ROI_DEFAULTS = {
 UI_NAVIGATION_TOOL = {
     "name": "control_website_ui",
     "description": (
-        "Deschide automat secțiunile site-ului, afișează carduri interactive "
-        "(servicii, prețuri, portofoliu, calendar de programare) sau evidențiază "
-        "informații pe ecranul clientului. Folosește-l când utilizatorul cere "
-        "să vadă ceva pe ecran sau când vrei să arăți informație vizual."
+        "Controls the website interface in real time. "
+        "SERIES mode (default for clients): open a prepared section "
+        "(hero, services, pricing, cases, booking_widget, contacts, roi_calculator) "
+        "and optionally highlight an element or prefill a form. "
+        "CONCEPT mode (labupgrade.ai): you may also pass a 'components' list to "
+        "assemble the view from design-system primitives. Prefer 'section' when in doubt."
     ),
     "parameters": {
         "type": "object",
@@ -115,15 +124,30 @@ UI_NAVIGATION_TOOL = {
                     "contacts",
                     "roi_calculator",
                 ],
-                "description": "Secțiunea sau widget-ul care trebuie afișat pe ecran",
+                "description": "Prepared section to show (series mode). Always provide when possible.",
             },
             "highlight_element": {
                 "type": "string",
-                "description": "ID-ul elementului sau tarifului pe care trebuie pus accent vizual",
+                "description": "Element id or plan id to visually emphasize",
             },
             "prefill_data": {
                 "type": "object",
-                "description": "Date pre-completate pentru formularul de pe ecran",
+                "description": "Data to pre-fill into the visible form (name, phone, slot, etc.)",
+            },
+            "components": {
+                "type": "array",
+                "description": (
+                    "Optional. CONCEPT mode only: list of design-system components "
+                    "to compose the view. Each item: {type, props}. "
+                    "Series clients ignore this field."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string"},
+                        "props": {"type": "object"},
+                    },
+                },
             },
         },
         "required": ["section"],
@@ -372,7 +396,10 @@ async def run_webrtc_session(
         "shows cases or guarantees. Do not call it repeatedly for the same signal. "
         "DOM (Фаза 2.5): you may receive SYSTEM UI EVENT with ui-snapshot data. "
         "Use dom_action for precise scroll_to / highlight / set_input_value / click "
-        "when you have a ref or target_id. Prefer high-level control_website_ui first."
+        "when you have a ref or target_id. Prefer high-level control_website_ui first. "
+        "UI MODE: always prefer the 'section' parameter of control_website_ui. "
+        "Only use the optional 'components' list when you need to compose a custom view "
+        "(concept mode). Series clients ignore components."
     )
 
     tools = _build_tools_with_ui(client_data, "")
@@ -417,23 +444,31 @@ async def run_webrtc_session(
         section = params.arguments.get("section", "hero")
         highlight = params.arguments.get("highlight_element")
         prefill = params.arguments.get("prefill_data") or {}
+        components = params.arguments.get("components")  # CONCEPT mode (optional)
+
+        payload: dict[str, Any] = {
+            "section": section,
+            "highlight": highlight,
+            "prefill": prefill,
+        }
+        if components:
+            payload["components"] = components
+
         if task is not None:
             await task.queue_frames([
                 RTVIUICommandFrame(
                     command="navigate_and_render",
-                    payload={
-                        "section": section,
-                        "highlight": highlight,
-                        "prefill": prefill,
-                    },
+                    payload=payload,
                 )
             ])
         await params.result_callback({
             "status": "ui_updated",
             "active_section": section,
+            "has_components": bool(components),
             "instruction": (
-                f"Section '{section}' is now shown on screen. "
-                "Give a short spoken summary of what the visitor sees."
+                f"Section '{section}' is now shown on screen"
+                + (" (with custom components)" if components else "")
+                + ". Give a short spoken summary of what the visitor sees."
             ),
         })
 
