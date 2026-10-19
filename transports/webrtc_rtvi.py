@@ -15,6 +15,7 @@ Legacy GSM и /ws НЕ затрагиваются.
   Фаза 3.5 Real-Time Sentiment UI Morphing
   Фаза 2.5 UI protocol: ui-snapshot + DOM-команды (scroll_to, highlight,
             set_input_value, click) через RTVIUICommandFrame
+  Agentic Tool-State: set_agent_state → Thinking Orb (thinking-orbs)
 
 Защита /api/offer: origin, blacklist, Turnstile, суточные лимиты.
 """
@@ -279,6 +280,44 @@ DOM_ACTION_TOOL = {
     },
 }
 
+# Agentic Tool-State + Thinking Orbs
+# Front-end will render the matching orb from the `thinking-orbs` library.
+AGENT_STATE_TOOL = {
+    "name": "set_agent_state",
+    "description": (
+        "Update the visual agent state indicator on the page (Thinking Orb). "
+        "Call this when you start or finish a meaningful action so the visitor "
+        "sees what you are doing. Use short-lived states; return to 'breathing' "
+        "or clear when idle."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "state": {
+                "type": "string",
+                "enum": [
+                    "working",
+                    "searching",
+                    "solving",
+                    "listening",
+                    "connecting",
+                    "weaving",
+                    "composing",
+                    "breathing",
+                    "shaping",
+                    "idle",
+                ],
+                "description": "Current agent activity shown as a Thinking Orb",
+            },
+            "label": {
+                "type": "string",
+                "description": "Optional short label next to the orb (e.g. 'Checking calendar')",
+            },
+        },
+        "required": ["state"],
+    },
+}
+
 
 def _build_tools_with_ui(client_data: dict, readable_hours: str) -> list[dict]:
     base = build_tools(client_data, readable_hours, web=True)
@@ -287,6 +326,7 @@ def _build_tools_with_ui(client_data: dict, readable_hours: str) -> list[dict]:
     base.append(SCREEN_AUDIT_TOOL)
     base.append(SENTIMENT_MORPH_TOOL)
     base.append(DOM_ACTION_TOOL)
+    base.append(AGENT_STATE_TOOL)
     return [{"function_declarations": base}]
 
 
@@ -399,7 +439,11 @@ async def run_webrtc_session(
         "when you have a ref or target_id. Prefer high-level control_website_ui first. "
         "UI MODE: always prefer the 'section' parameter of control_website_ui. "
         "Only use the optional 'components' list when you need to compose a custom view "
-        "(concept mode). Series clients ignore components."
+        "(concept mode). Series clients ignore components. "
+        "AGENT STATE: before longer actions (checking calendar, calculating ROI, "
+        "auditing page) call set_agent_state with an appropriate state "
+        "(searching, solving, working, composing…). Return to breathing or idle when done. "
+        "This drives the Thinking Orb the visitor sees."
     )
 
     tools = _build_tools_with_ui(client_data, "")
@@ -429,6 +473,7 @@ async def run_webrtc_session(
                 "request_screen_audit": RTVIFunctionCallReportLevel.FULL,
                 "morph_ui_for_sentiment": RTVIFunctionCallReportLevel.FULL,
                 "dom_action": RTVIFunctionCallReportLevel.FULL,
+                "set_agent_state": RTVIFunctionCallReportLevel.FULL,
                 "Booking_tool": RTVIFunctionCallReportLevel.ARGUMENTS,
             }
         ),
@@ -607,6 +652,34 @@ async def run_webrtc_session(
             "instruction": f"DOM command '{action}' sent. Continue speaking naturally.",
         })
 
+    async def process_set_agent_state(params: FunctionCallParams):
+        """Agentic Tool-State → Thinking Orb on the client."""
+        state = str(params.arguments.get("state") or "breathing").strip()
+        label = params.arguments.get("label")
+        allowed = {
+            "working", "searching", "solving", "listening",
+            "connecting", "weaving", "composing", "breathing",
+            "shaping", "idle",
+        }
+        if state not in allowed:
+            await params.result_callback({"status": "error", "message": f"Unknown state: {state}"})
+            return
+
+        payload: dict[str, Any] = {"state": state}
+        if label:
+            payload["label"] = str(label)[:80]
+
+        if task is not None:
+            await task.queue_frames([
+                RTVIUICommandFrame(command="set_agent_state", payload=payload)
+            ])
+
+        await params.result_callback({
+            "status": "state_updated",
+            "state": state,
+            "instruction": "Agent state indicator updated. Continue the task.",
+        })
+
     async def process_save_lead(params: FunctionCallParams):
         nonlocal learned_phone
         phone = str(params.arguments.get("client_phone") or "").strip()
@@ -756,6 +829,7 @@ async def run_webrtc_session(
     llm.register_function("request_screen_audit", process_request_screen_audit)
     llm.register_function("morph_ui_for_sentiment", process_morph_ui_for_sentiment)
     llm.register_function("dom_action", process_dom_action)
+    llm.register_function("set_agent_state", process_set_agent_state)
     llm.register_function("save_lead", process_save_lead)
     llm.register_function("Booking_tool", process_booking)
     llm.register_function("send_sms", process_sms)
