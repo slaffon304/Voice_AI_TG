@@ -2,8 +2,8 @@
 Изолированный WebRTC + RTVI контур для «Сайта Будущего».
 
 Legacy GSM и /ws НЕ затрагиваются.
-Паттерны LLM, tools и обработчиков — как в main.py (web endpoint).
-Фаза 3.1: Анти-Диктовка (Voice + Micro-Form Injection).
+Фаза 3.1: Анти-Диктовка.
+Защита /api/offer: origin, blacklist, Turnstile, суточные лимиты.
 """
 
 from __future__ import annotations
@@ -13,11 +13,13 @@ import contextlib
 import hashlib
 import html
 import logging
+import re
 import time
 import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
 from pipecat.frames.frames import (
     CancelFrame,
     LLMMessagesAppendFrame,
@@ -53,13 +55,18 @@ from core import (
     build_personality_block,
     build_tools,
     call_n8n,
+    este_blocat,
     get_client_data,
     get_persona,
     id_din_lookup,
     id_zapisi,
     log,
     normalizeaza_timp,
+    origin_permis,
+    peste_limita,
+    propusk_valabil,
     resolve_voice_name,
+    sb_select,
     send_tg_alert,
     slot_liber,
     telefon_valid,
@@ -106,7 +113,6 @@ UI_NAVIGATION_TOOL = {
 
 
 def _build_tools_with_ui(client_data: dict, readable_hours: str) -> list[dict]:
-    """Формат как в main.py: [{"function_declarations": [...]}]."""
     base = build_tools(client_data, readable_hours, web=True)
     base.append(UI_NAVIGATION_TOOL)
     return [{"function_declarations": base}]
@@ -130,7 +136,6 @@ async def run_webrtc_session(
     tg_chat = client_data.get("tg_chat_id_notify") or ""
     start_ts = time.time()
 
-    known_phone = ""
     learned_phone = ""
     zapis_id = ""
     saved_lead_hashes: set[str] = set()
@@ -183,7 +188,6 @@ async def run_webrtc_session(
     context_aggregator = LLMContextAggregatorPair(context)
     task: Optional[PipelineTask] = None
 
-    # ----- UI -----
     async def process_control_website_ui(params: FunctionCallParams):
         section = params.arguments.get("section", "hero")
         highlight = params.arguments.get("highlight_element")
@@ -208,7 +212,6 @@ async def run_webrtc_session(
             ),
         })
 
-    # ----- save_lead -----
     async def process_save_lead(params: FunctionCallParams):
         nonlocal learned_phone
         phone = str(params.arguments.get("client_phone") or "").strip()
@@ -244,7 +247,6 @@ async def run_webrtc_session(
             )
             await params.result_callback({"error": f"Eroare CRM: {exc}"})
 
-    # ----- Booking_tool -----
     async def process_booking(params: FunctionCallParams):
         nonlocal learned_phone, zapis_id
         phone_arg = str(params.arguments.get("phone") or "").strip()
@@ -257,7 +259,6 @@ async def run_webrtc_session(
         normalizeaza_timp(params.arguments, tz_name)
 
         if action == "book" and not telefon_valid(phone_arg):
-            # Анти-диктовка: форма на экране вместо диктовки номера
             if task is not None:
                 await task.queue_frames([
                     RTVIUICommandFrame(
@@ -321,7 +322,6 @@ async def run_webrtc_session(
             )
             await params.result_callback({"status": "error", "message": str(exc)})
 
-    # ----- send_sms -----
     async def process_sms(params: FunctionCallParams):
         phone = str(params.arguments.get("phone") or "").strip()
         if not phone and learned_phone:
@@ -343,7 +343,6 @@ async def run_webrtc_session(
             )
             await params.result_callback({"status": "error", "message": str(exc)})
 
-    # ----- end_call -----
     async def process_end_call(params: FunctionCallParams):
         elapsed = time.time() - start_ts
         if elapsed < MIN_SECONDS_BEFORE_END_CALL:
@@ -446,21 +445,69 @@ async def run_webrtc_session(
 
 @router.post("/api/offer")
 async def webrtc_offer(request: Request):
+    """
+    Сигналинг WebRTC + та же защита, что у /ws:
+    ключ виджета, origin, blacklist, Turnstile, суточные лимиты.
+    """
     body = await request.json()
     offer_sdp = body.get("sdp")
     offer_type = body.get("type", "offer")
-    client_id = (body.get("client_id") or "").strip()
-    visitor_id = (body.get("visitor_id") or uuid.uuid4().hex)[:64]
-    project_id = (body.get("project_id") or "").strip()
+    key = re.sub(r"[^A-Za-z0-9_\-]", "", str(body.get("key") or ""))[:64]
+    visitor_id = re.sub(r"[^A-Za-z0-9_\-]", "", str(body.get("visitor_id") or ""))[:64]
+    turnstile_token = str(body.get("t") or "")
+    project_id = str(body.get("project_id") or "").strip()
 
     if not offer_sdp:
-        return {"error": "missing sdp"}, 400
-    if not client_id:
-        return {"error": "missing client_id"}, 400
+        return JSONResponse({"error": "missing sdp"}, status_code=400)
+    if not key:
+        return JSONResponse({"error": "missing widget key"}, status_code=400)
 
-    client_data = await get_client_data(client_id)
-    if not client_data:
-        return {"error": "unknown client_id"}, 404
+    forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    ip = forwarded or (request.client.host if request.client else "")
+    origin = request.headers.get("origin") or ""
+
+    try:
+        channel_rows = await sb_select(
+            "bot_channels",
+            {
+                "identifier": f"eq.{key}",
+                "platform": "eq.web",
+                "select": "client_id,project_id,allowed_origins,turnstile_secret_key,voice_enabled",
+                "limit": "1",
+            },
+            timeout=2.5,
+        )
+    except Exception as exc:
+        log.error("webrtc channel lookup failed: %s", exc)
+        return JSONResponse({"error": "channel lookup failed"}, status_code=500)
+
+    if not channel_rows or not channel_rows[0].get("client_id"):
+        return JSONResponse({"error": "unknown widget key"}, status_code=403)
+
+    row = channel_rows[0]
+    client_id = str(row["client_id"])
+    if not project_id:
+        project_id = str(row.get("project_id") or "")
+
+    if row.get("voice_enabled") is False:
+        return JSONResponse({"error": "voice disabled"}, status_code=403)
+
+    if not origin_permis(origin, row.get("allowed_origins")):
+        log.warning("webrtc origin refused: %s key=%s", origin, key[:12])
+        return JSONResponse({"error": "origin not allowed"}, status_code=403)
+
+    if await este_blocat(visitor_id, ip):
+        log.warning("webrtc blocked visitor=%s ip=%s", visitor_id[:12], ip)
+        return JSONResponse({"error": "blocked"}, status_code=403)
+
+    if not await propusk_valabil(turnstile_token, ip, str(row.get("turnstile_secret_key") or "")):
+        log.warning("webrtc turnstile failed ip=%s", ip)
+        return JSONResponse({"error": "verification failed"}, status_code=403)
+
+    depasit = await peste_limita(visitor_id, ip)
+    if depasit:
+        log.warning("webrtc daily limit: %s", depasit)
+        return JSONResponse({"error": "daily_limit", "detail": depasit}, status_code=429)
 
     connection = SmallWebRTCConnection()
     await connection.initialize(sdp=offer_sdp, type=offer_type)
@@ -475,7 +522,7 @@ async def webrtc_offer(request: Request):
     )
 
     asyncio.create_task(
-        run_webrtc_session(transport, client_id, visitor_id, project_id)
+        run_webrtc_session(transport, client_id, visitor_id or uuid.uuid4().hex, project_id)
     )
 
     answer = connection.get_answer()
