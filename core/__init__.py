@@ -58,6 +58,10 @@ from core.config import (
     WEB_CHAT_MAX_TEXT,
     WEB_CHAT_SESSION_TTL,
     WEB_OUTPUT_SAMPLE_RATE,
+    TURNSTILE_SECRET_KEY,
+    WEB_MAX_CALLS_PER_IP,
+    WEB_MAX_CALLS_PER_VISITOR,
+    WEB_MAX_MINUTES_PER_DAY,
     log,
     tz_for,
 )
@@ -110,6 +114,13 @@ from core.tools import (
     telefon_valid,
 )
 from core.archivist import run_archivist_and_notify_n8n
+from core.protection import (
+    blocheaza,
+    este_blocat,
+    origin_permis,
+    peste_limita,
+    propusk_valabil,
+)
 
 __all__ = [
     # config
@@ -165,6 +176,10 @@ __all__ = [
     "ASTERISK_RECORDING_EXT",
     "INTERNAL_TOKEN",
     "CORS_ORIGINS",
+    "TURNSTILE_SECRET_KEY",
+    "WEB_MAX_CALLS_PER_VISITOR",
+    "WEB_MAX_CALLS_PER_IP",
+    "WEB_MAX_MINUTES_PER_DAY",
     "log",
     "tz_for",
     # audio
@@ -213,4 +228,9 @@ __all__ = [
     "build_tools",
     # archivist
     "run_archivist_and_notify_n8n",
+    "propusk_valabil",
+    "este_blocat",
+    "blocheaza",
+    "peste_limita",
+    "origin_permis",
 ]
