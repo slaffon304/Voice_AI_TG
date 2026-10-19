@@ -201,12 +201,12 @@ OUT_VOLUME = _env_float("OUT_VOLUME", 0.75)
 
 DEFAULT_TZ = os.getenv("DEFAULT_TIMEZONE", "Europe/Chisinau")
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "ro")
-GEMINI_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview")
+GEMINI_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
 ARCHIVIST_MODELS = [
     m.strip()
     for m in os.getenv(
         "ARCHIVIST_MODELS",
-        "gemini-3.6-flash,gemini-3.1-pro-preview,gemini-3.1-flash-lite,gemini-3.5-flash",
+        "gemini-3.8-flash,gemini-3.1-flash-lite,gemini-4-argon",
     ).split(",")
     if m.strip()
 ]
@@ -653,6 +653,23 @@ _SPEECH_STYLE: dict[str, str] = {
     ),
 }
 
+# Маппинг голосов для Gemini Live: устаревший Enceladus сопоставляется с Kore
+VOICE_MAP: dict[str, str] = {
+    "enceladus": "Kore",
+    "kore": "Kore",
+    "puck": "Puck",
+    "charon": "Charon",
+    "aoede": "Aoede",
+    "fenrir": "Fenrir",
+    "zephyr": "Zephyr",
+}
+
+
+def resolve_voice_name(voice: str | None) -> str:
+    if not voice:
+        return "Kore"
+    return VOICE_MAP.get(voice.strip().lower(), voice.strip())
+
 
 @dataclass
 class Persona:
@@ -660,7 +677,7 @@ class Persona:
 
     persona_name: str = ""
     lore: str = ""
-    voice_model: str = "Enceladus"
+    voice_model: str = "Kore"
     language: str = DEFAULT_LANG
     system_prompt: str = ""
     personality_enabled: bool = True
@@ -3791,7 +3808,7 @@ async def web_voice_endpoint(
                 tools=tools,
                 settings=GeminiLiveLLMService.Settings(
                     model=GEMINI_MODEL,
-                    voice=persona.voice_model,
+                    voice=resolve_voice_name(persona.voice_model),
                     system_instruction=system_prompt,
                     vad=build_vad_params(),
                 ),
@@ -4368,7 +4385,7 @@ async def handle_asterisk_conn(
                 tools=tools,
                 settings=GeminiLiveLLMService.Settings(
                     model=GEMINI_MODEL,
-                    voice=persona.voice_model,
+                    voice=resolve_voice_name(persona.voice_model),
                     system_instruction=system_prompt,
                     vad=build_vad_params(),
                 ),

@@ -5,7 +5,7 @@ websockets
 httpx
 pytz
 supabase
-google-genai
+google-genai>=2.0.0
 redis
 audiolab==0.5.1
 av<18
