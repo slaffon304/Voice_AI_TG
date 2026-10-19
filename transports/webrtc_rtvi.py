@@ -2,17 +2,19 @@
 Изолированный WebRTC + RTVI контур для «Сайта Будущего».
 
 Legacy GSM и /ws НЕ затрагиваются.
-Все общие компоненты берутся из core/.
-Паттерны инициализации LLM и tools — как в main.py (web endpoint).
+Паттерны LLM, tools и обработчиков — как в main.py (web endpoint).
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import html
 import logging
+import time
 import uuid
-from typing import Any, Optional
+from typing import Optional
 
 from fastapi import APIRouter, Request
 from pipecat.frames.frames import (
@@ -41,23 +43,28 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 from core import (
     DEFAULT_LANG,
-    DEFAULT_TZ,
+    FARA_PROGRAMARE,
     GEMINI_API_KEY,
     GEMINI_MODEL,
     IDLE_TIMEOUT_SECONDS,
+    MIN_SECONDS_BEFORE_END_CALL,
+    TELEFON_INCOMPLET,
     build_personality_block,
     build_tools,
+    call_n8n,
     get_client_data,
     get_persona,
+    id_din_lookup,
+    id_zapisi,
     log,
+    normalizeaza_timp,
     resolve_voice_name,
+    send_tg_alert,
+    slot_liber,
+    telefon_valid,
 )
 
 router = APIRouter(tags=["webrtc-rtvi"])
-
-# =============================================================================
-# Инструмент управления интерфейсом
-# =============================================================================
 
 UI_NAVIGATION_TOOL = {
     "name": "control_website_ui",
@@ -104,17 +111,12 @@ def _build_tools_with_ui(client_data: dict, readable_hours: str) -> list[dict]:
     return [{"function_declarations": base}]
 
 
-# =============================================================================
-# Основной пайплайн WebRTC-сессии
-# =============================================================================
-
 async def run_webrtc_session(
     transport: SmallWebRTCTransport,
     client_id: str,
     visitor_id: str,
     project_id: str = "",
 ) -> None:
-    """Один WebRTC-сеанс «Сайта Будущего»."""
     call_id = uuid.uuid4().hex[:8]
     clog = logging.LoggerAdapter(log, {})
     clog.info("[%s] WebRTC session start client=%s visitor=%s", call_id, client_id, visitor_id)
@@ -122,6 +124,15 @@ async def run_webrtc_session(
     client_data = await get_client_data(client_id) or {}
     persona = await get_persona(client_id)
     call_lang = persona.language or DEFAULT_LANG
+    tz_name = client_data.get("timezone") or "Europe/Chisinau"
+    company = client_data.get("company_name") or client_id
+    tg_chat = client_data.get("tg_chat_id_notify") or ""
+    start_ts = time.time()
+
+    known_phone = ""
+    learned_phone = ""
+    zapis_id = ""
+    saved_lead_hashes: set[str] = set()
 
     system_prompt = (
         build_personality_block(persona, call_lang)
@@ -165,14 +176,13 @@ async def run_webrtc_session(
 
     context = LLMContext(messages=[])
     context_aggregator = LLMContextAggregatorPair(context)
-
     task: Optional[PipelineTask] = None
 
+    # ----- UI -----
     async def process_control_website_ui(params: FunctionCallParams):
         section = params.arguments.get("section", "hero")
         highlight = params.arguments.get("highlight_element")
         prefill = params.arguments.get("prefill_data") or {}
-
         if task is not None:
             await task.queue_frames([
                 RTVIUICommandFrame(
@@ -193,7 +203,142 @@ async def run_webrtc_session(
             ),
         })
 
+    # ----- save_lead -----
+    async def process_save_lead(params: FunctionCallParams):
+        nonlocal learned_phone
+        phone = str(params.arguments.get("client_phone") or "").strip()
+        if not phone and learned_phone:
+            params.arguments["client_phone"] = phone = learned_phone
+        if telefon_valid(phone):
+            learned_phone = phone
+
+        digest = hashlib.sha256(
+            f"{params.arguments.get('client_name')}|{phone}|{params.arguments.get('request_summary')}".encode()
+        ).hexdigest()
+        if digest in saved_lead_hashes:
+            await params.result_callback({"status": "success", "message": "Deja salvat."})
+            return
+
+        try:
+            result = await call_n8n(
+                "save_lead",
+                {"client_id": client_id, "tg_chat_id": tg_chat or ""},
+                params.arguments,
+                5.0,
+            )
+            saved_lead_hashes.add(digest)
+            await params.result_callback(result)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await params.result_callback({"status": "cancelled"})
+            raise
+        except Exception as exc:
+            await send_tg_alert(
+                tg_chat,
+                f"⚠️ <b>Eroare API (save_lead)</b>\n🏢 {company}\n🔧 <code>{html.escape(str(exc))}</code>",
+            )
+            await params.result_callback({"error": f"Eroare CRM: {exc}"})
+
+    # ----- Booking_tool -----
+    async def process_booking(params: FunctionCallParams):
+        nonlocal learned_phone, zapis_id
+        phone_arg = str(params.arguments.get("phone") or "").strip()
+        if not phone_arg and learned_phone:
+            params.arguments["phone"] = phone_arg = learned_phone
+        if telefon_valid(phone_arg):
+            learned_phone = phone_arg
+
+        action = params.arguments.get("action")
+        normalizeaza_timp(params.arguments, tz_name)
+
+        if action == "book" and not telefon_valid(phone_arg):
+            await params.result_callback(TELEFON_INCOMPLET)
+            return
+        if action in ("cancel", "reschedule"):
+            if not zapis_id:
+                await params.result_callback(FARA_PROGRAMARE)
+                return
+            params.arguments["event_id"] = zapis_id
+
+        params_n8n = {
+            "client_id": client_id,
+            "google_calendar_id": client_data.get("google_calendar_id") or "",
+        }
+        try:
+            if action == "book":
+                proba = await call_n8n(
+                    "booking", params_n8n, {**params.arguments, "action": "check"}, 10.0
+                )
+                if not slot_liber(proba):
+                    await params.result_callback(proba)
+                    return
+            result = await call_n8n("booking", params_n8n, params.arguments, 10.0)
+            zapis_id = id_zapisi(result) or zapis_id
+            if action == "lookup":
+                zapis_id = id_din_lookup(result) or zapis_id
+            if action == "cancel":
+                zapis_id = ""
+            await params.result_callback(result)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await params.result_callback({"status": "cancelled"})
+            raise
+        except Exception as exc:
+            await send_tg_alert(
+                tg_chat,
+                f"⚠️ <b>Eroare API (Booking_tool)</b>\n🏢 {company}\n🔧 <code>{html.escape(str(exc))}</code>",
+            )
+            await params.result_callback({"status": "error", "message": str(exc)})
+
+    # ----- send_sms -----
+    async def process_sms(params: FunctionCallParams):
+        phone = str(params.arguments.get("phone") or "").strip()
+        if not phone and learned_phone:
+            params.arguments["phone"] = phone = learned_phone
+        if not telefon_valid(phone):
+            await params.result_callback(TELEFON_INCOMPLET)
+            return
+        try:
+            await call_n8n("send_sms", {"client_id": client_id}, params.arguments, 5.0)
+            await params.result_callback({"status": "success", "message": "SMS trimis"})
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await params.result_callback({"status": "cancelled"})
+            raise
+        except Exception as exc:
+            await send_tg_alert(
+                tg_chat,
+                f"⚠️ <b>Eroare API (send_sms)</b>\n🏢 {company}\n🔧 <code>{html.escape(str(exc))}</code>",
+            )
+            await params.result_callback({"status": "error", "message": str(exc)})
+
+    # ----- end_call -----
+    async def process_end_call(params: FunctionCallParams):
+        elapsed = time.time() - start_ts
+        if elapsed < MIN_SECONDS_BEFORE_END_CALL:
+            await params.result_callback({
+                "status": "rejected",
+                "message": (
+                    "Nu închide acum. Clientul nu și-a luat rămas-bun clar. "
+                    "Cere-i să repete și continuă conversația."
+                ),
+            })
+            return
+        await params.result_callback({"status": "success", "message": "Call ended"})
+
+        async def delayed_end():
+            await asyncio.sleep(3.5)
+            if task is not None:
+                await task.queue_frames([CancelFrame()])
+
+        asyncio.create_task(delayed_end())
+
     llm.register_function("control_website_ui", process_control_website_ui)
+    llm.register_function("save_lead", process_save_lead)
+    llm.register_function("send_sms", process_sms)
+    llm.register_function("end_call", process_end_call)
+    if client_data.get("google_calendar_id"):
+        llm.register_function("Booking_tool", process_booking)
 
     @rtvi.event_handler("on_client_message")
     async def on_client_message(rtvi_proc, msg):
@@ -257,16 +402,8 @@ async def run_webrtc_session(
         clog.info("[%s] WebRTC session ended", call_id)
 
 
-# =============================================================================
-# Сигналинг (SDP offer/answer)
-# =============================================================================
-
 @router.post("/api/offer")
 async def webrtc_offer(request: Request):
-    """
-    Сигналинг для SmallWebRTCTransport.
-    Клиент присылает SDP offer, сервер возвращает answer.
-    """
     body = await request.json()
     offer_sdp = body.get("sdp")
     offer_type = body.get("type", "offer")
