@@ -4,6 +4,7 @@
 Legacy GSM и /ws НЕ затрагиваются.
 Фаза 3.1: Анти-Диктовка.
 Фаза 3.2: Zero-Click Dwell Sensing.
+Фаза 3.3: ROI Calculator (серверная логика).
 Защита /api/offer: origin, blacklist, Turnstile, суточные лимиты.
 """
 
@@ -17,7 +18,7 @@ import logging
 import re
 import time
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -75,8 +76,14 @@ from core import (
 
 router = APIRouter(tags=["webrtc-rtvi"])
 
-# Минимальная длительность взгляда (сек), ниже — игнор на сервере
 DWELL_MIN_SECONDS = 3.0
+
+# Дефолтные коэффициенты ROI (можно позже вынести в client_data / БД)
+ROI_DEFAULTS = {
+    "cost_per_missed_lead": 50.0,   # $ потери с одного упущенного лида
+    "ai_monthly_cost": 299.0,       # $/мес тариф AI
+    "capture_rate": 0.35,           # доля упущенных, которую AI «забирает»
+}
 
 UI_NAVIGATION_TOOL = {
     "name": "control_website_ui",
@@ -115,11 +122,90 @@ UI_NAVIGATION_TOOL = {
     },
 }
 
+ROI_CALCULATOR_TOOL = {
+    "name": "update_roi_calculator",
+    "description": (
+        "Actualizează calculatorul ROI de pe ecran. Folosește când vizitatorul "
+        "spune câte apeluri ratează pe zi / pe lună, costul unui lead pierdut, "
+        "sau cere să calculezi economia. Deschide secțiunea roi_calculator și "
+        "afișează cifrele live."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "missed_calls_per_day": {
+                "type": "number",
+                "description": "Apeluri ratate pe zi (dacă a spus pe lună — împarte la 30)",
+            },
+            "missed_calls_per_month": {
+                "type": "number",
+                "description": "Apeluri ratate pe lună (alternativă la per_day)",
+            },
+            "cost_per_missed_lead": {
+                "type": "number",
+                "description": "Pierdere estimată per lead ratat, în USD",
+            },
+            "ai_monthly_cost": {
+                "type": "number",
+                "description": "Cost lunar al serviciului AI, în USD",
+            },
+            "capture_rate": {
+                "type": "number",
+                "description": "Fracție 0–1 din lead-urile ratate pe care AI le recuperează",
+            },
+        },
+    },
+}
+
 
 def _build_tools_with_ui(client_data: dict, readable_hours: str) -> list[dict]:
     base = build_tools(client_data, readable_hours, web=True)
     base.append(UI_NAVIGATION_TOOL)
+    base.append(ROI_CALCULATOR_TOOL)
     return [{"function_declarations": base}]
+
+
+def _compute_roi(args: dict[str, Any]) -> dict[str, Any]:
+    """Серверная формула — модель не выдумывает итог."""
+    per_day = args.get("missed_calls_per_day")
+    per_month = args.get("missed_calls_per_month")
+    try:
+        if per_month is not None and float(per_month) > 0:
+            missed_month = float(per_month)
+        elif per_day is not None and float(per_day) > 0:
+            missed_month = float(per_day) * 30.0
+        else:
+            missed_month = 0.0
+    except (TypeError, ValueError):
+        missed_month = 0.0
+
+    def _num(key: str, default: float) -> float:
+        try:
+            v = args.get(key)
+            return float(v) if v is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    cost_lead = _num("cost_per_missed_lead", ROI_DEFAULTS["cost_per_missed_lead"])
+    ai_cost = _num("ai_monthly_cost", ROI_DEFAULTS["ai_monthly_cost"])
+    capture = _num("capture_rate", ROI_DEFAULTS["capture_rate"])
+    capture = max(0.0, min(1.0, capture))
+
+    recovered = missed_month * capture
+    gross_save = recovered * cost_lead
+    net_save = gross_save - ai_cost
+    payback_days = (ai_cost / (gross_save / 30.0)) if gross_save > 0 else None
+
+    return {
+        "missed_calls_per_month": round(missed_month, 1),
+        "cost_per_missed_lead": round(cost_lead, 2),
+        "ai_monthly_cost": round(ai_cost, 2),
+        "capture_rate": round(capture, 2),
+        "recovered_leads_per_month": round(recovered, 1),
+        "gross_monthly_savings": round(gross_save, 2),
+        "net_monthly_savings": round(net_save, 2),
+        "payback_days": round(payback_days, 1) if payback_days is not None else None,
+    }
 
 
 async def run_webrtc_session(
@@ -143,7 +229,8 @@ async def run_webrtc_session(
     learned_phone = ""
     zapis_id = ""
     saved_lead_hashes: set[str] = set()
-    dwell_seen: set[str] = set()  # element_id уже прокомментированы в этой сессии
+    dwell_seen: set[str] = set()
+    last_roi: dict[str, Any] = {}
 
     system_prompt = (
         build_personality_block(persona, call_lang)
@@ -161,7 +248,10 @@ async def run_webrtc_session(
         "from the UI. When a SYSTEM UI EVENT brings a phone number, use it. "
         "DWELL: if you receive SYSTEM UI EVENT about the visitor lingering on a plan "
         "or element, give one short helpful comment (1 sentence). Do not repeat, "
-        "do not push hard, do not ask a long question."
+        "do not push hard, do not ask a long question. "
+        "ROI: when the visitor talks about missed calls, lost leads or savings, "
+        "call update_roi_calculator with the numbers they gave. Then briefly "
+        "speak the net monthly savings from the tool result — do not invent figures."
     )
 
     tools = _build_tools_with_ui(client_data, "")
@@ -187,6 +277,7 @@ async def run_webrtc_session(
             function_call_report_level={
                 "*": RTVIFunctionCallReportLevel.NAME,
                 "control_website_ui": RTVIFunctionCallReportLevel.FULL,
+                "update_roi_calculator": RTVIFunctionCallReportLevel.FULL,
                 "Booking_tool": RTVIFunctionCallReportLevel.ARGUMENTS,
             }
         ),
@@ -217,6 +308,35 @@ async def run_webrtc_session(
             "instruction": (
                 f"Section '{section}' is now shown on screen. "
                 "Give a short spoken summary of what the visitor sees."
+            ),
+        })
+
+    async def process_update_roi(params: FunctionCallParams):
+        nonlocal last_roi
+        result = _compute_roi(params.arguments or {})
+        last_roi = result
+        if task is not None:
+            await task.queue_frames([
+                RTVIUICommandFrame(
+                    command="navigate_and_render",
+                    payload={
+                        "section": "roi_calculator",
+                        "highlight": None,
+                        "prefill": result,
+                    },
+                ),
+                RTVIUICommandFrame(
+                    command="update_roi",
+                    payload=result,
+                ),
+            ])
+        await params.result_callback({
+            "status": "roi_updated",
+            "figures": result,
+            "instruction": (
+                f"Calculator is on screen. Net monthly savings: "
+                f"{result.get('net_monthly_savings')}. "
+                "Speak this figure briefly; do not invent other numbers."
             ),
         })
 
@@ -372,6 +492,7 @@ async def run_webrtc_session(
         asyncio.create_task(delayed_end())
 
     llm.register_function("control_website_ui", process_control_website_ui)
+    llm.register_function("update_roi_calculator", process_update_roi)
     llm.register_function("save_lead", process_save_lead)
     llm.register_function("send_sms", process_sms)
     llm.register_function("end_call", process_end_call)
@@ -395,7 +516,6 @@ async def run_webrtc_session(
         except (TypeError, ValueError):
             dwell_sec = 0.0
 
-        # ----- Zero-Click Dwell -----
         if interaction == "dwell":
             if dwell_sec < DWELL_MIN_SECONDS:
                 return
@@ -416,7 +536,6 @@ async def run_webrtc_session(
                 await task.queue_frames([LLMRunFrame()])
             return
 
-        # ----- Обычные UI-события + форма (анти-диктовка) -----
         description = data.get("description", str(data))
         form_phone = str(data.get("phone") or data.get("client_phone") or "").strip()
         form_name = str(data.get("client_name") or data.get("name") or "").strip()
@@ -484,10 +603,6 @@ async def run_webrtc_session(
 
 @router.post("/api/offer")
 async def webrtc_offer(request: Request):
-    """
-    Сигналинг WebRTC + та же защита, что у /ws:
-    ключ виджета, origin, blacklist, Turnstile, суточные лимиты.
-    """
     body = await request.json()
     offer_sdp = body.get("sdp")
     offer_type = body.get("type", "offer")
