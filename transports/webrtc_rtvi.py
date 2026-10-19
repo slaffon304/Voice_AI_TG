@@ -6,6 +6,9 @@ Legacy GSM и /ws НЕ затрагиваются.
 Фаза 3.2: Zero-Click Dwell Sensing.
 Фаза 3.3: ROI Calculator.
 Фаза 3.4: Live Screen Audit (контракт + поток).
+Фаза 3.5: Real-Time Sentiment UI Morphing.
+Фаза 2.5: UI Worker Protocol v1 — приём ui-snapshot + DOM-команды
+          (scroll_to, highlight, set_input_value, click).
 Защита /api/offer: origin, blacklist, Turnstile, суточные лимиты.
 """
 
@@ -40,6 +43,7 @@ from pipecat.processors.frameworks.rtvi import (
     RTVIObserverParams,
     RTVIProcessor,
     RTVIUICommandFrame,
+    RTVIUISnapshotFrame,
 )
 from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, GeminiVADParams
 from pipecat.services.llm_service import FunctionCallParams
@@ -84,6 +88,10 @@ ROI_DEFAULTS = {
     "ai_monthly_cost": 299.0,
     "capture_rate": 0.35,
 }
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
 
 UI_NAVIGATION_TOOL = {
     "name": "control_website_ui",
@@ -164,12 +172,97 @@ SCREEN_AUDIT_TOOL = {
     },
 }
 
+# Фаза 3.5 — Real-Time Sentiment UI Morphing
+SENTIMENT_MORPH_TOOL = {
+    "name": "morph_ui_for_sentiment",
+    "description": (
+        "Call immediately when you detect doubt, hesitation, price objection, "
+        "trust gap or anxiety in the visitor's voice or words "
+        "(long pauses, soft/uncertain tone, phrases like 'expensive', 'not sure', "
+        "'risky', 'maybe later', 'I need to think'). "
+        "Shows trust-building content (cases, guarantees, ROI, contacts) without being pushy."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "signal": {
+                "type": "string",
+                "enum": [
+                    "doubt",
+                    "price_objection",
+                    "trust_gap",
+                    "urgency",
+                    "confusion",
+                ],
+                "description": "Detected emotional / objection signal",
+            },
+            "suggested_section": {
+                "type": "string",
+                "enum": [
+                    "cases",
+                    "pricing",
+                    "roi_calculator",
+                    "contacts",
+                    "booking_widget",
+                    "services",
+                ],
+                "description": "Preferred section to surface (defaults based on signal)",
+            },
+            "highlight_element": {
+                "type": "string",
+                "description": "Optional element id to highlight (e.g. 'guarantee', 'roi-result', 'case-byd')",
+            },
+        },
+        "required": ["signal"],
+    },
+}
+
+# Фаза 2.5 — DOM actions via UI Worker Protocol (scroll_to / highlight / set_input_value / click)
+DOM_ACTION_TOOL = {
+    "name": "dom_action",
+    "description": (
+        "Low-level DOM manipulation on the page the visitor is looking at. "
+        "Use after a ui-snapshot is available or when you know a stable target_id / ref. "
+        "Prefer control_website_ui for high-level section navigation; use this for precise "
+        "scroll, highlight, form fill or click."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["scroll_to", "highlight", "set_input_value", "click", "focus"],
+                "description": "DOM command to execute",
+            },
+            "ref": {
+                "type": "string",
+                "description": "Stable a11y snapshot ref (e.g. 'e42') from the latest ui-snapshot",
+            },
+            "target_id": {
+                "type": "string",
+                "description": "Fallback DOM id (document.getElementById) when ref is unknown",
+            },
+            "value": {
+                "type": "string",
+                "description": "Value for set_input_value",
+            },
+            "duration_ms": {
+                "type": "number",
+                "description": "Highlight duration in ms (default 2000)",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
 
 def _build_tools_with_ui(client_data: dict, readable_hours: str) -> list[dict]:
     base = build_tools(client_data, readable_hours, web=True)
     base.append(UI_NAVIGATION_TOOL)
     base.append(ROI_CALCULATOR_TOOL)
     base.append(SCREEN_AUDIT_TOOL)
+    base.append(SENTIMENT_MORPH_TOOL)
+    base.append(DOM_ACTION_TOOL)
     return [{"function_declarations": base}]
 
 
@@ -214,6 +307,16 @@ def _compute_roi(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _default_section_for_signal(signal: str) -> str:
+    return {
+        "doubt": "cases",
+        "price_objection": "roi_calculator",
+        "trust_gap": "cases",
+        "urgency": "booking_widget",
+        "confusion": "services",
+    }.get(signal, "cases")
+
+
 async def run_webrtc_session(
     transport: SmallWebRTCTransport,
     client_id: str,
@@ -238,6 +341,8 @@ async def run_webrtc_session(
     dwell_seen: set[str] = set()
     last_roi: dict[str, Any] = {}
     audit_pending_focus: str = ""
+    latest_snapshot: Any = None  # Фаза 2.5 — последний ui-snapshot
+    sentiment_fired: set[str] = set()  # анти-спам для morph
 
     system_prompt = (
         build_personality_block(persona, call_lang)
@@ -260,7 +365,14 @@ async def run_webrtc_session(
         "SCREEN AUDIT: when the visitor asks to review their page/CTA/form, call "
         "request_screen_audit. Wait for SYSTEM UI EVENT with page summary, then "
         "give 2–3 concrete observations and optionally highlight elements via "
-        "control_website_ui. Do not invent page content you were not given."
+        "control_website_ui. Do not invent page content you were not given. "
+        "SENTIMENT (Фаза 3.5): listen for hesitation, soft tone, long pauses, "
+        "or objection words. When you detect doubt / price concern / trust gap, "
+        "call morph_ui_for_sentiment once, then briefly reassure while the UI "
+        "shows cases or guarantees. Do not call it repeatedly for the same signal. "
+        "DOM (Фаза 2.5): you may receive SYSTEM UI EVENT with ui-snapshot data. "
+        "Use dom_action for precise scroll_to / highlight / set_input_value / click "
+        "when you have a ref or target_id. Prefer high-level control_website_ui first."
     )
 
     tools = _build_tools_with_ui(client_data, "")
@@ -288,6 +400,8 @@ async def run_webrtc_session(
                 "control_website_ui": RTVIFunctionCallReportLevel.FULL,
                 "update_roi_calculator": RTVIFunctionCallReportLevel.FULL,
                 "request_screen_audit": RTVIFunctionCallReportLevel.FULL,
+                "morph_ui_for_sentiment": RTVIFunctionCallReportLevel.FULL,
+                "dom_action": RTVIFunctionCallReportLevel.FULL,
                 "Booking_tool": RTVIFunctionCallReportLevel.ARGUMENTS,
             }
         ),
@@ -296,6 +410,8 @@ async def run_webrtc_session(
     context = LLMContext(messages=[])
     context_aggregator = LLMContextAggregatorPair(context)
     task: Optional[PipelineTask] = None
+
+    # ----- Tool handlers -----
 
     async def process_control_website_ui(params: FunctionCallParams):
         section = params.arguments.get("section", "hero")
@@ -361,6 +477,99 @@ async def run_webrtc_session(
                 "Tell the visitor briefly that you are reviewing the page. "
                 "Wait for SYSTEM UI EVENT with the page summary before giving findings."
             ),
+        })
+
+    async def process_morph_ui_for_sentiment(params: FunctionCallParams):
+        """Фаза 3.5 — эмоционально-реактивная морфология UI."""
+        signal = str(params.arguments.get("signal") or "doubt")
+        section = (
+            params.arguments.get("suggested_section")
+            or _default_section_for_signal(signal)
+        )
+        highlight = params.arguments.get("highlight_element")
+        if not highlight:
+            highlight = {
+                "doubt": "guarantee",
+                "price_objection": "roi-result",
+                "trust_gap": "cases-grid",
+                "urgency": "booking-slot",
+                "confusion": "services-bento",
+            }.get(signal)
+
+        # Анти-спам: один раз на сигнал за сессию
+        if signal in sentiment_fired:
+            await params.result_callback({
+                "status": "already_shown",
+                "instruction": "You already reacted to this signal. Continue the conversation naturally.",
+            })
+            return
+        sentiment_fired.add(signal)
+
+        if task is not None:
+            frames = [
+                RTVIUICommandFrame(
+                    command="navigate_and_render",
+                    payload={
+                        "section": section,
+                        "highlight": highlight,
+                        "prefill": {"sentiment_signal": signal},
+                    },
+                )
+            ]
+            # Дополнительный highlight для гарантий / кейсов
+            if highlight:
+                frames.append(
+                    RTVIUICommandFrame(
+                        command="highlight",
+                        payload={"target_id": highlight, "duration_ms": 3500},
+                    )
+                )
+            await task.queue_frames(frames)
+
+        await params.result_callback({
+            "status": "ui_morphed",
+            "signal": signal,
+            "active_section": section,
+            "instruction": (
+                f"UI now shows '{section}' with trust content for signal '{signal}'. "
+                "Give one short empathetic sentence and point to what is on screen. "
+                "Do not over-sell."
+            ),
+        })
+
+    async def process_dom_action(params: FunctionCallParams):
+        """Фаза 2.5 — низкоуровневые DOM-команды UI Worker Protocol."""
+        action = str(params.arguments.get("action") or "").strip()
+        ref = params.arguments.get("ref")
+        target_id = params.arguments.get("target_id")
+        value = params.arguments.get("value")
+        duration_ms = params.arguments.get("duration_ms") or 2000
+
+        if action not in ("scroll_to", "highlight", "set_input_value", "click", "focus"):
+            await params.result_callback({"status": "error", "message": f"Unknown action: {action}"})
+            return
+
+        payload: dict[str, Any] = {}
+        if ref:
+            payload["ref"] = ref
+        if target_id:
+            payload["target_id"] = target_id
+        if action == "set_input_value":
+            payload["value"] = value or ""
+            payload["replace"] = True
+        if action == "highlight":
+            payload["duration_ms"] = duration_ms
+
+        if task is not None:
+            await task.queue_frames([
+                RTVIUICommandFrame(command=action, payload=payload)
+            ])
+
+        await params.result_callback({
+            "status": "command_sent",
+            "action": action,
+            "payload": payload,
+            "instruction": f"DOM command '{action}' sent. Continue speaking naturally.",
         })
 
     async def process_save_lead(params: FunctionCallParams):
@@ -479,47 +688,45 @@ async def run_webrtc_session(
             await params.result_callback(TELEFON_INCOMPLET)
             return
         try:
-            await call_n8n("send_sms", {"client_id": client_id}, params.arguments, 5.0)
-            await params.result_callback({"status": "success", "message": "SMS trimis"})
+            result = await call_n8n(
+                "send_sms",
+                {"client_id": client_id},
+                params.arguments,
+                5.0,
+            )
+            await params.result_callback(result)
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):
                 await params.result_callback({"status": "cancelled"})
             raise
         except Exception as exc:
-            await send_tg_alert(
-                tg_chat,
-                f"⚠️ <b>Eroare API (send_sms)</b>\n🏢 {company}\n🔧 <code>{html.escape(str(exc))}</code>",
-            )
             await params.result_callback({"status": "error", "message": str(exc)})
 
     async def process_end_call(params: FunctionCallParams):
+        reason = str(params.arguments.get("reason") or "natural_end")
         elapsed = time.time() - start_ts
         if elapsed < MIN_SECONDS_BEFORE_END_CALL:
             await params.result_callback({
-                "status": "rejected",
-                "message": (
-                    "Nu închide acum. Clientul nu și-a luat rămas-bun clar. "
-                    "Continuă conversația."
-                ),
+                "status": "too_early",
+                "message": f"Call is only {elapsed:.0f}s old. Continue the conversation.",
             })
             return
-        await params.result_callback({"status": "success", "message": "Call ended"})
+        if task is not None:
+            await task.queue_frames([CancelFrame()])
+        await params.result_callback({"status": "ending", "reason": reason})
 
-        async def delayed_end():
-            await asyncio.sleep(3.5)
-            if task is not None:
-                await task.queue_frames([CancelFrame()])
-
-        asyncio.create_task(delayed_end())
-
+    # Register tools
     llm.register_function("control_website_ui", process_control_website_ui)
     llm.register_function("update_roi_calculator", process_update_roi)
     llm.register_function("request_screen_audit", process_request_screen_audit)
+    llm.register_function("morph_ui_for_sentiment", process_morph_ui_for_sentiment)
+    llm.register_function("dom_action", process_dom_action)
     llm.register_function("save_lead", process_save_lead)
+    llm.register_function("Booking_tool", process_booking)
     llm.register_function("send_sms", process_sms)
     llm.register_function("end_call", process_end_call)
-    if client_data.get("google_calendar_id"):
-        llm.register_function("Booking_tool", process_booking)
+
+    # ----- UI event / snapshot handlers (Фаза 2.5 + 3.x) -----
 
     @rtvi.event_handler("on_client_message")
     async def on_client_message(rtvi_proc, msg):
@@ -556,7 +763,7 @@ async def run_webrtc_session(
                     f"SYSTEM UI EVENT: SCREEN AUDIT (focus={focus}"
                     f"{', url=' + url if url else ''}): {page_summary}{issues_txt}. "
                     "Give 2–3 concrete observations. Optionally call control_website_ui "
-                    "to highlight weak spots. Do not invent content not in this summary."
+                    "or dom_action to highlight weak spots. Do not invent content not in this summary."
                 ),
             })
             if task is not None:
@@ -601,6 +808,42 @@ async def run_webrtc_session(
         })
         if task is not None:
             await task.queue_frames([LLMRunFrame()])
+
+    # Фаза 2.5 — приём ui-snapshot (A11y tree)
+    @rtvi.event_handler("on_ui_message")
+    async def on_ui_message(rtvi_proc, message):
+        nonlocal latest_snapshot
+        # message may be UISnapshotMessage / UIEventMessage / etc.
+        msg_type = getattr(message, "type", None) or (
+            message.get("type") if isinstance(message, dict) else None
+        )
+        if msg_type == "ui-snapshot" or isinstance(message, RTVIUISnapshotFrame):
+            tree = None
+            if isinstance(message, RTVIUISnapshotFrame):
+                tree = getattr(message, "tree", None)
+            else:
+                data = getattr(message, "data", None) or (
+                    message.get("data") if isinstance(message, dict) else {}
+                )
+                if isinstance(data, dict):
+                    tree = data.get("tree") or data
+            if tree is not None:
+                latest_snapshot = tree
+                clog.debug("[%s] ui-snapshot received (keys=%s)", call_id, list(tree.keys()) if isinstance(tree, dict) else type(tree))
+            return
+
+        # Also surface generic ui-event as SYSTEM UI EVENT if useful
+        if msg_type == "ui-event":
+            data = getattr(message, "data", None) or (
+                message.get("data") if isinstance(message, dict) else {}
+            ) or {}
+            name = getattr(message, "name", None) or data.get("name") or data.get("event") or "ui-event"
+            context.add_message({
+                "role": "user",
+                "content": f"SYSTEM UI EVENT (ui-event/{name}): {data}",
+            })
+            if task is not None:
+                await task.queue_frames([LLMRunFrame()])
 
     pipeline = Pipeline([
         transport.input(),
@@ -651,19 +894,22 @@ async def run_webrtc_session(
 
 
 @router.post("/api/offer")
-async def webrtc_offer(request: Request):
-    body = await request.json()
+async def webrtc_offer(request: Request) -> dict | JSONResponse:
+    """Signalling endpoint for SmallWebRTCTransport (SDP offer → answer)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
     offer_sdp = body.get("sdp")
     offer_type = body.get("type", "offer")
-    key = re.sub(r"[^A-Za-z0-9_\-]", "", str(body.get("key") or ""))[:64]
-    visitor_id = re.sub(r"[^A-Za-z0-9_\-]", "", str(body.get("visitor_id") or ""))[:64]
-    turnstile_token = str(body.get("t") or "")
+    key = str(body.get("key") or body.get("widget_key") or "").strip()
+    visitor_id = str(body.get("visitor_id") or "").strip()
     project_id = str(body.get("project_id") or "").strip()
+    turnstile_token = str(body.get("turnstile_token") or body.get("cf-turnstile-response") or "").strip()
 
-    if not offer_sdp:
-        return JSONResponse({"error": "missing sdp"}, status_code=400)
-    if not key:
-        return JSONResponse({"error": "missing widget key"}, status_code=400)
+    if not offer_sdp or not key:
+        return JSONResponse({"error": "sdp and key required"}, status_code=400)
 
     forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
     ip = forwarded or (request.client.host if request.client else "")
