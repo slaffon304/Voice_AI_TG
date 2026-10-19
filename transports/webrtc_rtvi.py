@@ -524,6 +524,10 @@ async def run_webrtc_session(
         if task is not None:
             await task.queue_frames([
                 RTVIUICommandFrame(
+                    command="set_agent_state",
+                    payload={"state": "solving", "label": "Calculating savings"},
+                ),
+                RTVIUICommandFrame(
                     command="navigate_and_render",
                     payload={"section": "roi_calculator", "highlight": None, "prefill": result},
                 ),
@@ -545,17 +549,23 @@ async def run_webrtc_session(
         audit_pending_focus = focus
         if task is not None:
             await task.queue_frames([
+                # Show Thinking Orb while audit is in progress
+                RTVIUICommandFrame(
+                    command="set_agent_state",
+                    payload={"state": "searching", "label": "Reviewing page"},
+                ),
                 RTVIUICommandFrame(
                     command="start_screen_audit",
                     payload={"focus": focus, "reason": reason},
-                )
+                ),
             ])
         await params.result_callback({
             "status": "audit_requested",
             "focus": focus,
             "instruction": (
                 "Tell the visitor briefly that you are reviewing the page. "
-                "Wait for SYSTEM UI EVENT with the page summary before giving findings."
+                "Wait for SYSTEM UI EVENT with the page summary before giving findings. "
+                "After you speak the findings, call set_agent_state(state='breathing')."
             ),
         })
 
@@ -872,11 +882,19 @@ async def run_webrtc_session(
                     f"SYSTEM UI EVENT: SCREEN AUDIT (focus={focus}"
                     f"{', url=' + url if url else ''}): {page_summary}{issues_txt}. "
                     "Give 2–3 concrete observations. Optionally call control_website_ui "
-                    "or dom_action to highlight weak spots. Do not invent content not in this summary."
+                    "or dom_action to highlight weak spots. Do not invent content not in this summary. "
+                    "When finished speaking, call set_agent_state(state='breathing')."
                 ),
             })
             if task is not None:
-                await task.queue_frames([LLMRunFrame()])
+                # Return orb to neutral while the model prepares the answer
+                await task.queue_frames([
+                    RTVIUICommandFrame(
+                        command="set_agent_state",
+                        payload={"state": "composing", "label": "Preparing feedback"},
+                    ),
+                    LLMRunFrame(),
+                ])
             return
 
         # ----- Dwell -----
@@ -918,35 +936,53 @@ async def run_webrtc_session(
         if task is not None:
             await task.queue_frames([LLMRunFrame()])
 
-    # Фаза 2.5 — приём ui-snapshot (A11y tree)
+    # Фаза 2.5 — приём ui-snapshot (A11y tree) + ui-event
     @rtvi.event_handler("on_ui_message")
     async def on_ui_message(rtvi_proc, message):
         nonlocal latest_snapshot
-        # message may be UISnapshotMessage / UIEventMessage / etc.
         msg_type = getattr(message, "type", None) or (
             message.get("type") if isinstance(message, dict) else None
         )
+
+        # --- Snapshot: store only. Never dump the full tree into the LLM context. ---
         if msg_type == "ui-snapshot" or isinstance(message, RTVIUISnapshotFrame):
             tree = None
             if isinstance(message, RTVIUISnapshotFrame):
-                tree = getattr(message, "tree", None)
+                tree = getattr(message, "tree", None) or getattr(message, "snapshot", None)
             else:
                 data = getattr(message, "data", None) or (
                     message.get("data") if isinstance(message, dict) else {}
                 )
                 if isinstance(data, dict):
-                    tree = data.get("tree") or data
+                    tree = data.get("tree") or data.get("snapshot") or data
+                elif data is not None:
+                    tree = data
             if tree is not None:
                 latest_snapshot = tree
-                clog.debug("[%s] ui-snapshot received (keys=%s)", call_id, list(tree.keys()) if isinstance(tree, dict) else type(tree))
+                # Keep a tiny high-level notice (not the tree itself)
+                summary_hint = ""
+                if isinstance(tree, dict):
+                    # Common shapes: {nodes: [...]} or {tree: ...} or role-based
+                    nodes = tree.get("nodes") or tree.get("children") or []
+                    if isinstance(nodes, list) and nodes:
+                        summary_hint = f" (~{len(nodes)} nodes)"
+                clog.debug("[%s] ui-snapshot received%s", call_id, summary_hint)
             return
 
-        # Also surface generic ui-event as SYSTEM UI EVENT if useful
+        # --- Generic ui-event ---
         if msg_type == "ui-event":
             data = getattr(message, "data", None) or (
                 message.get("data") if isinstance(message, dict) else {}
             ) or {}
-            name = getattr(message, "name", None) or data.get("name") or data.get("event") or "ui-event"
+            name = (
+                getattr(message, "name", None)
+                or (data.get("name") if isinstance(data, dict) else None)
+                or (data.get("event") if isinstance(data, dict) else None)
+                or "ui-event"
+            )
+            # Noise filter
+            if str(name) in ("pointermove", "scroll", "resize", "mousemove"):
+                return
             context.add_message({
                 "role": "user",
                 "content": f"SYSTEM UI EVENT (ui-event/{name}): {data}",
