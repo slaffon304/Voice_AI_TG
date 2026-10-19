@@ -4,7 +4,8 @@
 Legacy GSM и /ws НЕ затрагиваются.
 Фаза 3.1: Анти-Диктовка.
 Фаза 3.2: Zero-Click Dwell Sensing.
-Фаза 3.3: ROI Calculator (серверная логика).
+Фаза 3.3: ROI Calculator.
+Фаза 3.4: Live Screen Audit (контракт + поток).
 Защита /api/offer: origin, blacklist, Turnstile, суточные лимиты.
 """
 
@@ -78,11 +79,10 @@ router = APIRouter(tags=["webrtc-rtvi"])
 
 DWELL_MIN_SECONDS = 3.0
 
-# Дефолтные коэффициенты ROI (можно позже вынести в client_data / БД)
 ROI_DEFAULTS = {
-    "cost_per_missed_lead": 50.0,   # $ потери с одного упущенного лида
-    "ai_monthly_cost": 299.0,       # $/мес тариф AI
-    "capture_rate": 0.35,           # доля упущенных, которую AI «забирает»
+    "cost_per_missed_lead": 50.0,
+    "ai_monthly_cost": 299.0,
+    "capture_rate": 0.35,
 }
 
 UI_NAVIGATION_TOOL = {
@@ -127,31 +127,38 @@ ROI_CALCULATOR_TOOL = {
     "description": (
         "Actualizează calculatorul ROI de pe ecran. Folosește când vizitatorul "
         "spune câte apeluri ratează pe zi / pe lună, costul unui lead pierdut, "
-        "sau cere să calculezi economia. Deschide secțiunea roi_calculator și "
-        "afișează cifrele live."
+        "sau cere să calculezi economia."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "missed_calls_per_day": {
-                "type": "number",
-                "description": "Apeluri ratate pe zi (dacă a spus pe lună — împarte la 30)",
+            "missed_calls_per_day": {"type": "number"},
+            "missed_calls_per_month": {"type": "number"},
+            "cost_per_missed_lead": {"type": "number"},
+            "ai_monthly_cost": {"type": "number"},
+            "capture_rate": {"type": "number"},
+        },
+    },
+}
+
+SCREEN_AUDIT_TOOL = {
+    "name": "request_screen_audit",
+    "description": (
+        "Pornește auditul paginii pe care o vede vizitatorul. Folosește când "
+        "cere să evaluezi site-ul, CTA, formularul sau conversia. Clientul va "
+        "trimite un rezumat al paginii; tu îl comentezi scurt și poți evidenția zone."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "focus": {
+                "type": "string",
+                "enum": ["full_page", "cta", "form", "pricing", "hero", "mobile"],
+                "description": "Pe ce să se concentreze auditul",
             },
-            "missed_calls_per_month": {
-                "type": "number",
-                "description": "Apeluri ratate pe lună (alternativă la per_day)",
-            },
-            "cost_per_missed_lead": {
-                "type": "number",
-                "description": "Pierdere estimată per lead ratat, în USD",
-            },
-            "ai_monthly_cost": {
-                "type": "number",
-                "description": "Cost lunar al serviciului AI, în USD",
-            },
-            "capture_rate": {
-                "type": "number",
-                "description": "Fracție 0–1 din lead-urile ratate pe care AI le recuperează",
+            "reason": {
+                "type": "string",
+                "description": "De ce ceri auditul (scurt)",
             },
         },
     },
@@ -162,11 +169,11 @@ def _build_tools_with_ui(client_data: dict, readable_hours: str) -> list[dict]:
     base = build_tools(client_data, readable_hours, web=True)
     base.append(UI_NAVIGATION_TOOL)
     base.append(ROI_CALCULATOR_TOOL)
+    base.append(SCREEN_AUDIT_TOOL)
     return [{"function_declarations": base}]
 
 
 def _compute_roi(args: dict[str, Any]) -> dict[str, Any]:
-    """Серверная формула — модель не выдумывает итог."""
     per_day = args.get("missed_calls_per_day")
     per_month = args.get("missed_calls_per_month")
     try:
@@ -188,8 +195,7 @@ def _compute_roi(args: dict[str, Any]) -> dict[str, Any]:
 
     cost_lead = _num("cost_per_missed_lead", ROI_DEFAULTS["cost_per_missed_lead"])
     ai_cost = _num("ai_monthly_cost", ROI_DEFAULTS["ai_monthly_cost"])
-    capture = _num("capture_rate", ROI_DEFAULTS["capture_rate"])
-    capture = max(0.0, min(1.0, capture))
+    capture = max(0.0, min(1.0, _num("capture_rate", ROI_DEFAULTS["capture_rate"])))
 
     recovered = missed_month * capture
     gross_save = recovered * cost_lead
@@ -231,6 +237,7 @@ async def run_webrtc_session(
     saved_lead_hashes: set[str] = set()
     dwell_seen: set[str] = set()
     last_roi: dict[str, Any] = {}
+    audit_pending_focus: str = ""
 
     system_prompt = (
         build_personality_block(persona, call_lang)
@@ -247,11 +254,13 @@ async def run_webrtc_session(
         "(control_website_ui section=booking_widget) and wait for the form data "
         "from the UI. When a SYSTEM UI EVENT brings a phone number, use it. "
         "DWELL: if you receive SYSTEM UI EVENT about the visitor lingering on a plan "
-        "or element, give one short helpful comment (1 sentence). Do not repeat, "
-        "do not push hard, do not ask a long question. "
-        "ROI: when the visitor talks about missed calls, lost leads or savings, "
-        "call update_roi_calculator with the numbers they gave. Then briefly "
-        "speak the net monthly savings from the tool result — do not invent figures."
+        "or element, give one short helpful comment (1 sentence). Do not repeat. "
+        "ROI: when the visitor talks about missed calls or savings, call "
+        "update_roi_calculator, then speak net_monthly_savings from the result. "
+        "SCREEN AUDIT: when the visitor asks to review their page/CTA/form, call "
+        "request_screen_audit. Wait for SYSTEM UI EVENT with page summary, then "
+        "give 2–3 concrete observations and optionally highlight elements via "
+        "control_website_ui. Do not invent page content you were not given."
     )
 
     tools = _build_tools_with_ui(client_data, "")
@@ -278,6 +287,7 @@ async def run_webrtc_session(
                 "*": RTVIFunctionCallReportLevel.NAME,
                 "control_website_ui": RTVIFunctionCallReportLevel.FULL,
                 "update_roi_calculator": RTVIFunctionCallReportLevel.FULL,
+                "request_screen_audit": RTVIFunctionCallReportLevel.FULL,
                 "Booking_tool": RTVIFunctionCallReportLevel.ARGUMENTS,
             }
         ),
@@ -319,24 +329,37 @@ async def run_webrtc_session(
             await task.queue_frames([
                 RTVIUICommandFrame(
                     command="navigate_and_render",
-                    payload={
-                        "section": "roi_calculator",
-                        "highlight": None,
-                        "prefill": result,
-                    },
+                    payload={"section": "roi_calculator", "highlight": None, "prefill": result},
                 ),
-                RTVIUICommandFrame(
-                    command="update_roi",
-                    payload=result,
-                ),
+                RTVIUICommandFrame(command="update_roi", payload=result),
             ])
         await params.result_callback({
             "status": "roi_updated",
             "figures": result,
             "instruction": (
                 f"Calculator is on screen. Net monthly savings: "
-                f"{result.get('net_monthly_savings')}. "
-                "Speak this figure briefly; do not invent other numbers."
+                f"{result.get('net_monthly_savings')}. Speak this briefly."
+            ),
+        })
+
+    async def process_request_screen_audit(params: FunctionCallParams):
+        nonlocal audit_pending_focus
+        focus = str(params.arguments.get("focus") or "full_page")
+        reason = str(params.arguments.get("reason") or "")
+        audit_pending_focus = focus
+        if task is not None:
+            await task.queue_frames([
+                RTVIUICommandFrame(
+                    command="start_screen_audit",
+                    payload={"focus": focus, "reason": reason},
+                )
+            ])
+        await params.result_callback({
+            "status": "audit_requested",
+            "focus": focus,
+            "instruction": (
+                "Tell the visitor briefly that you are reviewing the page. "
+                "Wait for SYSTEM UI EVENT with the page summary before giving findings."
             ),
         })
 
@@ -406,10 +429,8 @@ async def run_webrtc_session(
             await params.result_callback({
                 "status": "need_phone_via_form",
                 "message": (
-                    "Forma de pe ecran este deschisă. Nu cere numărul pe voice, "
-                    "cifră cu cifră. Spune scurt să completeze telefonul în formular "
-                    "sau să apese autofill. Așteaptă SYSTEM UI EVENT cu numărul, "
-                    "apoi apelează din nou Booking_tool action=book."
+                    "Forma de pe ecran este deschisă. Nu cere numărul pe voice. "
+                    "Așteaptă SYSTEM UI EVENT cu numărul, apoi Booking_tool action=book."
                 ),
             })
             return
@@ -478,7 +499,7 @@ async def run_webrtc_session(
                 "status": "rejected",
                 "message": (
                     "Nu închide acum. Clientul nu și-a luat rămas-bun clar. "
-                    "Cere-i să repete și continuă conversația."
+                    "Continuă conversația."
                 ),
             })
             return
@@ -493,6 +514,7 @@ async def run_webrtc_session(
 
     llm.register_function("control_website_ui", process_control_website_ui)
     llm.register_function("update_roi_calculator", process_update_roi)
+    llm.register_function("request_screen_audit", process_request_screen_audit)
     llm.register_function("save_lead", process_save_lead)
     llm.register_function("send_sms", process_sms)
     llm.register_function("end_call", process_end_call)
@@ -501,7 +523,7 @@ async def run_webrtc_session(
 
     @rtvi.event_handler("on_client_message")
     async def on_client_message(rtvi_proc, msg):
-        nonlocal learned_phone
+        nonlocal learned_phone, audit_pending_focus
         msg_type = getattr(msg, "type", None) or (msg.get("type") if isinstance(msg, dict) else None)
         if msg_type != "ui_user_interaction":
             return
@@ -516,6 +538,32 @@ async def run_webrtc_session(
         except (TypeError, ValueError):
             dwell_sec = 0.0
 
+        # ----- Screen audit result from client -----
+        if interaction == "screen_audit":
+            page_summary = str(data.get("page_summary") or data.get("summary") or "").strip()
+            issues = data.get("issues") or []
+            url = str(data.get("url") or "").strip()
+            focus = str(data.get("focus") or audit_pending_focus or "full_page")
+            audit_pending_focus = ""
+            if not page_summary and not issues:
+                return
+            issues_txt = ""
+            if isinstance(issues, list) and issues:
+                issues_txt = "; issues hint: " + ", ".join(str(x) for x in issues[:8])
+            context.add_message({
+                "role": "user",
+                "content": (
+                    f"SYSTEM UI EVENT: SCREEN AUDIT (focus={focus}"
+                    f"{', url=' + url if url else ''}): {page_summary}{issues_txt}. "
+                    "Give 2–3 concrete observations. Optionally call control_website_ui "
+                    "to highlight weak spots. Do not invent content not in this summary."
+                ),
+            })
+            if task is not None:
+                await task.queue_frames([LLMRunFrame()])
+            return
+
+        # ----- Dwell -----
         if interaction == "dwell":
             if dwell_sec < DWELL_MIN_SECONDS:
                 return
@@ -536,6 +584,7 @@ async def run_webrtc_session(
                 await task.queue_frames([LLMRunFrame()])
             return
 
+        # ----- Form / generic UI -----
         description = data.get("description", str(data))
         form_phone = str(data.get("phone") or data.get("client_phone") or "").strip()
         form_name = str(data.get("client_name") or data.get("name") or "").strip()
