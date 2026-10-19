@@ -54,6 +54,7 @@ from google.genai import types
 from supabase import Client, create_client
 
 from core import *
+from transports.webrtc_rtvi import router as webrtc_router
 
 try:
     from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
@@ -2757,7 +2758,7 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Authorization", "Content-Type"],
 )
-
+app.include_router(webrtc_router)
 
 @app.get("/widget-config")
 async def widget_config(response: Response, key: str = Query("")) -> dict:
