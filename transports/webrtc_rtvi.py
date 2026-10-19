@@ -3,6 +3,7 @@
 
 Legacy GSM и /ws НЕ затрагиваются.
 Фаза 3.1: Анти-Диктовка.
+Фаза 3.2: Zero-Click Dwell Sensing.
 Защита /api/offer: origin, blacklist, Turnstile, суточные лимиты.
 """
 
@@ -74,6 +75,9 @@ from core import (
 
 router = APIRouter(tags=["webrtc-rtvi"])
 
+# Минимальная длительность взгляда (сек), ниже — игнор на сервере
+DWELL_MIN_SECONDS = 3.0
+
 UI_NAVIGATION_TOOL = {
     "name": "control_website_ui",
     "description": (
@@ -139,6 +143,7 @@ async def run_webrtc_session(
     learned_phone = ""
     zapis_id = ""
     saved_lead_hashes: set[str] = set()
+    dwell_seen: set[str] = set()  # element_id уже прокомментированы в этой сессии
 
     system_prompt = (
         build_personality_block(persona, call_lang)
@@ -153,7 +158,10 @@ async def run_webrtc_session(
         "ANTI-DICTATION: never ask the visitor to dictate a phone number digit by digit. "
         "If a phone is needed for booking or a lead, open the on-screen form "
         "(control_website_ui section=booking_widget) and wait for the form data "
-        "from the UI. When a SYSTEM UI EVENT brings a phone number, use it."
+        "from the UI. When a SYSTEM UI EVENT brings a phone number, use it. "
+        "DWELL: if you receive SYSTEM UI EVENT about the visitor lingering on a plan "
+        "or element, give one short helpful comment (1 sentence). Do not repeat, "
+        "do not push hard, do not ask a long question."
     )
 
     tools = _build_tools_with_ui(client_data, "")
@@ -377,8 +385,39 @@ async def run_webrtc_session(
         if msg_type != "ui_user_interaction":
             return
         data = getattr(msg, "data", None) or (msg.get("data") if isinstance(msg, dict) else {}) or {}
-        description = data.get("description", str(data))
 
+        interaction = str(data.get("interaction") or data.get("event") or "click").lower()
+        element_id = str(data.get("element_id") or data.get("element") or "").strip()
+        section = str(data.get("section") or "").strip()
+        dwell_ms = data.get("dwell_ms") or data.get("duration_ms") or 0
+        try:
+            dwell_sec = float(dwell_ms) / 1000.0 if float(dwell_ms) > 20 else float(dwell_ms)
+        except (TypeError, ValueError):
+            dwell_sec = 0.0
+
+        # ----- Zero-Click Dwell -----
+        if interaction == "dwell":
+            if dwell_sec < DWELL_MIN_SECONDS:
+                return
+            key = element_id or section or "unknown"
+            if key in dwell_seen:
+                return
+            dwell_seen.add(key)
+            label = element_id or section or "an element"
+            context.add_message({
+                "role": "user",
+                "content": (
+                    f"SYSTEM UI EVENT: DWELL — the visitor has been looking at "
+                    f"'{label}' for about {dwell_sec:.0f} seconds without clicking. "
+                    "Give one short helpful comment (one sentence). Do not push."
+                ),
+            })
+            if task is not None:
+                await task.queue_frames([LLMRunFrame()])
+            return
+
+        # ----- Обычные UI-события + форма (анти-диктовка) -----
+        description = data.get("description", str(data))
         form_phone = str(data.get("phone") or data.get("client_phone") or "").strip()
         form_name = str(data.get("client_name") or data.get("name") or "").strip()
         if telefon_valid(form_phone):
