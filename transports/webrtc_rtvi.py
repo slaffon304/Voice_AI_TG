@@ -3,23 +3,20 @@
 
 Legacy GSM и /ws НЕ затрагиваются.
 Все общие компоненты берутся из core/.
+Паттерны инициализации LLM и tools — как в main.py (web endpoint).
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import datetime as dt
-import json
 import logging
 import uuid
 from typing import Any, Optional
 
-from fastapi import APIRouter, Request, WebSocket
+from fastapi import APIRouter, Request
 from pipecat.frames.frames import (
     CancelFrame,
-    EndFrame,
-    Frame,
     LLMMessagesAppendFrame,
     LLMRunFrame,
 )
@@ -38,8 +35,9 @@ from pipecat.processors.frameworks.rtvi import (
 )
 from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, GeminiVADParams
 from pipecat.services.llm_service import FunctionCallParams
-from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 from core import (
     DEFAULT_LANG,
@@ -47,17 +45,12 @@ from core import (
     GEMINI_API_KEY,
     GEMINI_MODEL,
     IDLE_TIMEOUT_SECONDS,
-    MAX_CALL_SECONDS,
-    Persona,
     build_personality_block,
     build_tools,
     get_client_data,
     get_persona,
     log,
-    run_archivist_and_notify_n8n,
-    sb_select,
-    tz_for,
-    upload_audio_to_supabase,
+    resolve_voice_name,
 )
 
 router = APIRouter(tags=["webrtc-rtvi"])
@@ -105,14 +98,10 @@ UI_NAVIGATION_TOOL = {
 
 
 def _build_tools_with_ui(client_data: dict, readable_hours: str) -> list[dict]:
-    """Существующие tools + control_website_ui."""
-    tools = build_tools(client_data, readable_hours, web=True)
-    # build_tools возвращает list[dict] function_declarations-ready
-    if tools and "function_declarations" in tools[0]:
-        tools[0]["function_declarations"].append(UI_NAVIGATION_TOOL)
-    else:
-        tools = [{"function_declarations": [UI_NAVIGATION_TOOL]}]
-    return tools
+    """Формат как в main.py: [{"function_declarations": [...]}]."""
+    base = build_tools(client_data, readable_hours, web=True)
+    base.append(UI_NAVIGATION_TOOL)
+    return [{"function_declarations": base}]
 
 
 # =============================================================================
@@ -127,41 +116,41 @@ async def run_webrtc_session(
 ) -> None:
     """Один WebRTC-сеанс «Сайта Будущего»."""
     call_id = uuid.uuid4().hex[:8]
-    clog = logging.LoggerAdapter(log, {"call_id": call_id})
+    clog = logging.LoggerAdapter(log, {})
     clog.info("[%s] WebRTC session start client=%s visitor=%s", call_id, client_id, visitor_id)
 
     client_data = await get_client_data(client_id) or {}
     persona = await get_persona(client_id)
-    tz_name = client_data.get("timezone") or DEFAULT_TZ
     call_lang = persona.language or DEFAULT_LANG
 
-    # --- LLM ---
     system_prompt = (
         build_personality_block(persona, call_lang)
         + "\n\n"
         + (client_data.get("system_prompt") or "")
         + "\n\n"
+        "CHANNEL: this is a voice session from the company's WEBSITE via WebRTC. "
         "You can control the website UI with the control_website_ui tool. "
         "When the user asks to see services, prices, contacts or wants to book — "
-        "call control_website_ui first, then give a short spoken answer."
+        "call control_website_ui first, then give a short spoken answer. "
+        "You do not know the visitor's phone number unless they give it."
     )
 
     tools = _build_tools_with_ui(client_data, "")
 
     llm = GeminiLiveLLMService(
         api_key=GEMINI_API_KEY,
-        model=GEMINI_MODEL,
-        system_instruction=system_prompt,
         tools=tools,
         settings=GeminiLiveLLMService.Settings(
+            model=GEMINI_MODEL,
+            voice=resolve_voice_name(persona.voice_model),
+            system_instruction=system_prompt,
             vad=GeminiVADParams(
                 start_sensitivity="low",
                 end_sensitivity="low",
-            )
+            ),
         ),
     )
 
-    # --- RTVI ---
     rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
     rtvi_observer = RTVIObserver(
         rtvi,
@@ -174,48 +163,52 @@ async def run_webrtc_session(
         ),
     )
 
-    context = LLMContext()
+    context = LLMContext(messages=[])
     context_aggregator = LLMContextAggregatorPair(context)
 
-    # --- Обработчик UI-инструмента ---
+    task: Optional[PipelineTask] = None
+
     async def process_control_website_ui(params: FunctionCallParams):
         section = params.arguments.get("section", "hero")
         highlight = params.arguments.get("highlight_element")
         prefill = params.arguments.get("prefill_data") or {}
 
-        await task.queue_frames([
-            RTVIUICommandFrame(
-                command="navigate_and_render",
-                payload={
-                    "section": section,
-                    "highlight": highlight,
-                    "prefill": prefill,
-                },
-            )
-        ])
+        if task is not None:
+            await task.queue_frames([
+                RTVIUICommandFrame(
+                    command="navigate_and_render",
+                    payload={
+                        "section": section,
+                        "highlight": highlight,
+                        "prefill": prefill,
+                    },
+                )
+            ])
         await params.result_callback({
             "status": "ui_updated",
             "active_section": section,
-            "instruction": f"Section '{section}' is now shown on screen. Give a short spoken summary.",
+            "instruction": (
+                f"Section '{section}' is now shown on screen. "
+                "Give a short spoken summary of what the visitor sees."
+            ),
         })
 
     llm.register_function("control_website_ui", process_control_website_ui)
 
-    # --- Обратные события от экрана ---
     @rtvi.event_handler("on_client_message")
     async def on_client_message(rtvi_proc, msg):
-        if getattr(msg, "type", None) == "ui_user_interaction" or (
-            isinstance(msg, dict) and msg.get("type") == "ui_user_interaction"
-        ):
-            data = msg.data if hasattr(msg, "data") else msg.get("data", {})
-            description = data.get("description", str(data))
-            context.add_message({
-                "role": "user",
-                "content": f"SYSTEM UI EVENT: Client interacted with the screen: {description}",
-            })
+        msg_type = getattr(msg, "type", None) or (msg.get("type") if isinstance(msg, dict) else None)
+        if msg_type != "ui_user_interaction":
+            return
+        data = getattr(msg, "data", None) or (msg.get("data") if isinstance(msg, dict) else {}) or {}
+        description = data.get("description", str(data))
+        context.add_message({
+            "role": "user",
+            "content": f"SYSTEM UI EVENT: Client interacted with the screen: {description}",
+        })
+        if task is not None:
             await task.queue_frames([LLMRunFrame()])
 
-    # --- Pipeline ---
     pipeline = Pipeline([
         transport.input(),
         rtvi,
@@ -244,11 +237,13 @@ async def run_webrtc_session(
     @rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi_proc):
         await rtvi_proc.set_bot_ready()
-        # Короткое приветствие
         await task.queue_frames([
             LLMMessagesAppendFrame(messages=[{
                 "role": "user",
-                "content": "SYSTEM: Client just connected to the website. Greet briefly and ask how you can help.",
+                "content": (
+                    "SYSTEM: Client just connected to the website. "
+                    "Greet briefly and ask how you can help."
+                ),
             }]),
             LLMRunFrame(),
         ])
@@ -284,12 +279,9 @@ async def webrtc_offer(request: Request):
     if not client_id:
         return {"error": "missing client_id"}, 400
 
-    # Проверяем, что клиент существует
     client_data = await get_client_data(client_id)
     if not client_data:
         return {"error": "unknown client_id"}, 404
-
-    from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 
     connection = SmallWebRTCConnection()
     await connection.initialize(sdp=offer_sdp, type=offer_type)
@@ -303,7 +295,6 @@ async def webrtc_offer(request: Request):
         ),
     )
 
-    # Запускаем пайплайн в фоне
     asyncio.create_task(
         run_webrtc_session(transport, client_id, visitor_id, project_id)
     )
