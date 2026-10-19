@@ -3,6 +3,7 @@
 
 Legacy GSM и /ws НЕ затрагиваются.
 Паттерны LLM, tools и обработчиков — как в main.py (web endpoint).
+Фаза 3.1: Анти-Диктовка (Voice + Micro-Form Injection).
 """
 
 from __future__ import annotations
@@ -143,7 +144,11 @@ async def run_webrtc_session(
         "You can control the website UI with the control_website_ui tool. "
         "When the user asks to see services, prices, contacts or wants to book — "
         "call control_website_ui first, then give a short spoken answer. "
-        "You do not know the visitor's phone number unless they give it."
+        "You do not know the visitor's phone number unless they give it. "
+        "ANTI-DICTATION: never ask the visitor to dictate a phone number digit by digit. "
+        "If a phone is needed for booking or a lead, open the on-screen form "
+        "(control_website_ui section=booking_widget) and wait for the form data "
+        "from the UI. When a SYSTEM UI EVENT brings a phone number, use it."
     )
 
     tools = _build_tools_with_ui(client_data, "")
@@ -252,8 +257,34 @@ async def run_webrtc_session(
         normalizeaza_timp(params.arguments, tz_name)
 
         if action == "book" and not telefon_valid(phone_arg):
-            await params.result_callback(TELEFON_INCOMPLET)
+            # Анти-диктовка: форма на экране вместо диктовки номера
+            if task is not None:
+                await task.queue_frames([
+                    RTVIUICommandFrame(
+                        command="navigate_and_render",
+                        payload={
+                            "section": "booking_widget",
+                            "highlight": "phone",
+                            "prefill": {
+                                "start_time": params.arguments.get("start_time"),
+                                "end_time": params.arguments.get("end_time"),
+                                "client_name": params.arguments.get("client_name"),
+                                "request_summary": params.arguments.get("request_summary"),
+                            },
+                        },
+                    )
+                ])
+            await params.result_callback({
+                "status": "need_phone_via_form",
+                "message": (
+                    "Forma de pe ecran este deschisă. Nu cere numărul pe voice, "
+                    "cifră cu cifră. Spune scurt să completeze telefonul în formular "
+                    "sau să apese autofill. Așteaptă SYSTEM UI EVENT cu numărul, "
+                    "apoi apelează din nou Booking_tool action=book."
+                ),
+            })
             return
+
         if action in ("cancel", "reschedule"):
             if not zapis_id:
                 await params.result_callback(FARA_PROGRAMARE)
@@ -342,11 +373,22 @@ async def run_webrtc_session(
 
     @rtvi.event_handler("on_client_message")
     async def on_client_message(rtvi_proc, msg):
+        nonlocal learned_phone
         msg_type = getattr(msg, "type", None) or (msg.get("type") if isinstance(msg, dict) else None)
         if msg_type != "ui_user_interaction":
             return
         data = getattr(msg, "data", None) or (msg.get("data") if isinstance(msg, dict) else {}) or {}
         description = data.get("description", str(data))
+
+        form_phone = str(data.get("phone") or data.get("client_phone") or "").strip()
+        form_name = str(data.get("client_name") or data.get("name") or "").strip()
+        if telefon_valid(form_phone):
+            learned_phone = form_phone
+            description = (
+                f"{description}; phone_from_form={form_phone}"
+                + (f"; name_from_form={form_name}" if form_name else "")
+            )
+
         context.add_message({
             "role": "user",
             "content": f"SYSTEM UI EVENT: Client interacted with the screen: {description}",
