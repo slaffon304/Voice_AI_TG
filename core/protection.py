@@ -10,6 +10,9 @@ from core.config import (
     TURNSTILE_SECRET_KEY,
     WEB_MAX_CALLS_PER_IP,
     WEB_MAX_CALLS_PER_VISITOR,
+    WEB_SESSION_SECONDS_1,
+    WEB_SESSION_SECONDS_2,
+    WEB_SESSION_SECONDS_3,
     log,
     tz_for,
 )
@@ -74,31 +77,62 @@ async def blocheaza(client_id: str, visitor_id: str, ip: str, motiv: str) -> Non
     log.warning("blocat: visitor=%s ip=%s motiv=%s", (visitor_id or "")[:12], ip, motiv)
 
 
-async def peste_limita(visitor_id: str, ip: str) -> str:
-    if not redis_client:
-        return ""
+def _day_window() -> tuple[str, int]:
     acum = dt.datetime.now(tz_for(DEFAULT_TZ))
     start_zi = acum.replace(hour=5, minute=0, second=0, microsecond=0)
     if acum < start_zi:
         start_zi -= dt.timedelta(days=1)
     ttl = int((start_zi + dt.timedelta(days=1) - acum).total_seconds()) + 3600
-    zi = start_zi.strftime("%Y%m%d")
-    for cheie, valoare, limita, nume in (
-        (f"web_calls:v:{zi}:{visitor_id}", visitor_id, WEB_MAX_CALLS_PER_VISITOR, "visitor"),
-        (f"web_calls:i:{zi}:{ip}", ip, WEB_MAX_CALLS_PER_IP, "ip"),
-    ):
-        if not valoare:
-            continue
-        try:
-            numar = await redis_client.incr(cheie)
-            if numar == 1:
-                await redis_client.expire(cheie, ttl)
-            if numar > limita:
-                return f"{nume} {valoare[:16]}"
-        except Exception as exc:
-            log.warning("limita zilnica: Redis nu raspunde: %s", exc)
-            return ""
-    return ""
+    return start_zi.strftime("%Y%m%d"), ttl
+
+
+async def peste_limita(visitor_id: str, ip: str) -> str:
+    """Совместимость: инкремент счётчиков, строка ошибки или \"\"."""
+    err, _idx, _sec = await web_session_budget(visitor_id, ip)
+    return err
+
+
+async def web_session_budget(visitor_id: str, ip: str) -> tuple[str, int, int]:
+    """Слот голосовой сессии на сегодня (с 05:00 локального TZ).
+
+    Returns:
+        (error, session_index, max_seconds)
+        error непустой → отказать offer (429).
+        session_index — номер сессии visitor за сутки (1..N).
+        max_seconds — лимит длительности этой сессии (0 если отказано).
+    """
+    if not redis_client:
+        return "", 1, WEB_SESSION_SECONDS_1
+
+    zi, ttl = _day_window()
+    session_index = 1
+    try:
+        if visitor_id:
+            vkey = f"web_calls:v:{zi}:{visitor_id}"
+            session_index = int(await redis_client.incr(vkey))
+            if session_index == 1:
+                await redis_client.expire(vkey, ttl)
+            if session_index > WEB_MAX_CALLS_PER_VISITOR:
+                return f"visitor {visitor_id[:16]}", session_index, 0
+        if ip:
+            ikey = f"web_calls:i:{zi}:{ip}"
+            ip_n = int(await redis_client.incr(ikey))
+            if ip_n == 1:
+                await redis_client.expire(ikey, ttl)
+            if ip_n > WEB_MAX_CALLS_PER_IP:
+                return f"ip {ip[:16]}", session_index, 0
+    except Exception as exc:
+        log.warning("web_session_budget redis: %s", exc)
+        return "", 1, WEB_SESSION_SECONDS_1
+
+    if session_index <= 1:
+        max_sec = WEB_SESSION_SECONDS_1
+    elif session_index == 2:
+        max_sec = WEB_SESSION_SECONDS_2
+    else:
+        max_sec = WEB_SESSION_SECONDS_3
+
+    return "", session_index, max_sec
 
 
 def origin_permis(origin: str, allowed_origins: str | None) -> bool:
