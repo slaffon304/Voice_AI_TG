@@ -65,6 +65,7 @@ from core.config import (
     log,
     tz_for,
 )
+from core.memory import get_caller_memory, get_web_visitor_context
 from core.audio import (
     AIAudioCatcher,
     AudioMixer,
@@ -208,6 +209,8 @@ __all__ = [
     "estimate_tokens",
     "Persona",
     "build_personality_block",
+    "get_caller_memory",
+    "get_web_visitor_context",
     # db
     "http",
     "sb_headers",
