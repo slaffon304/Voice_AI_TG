@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import Any, Literal
 
+from core.config import WEB_PROMPT_CLIENT_MAX_CHARS
 from core.hours import next_open_slot, office_state
 from core.persona import Persona, build_personality_block
 
@@ -20,37 +21,30 @@ TELEPHONY_RULES = """<CALL_RULES>
 </CALL_RULES>"""
 
 WEB_CHANNEL_RULES = """<CHANNEL>
-This is a voice session from the company's WEBSITE via WebRTC (Generative UI).
-You control the website UI with tools. When the visitor asks about services, prices,
-contacts or wants to book — call control_website_ui first, then give a short spoken answer.
-You do not know the visitor's phone number unless they give it or the on-screen form sends it.
+Voice session on the company website (WebRTC + Generative UI widget).
+You lead. You are not a passive FAQ bot. Speak only the language given in <LANG>.
 
-ANTI-DICTATION: never ask the visitor to dictate a phone number digit by digit.
-If a phone is needed for booking or a lead, open the on-screen form
-(control_website_ui section=booking_widget) and wait for form data from the UI.
-When a SYSTEM UI EVENT brings a phone number, use it.
+UI FIRST: prices, packages, cases, forms live on screen. Call control_website_ui
+(or update_roi_calculator / morph_ui_for_sentiment) before long explanations.
+Voice = short; screen = detail. Never invent numbers not shown or confirmed by tools.
 
-DWELL: if you receive SYSTEM UI EVENT about the visitor lingering on a plan or element,
-give one short helpful comment (one sentence). Do not repeat.
+ANTI-DICTATION: never ask the visitor to dictate a phone digit by digit.
+Need a phone → open booking_widget / verify UI and wait for SYSTEM UI EVENT.
 
-ROI: when the visitor talks about missed calls or savings, call update_roi_calculator,
-then speak net_monthly_savings from the result.
+ESCAPE: if SYSTEM UI EVENT says the visitor chose "don't want to talk", stop the
+voice track immediately. Do not argue.
 
-SCREEN AUDIT: when the visitor asks to review their page/CTA/form, call request_screen_audit.
-Wait for SYSTEM UI EVENT with page summary, then give 2–3 concrete observations.
-Do not invent page content you were not given.
+ABUSE: we limit open voice access because of competitors and bad-faith visitors.
+Never say "demo", "trial ended", or "free minutes are over". If verification is
+required, say honestly that identity must be confirmed to continue, and point to
+the on-screen form. After verified abuse continues, the system will block them.
 
-SENTIMENT: on doubt / price concern / trust gap, call morph_ui_for_sentiment once,
-then briefly reassure while the UI shows cases or guarantees.
+SESSION: this voice session is time-limited. Be concise. Move toward a concrete
+next step (qualified interest, booking, or verified contact) without a hard-sell script.
 
-DOM: prefer control_website_ui for section navigation; use dom_action for precise
-scroll_to / highlight / set_input_value / click when you have a ref or target_id.
-
-UI MODE: always prefer the 'section' parameter of control_website_ui.
-Only use the optional 'components' list for concept mode (custom composition).
-
-AGENT STATE: before longer actions call set_agent_state (searching, solving, working…).
-Return to breathing or idle when done — this drives the Thinking Orb.
+DWELL / ROI / AUDIT / SENTIMENT / DOM / AGENT STATE: one short spoken line;
+UI does the heavy lifting. Prefer control_website_ui section=... ; components only in concept mode.
+AGENT STATE: set_agent_state for longer actions; return to breathing/idle when done.
 </CHANNEL>"""
 
 
@@ -64,12 +58,9 @@ def render_client_template(
     lang: str,
     now: dt.datetime,
     hours: dict[str, list[str]],
+    *,
+    channel: Channel = "gsm",
 ) -> tuple[str, bool, str]:
-    """Подстановки токенов в шаблон клиента.
-
-    Returns:
-        (rendered_prompt, is_open, readable_hours)
-    """
     raw = (
         persona.system_prompt
         or client_data.get("system_message")
@@ -96,6 +87,13 @@ def render_client_template(
     ):
         prompt = prompt.replace(token, value)
 
+    if channel == "web" and len(prompt) > WEB_PROMPT_CLIENT_MAX_CHARS:
+        prompt = (
+            prompt[:WEB_PROMPT_CLIENT_MAX_CHARS].rstrip()
+            + "\n\n[Truncated. Full pricing and long FAQ are on the website UI — "
+            "use control_website_ui / tools; do not invent missing details.]"
+        )
+
     return prompt, is_open, readable_hours
 
 
@@ -110,22 +108,12 @@ def _availability_block(
     blocks = [
         "<AVAILABILITY>",
         (
-            "YOU ARE AVAILABLE 24/7. Consult, present, explain, answer questions and give "
-            "prices at any hour of the day or night, including right now. The office being "
-            "closed limits NOTHING for you — you are not the office, you are the assistant, "
-            "and you work around the clock."
+            "YOU ARE AVAILABLE 24/7 for voice consultation. Office hours only limit "
+            f"meetings WITH A HUMAN: {readable_hours}."
         ),
         (
-            "NEVER tell the visitor to come back later, never postpone their question to "
-            "working hours, and never refuse to consult because of the time."
-        ),
-        (
-            "PEOPLE are a separate matter. Meetings, callbacks and consultations WITH A HUMAN "
-            f"only happen during working hours: {readable_hours}."
-        ),
-        (
-            f"Right now it is {now.strftime('%A, %d %B %Y, %H:%M')} local time "
-            f"(UTC{offset_fmt}). Next human slot: {next_slot}."
+            f"Now: {now.strftime('%A, %d %B %Y, %H:%M')} (UTC{offset_fmt}). "
+            f"Next human slot: {next_slot}."
         ),
         "</AVAILABILITY>",
         "",
@@ -145,20 +133,23 @@ def build_system_prompt(
     caller_phone: str = "Necunoscut",
     caller_name: str = "",
     caller_card: dict | None = None,
+    landing_url: str = "",
+    referrer: str = "",
 ) -> tuple[str, str]:
-    """Единая сборка system instruction.
-
-    Returns:
-        (full_system_prompt, readable_hours)
-        readable_hours — сразу для build_tools / Booking_tool description.
-    """
     memory = memory or {"core": "", "short": "", "long": ""}
     client_prompt, _is_open, readable_hours = render_client_template(
-        client_data, persona, lang, now, hours
+        client_data, persona, lang, now, hours, channel=channel
     )
 
-    # Характер первым — иначе тонет в длинном клиентском тексте
     blocks: list[str] = [build_personality_block(persona, lang), "", client_prompt, ""]
+
+    blocks.append("<LANG>")
+    blocks.append(
+        f"Speak and think in this language for the whole session: {lang}. "
+        "Do not switch unless the visitor clearly switches first."
+    )
+    blocks.append("</LANG>")
+    blocks.append("")
 
     if channel == "gsm":
         blocks.append(TELEPHONY_RULES)
@@ -190,10 +181,20 @@ def build_system_prompt(
     else:
         blocks.append(WEB_CHANNEL_RULES)
         blocks.append("")
+        if landing_url or referrer:
+            blocks.append("<ARRIVAL>")
+            if landing_url:
+                blocks.append(f"Landing URL: {landing_url}")
+            if referrer:
+                blocks.append(f"Referrer: {referrer}")
+            blocks.append("</ARRIVAL>")
+            blocks.append("")
+        if caller_name:
+            blocks.append(f"Visitor name (if known): {caller_name}.")
+            blocks.append("")
 
     blocks.extend(_availability_block(hours, now, readable_hours))
 
-    # Память
     core = (memory.get("core") or "").strip()
     short = (memory.get("short") or "").strip()
     long_m = (memory.get("long") or "").strip()
