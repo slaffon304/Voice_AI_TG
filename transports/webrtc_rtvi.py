@@ -60,6 +60,8 @@ from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 from core import (
+    build_transcript,
+    run_archivist_and_notify_n8n,
     DEFAULT_LANG,
     FARA_PROGRAMARE,
     GEMINI_API_KEY,
@@ -1035,7 +1037,64 @@ async def run_webrtc_session(
     except Exception as exc:
         clog.exception("[%s] WebRTC session error: %s", call_id, exc)
     finally:
-        clog.info("[%s] WebRTC session ended", call_id)
+        duration = int(max(0.0, time.time() - start_ts))
+        clog.info("[%s] WebRTC session ended, %ss", call_id, duration)
+
+        try:
+            messages = []
+            if context is not None:
+                messages = list(getattr(context, "messages", None) or [])
+
+            transcript, user_replies = build_transcript(messages)
+            if transcript:
+                clog.info("[%s] ДИАЛОГ (%d user turns):\n%s", call_id, user_replies, transcript)
+
+            call_status = "inbound_dropped" if user_replies == 0 else "completed"
+            phone_for_crm = learned_phone or ""
+            lead_was_saved = bool(saved_lead_hashes)
+
+            usage_stats = {
+                "duration_seconds": duration,
+                "turns": user_replies,
+                "platform": "web_voice",
+            }
+
+            async def _post() -> None:
+                await asyncio.sleep(0.3)
+                try:
+                    await run_archivist_and_notify_n8n(
+                        client_id=client_id,
+                        phone=phone_for_crm,
+                        client_name="",
+                        old_memory={"core": "", "short": "", "long": ""},
+                        chat_history=transcript,
+                        audio_url="",
+                        sys_length=len(system_prompt),
+                        direction="inbound",
+                        call_status=call_status,
+                        tz_name=tz_name,
+                        usage_stats=usage_stats,
+                        audio_path=None,
+                        project_id=project_id or "",
+                        web_id=visitor_id or "",
+                        platform="web_voice",
+                        visitor_meta={"visitor_id": visitor_id or ""},
+                        lead_saved=lead_was_saved,
+                        tg_chat=tg_chat,
+                    )
+                    clog.info(
+                        "[%s] archivist done status=%s lead_saved=%s",
+                        call_id, call_status, lead_was_saved,
+                    )
+                except Exception as post_exc:
+                    clog.exception("[%s] archivist failed: %s", call_id, post_exc)
+
+            if transcript or user_replies > 0 or learned_phone:
+                asyncio.create_task(_post())
+            else:
+                clog.info("[%s] skip archivist — empty session", call_id)
+        except Exception as fin_exc:
+            clog.exception("[%s] post-processing failed: %s", call_id, fin_exc)
 
 
 @router.post("/api/offer")
