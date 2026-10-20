@@ -66,7 +66,6 @@ OUT_CHUNK_SIZE = _env_int("OUT_CHUNK_SIZE", 640)
 OUT_VOLUME = _env_float("OUT_VOLUME", 0.75)
 DUMP_INPUT_AUDIO = _env_bool("DUMP_INPUT_AUDIO", False)
 
-# АРУ и фильтрация фона
 INPUT_AGC = _env_bool("INPUT_AGC", True)
 INPUT_TARGET_DBFS = _env_float("INPUT_TARGET_DBFS", -20.0)
 INPUT_MAX_GAIN_DB = _env_float("INPUT_MAX_GAIN_DB", 24.0)
@@ -75,7 +74,6 @@ BACKGROUND_GATE_DB = _env_float("BACKGROUND_GATE_DB", 10.0)
 BACKGROUND_ATTEN_DB = _env_float("BACKGROUND_ATTEN_DB", 15.0)
 BACKGROUND_HOLD_MS = _env_int("BACKGROUND_HOLD_MS", 300)
 
-# VAD (Voice Activity Detection)
 VAD_SILENCE_MS = _env_int("VAD_SILENCE_MS", 1500)
 VAD_END_SENSITIVITY = os.getenv("VAD_END_SENSITIVITY", "low").strip().lower()
 VAD_START_SENSITIVITY = os.getenv("VAD_START_SENSITIVITY", "low").strip().lower()
@@ -93,7 +91,6 @@ MIN_SECONDS_BEFORE_END_CALL = _env_int("MIN_SECONDS_BEFORE_END_CALL", 25)
 IDLE_TIMEOUT_SECONDS = _env_float("IDLE_TIMEOUT_SECONDS", 20.0)
 PERSONA_CACHE_TTL = _env_int("PERSONA_CACHE_TTL", 60)
 
-# Web виджет лимиты
 WEB_CHAT_MAX_PER_VISITOR = _env_int("WEB_CHAT_MAX_PER_VISITOR", 60)
 WEB_CHAT_MAX_PER_IP = _env_int("WEB_CHAT_MAX_PER_IP", 200)
 WEB_CHAT_MAX_PER_SITE = _env_int("WEB_CHAT_MAX_PER_SITE", 1000)
@@ -106,13 +103,18 @@ WEB_MAX_CALLS_PER_VISITOR = _env_int("WEB_MAX_CALLS_PER_VISITOR", 3)
 WEB_MAX_CALLS_PER_IP = _env_int("WEB_MAX_CALLS_PER_IP", 6)
 WEB_MAX_MINUTES_PER_DAY = _env_int("WEB_MAX_MINUTES_PER_DAY", 60)
 
-# Цены токенов ($ / 1M)
+# Progressive WebRTC session length (seconds), by visit number today
+WEB_SESSION_SECONDS_1 = _env_int("WEB_SESSION_SECONDS_1", 180)
+WEB_SESSION_SECONDS_2 = _env_int("WEB_SESSION_SECONDS_2", 90)
+WEB_SESSION_SECONDS_3 = _env_int("WEB_SESSION_SECONDS_3", 45)
+# Cap client system_message size injected into Live prompt (web only)
+WEB_PROMPT_CLIENT_MAX_CHARS = _env_int("WEB_PROMPT_CLIENT_MAX_CHARS", 2200)
+
 PRICE_TEXT_IN = _env_float("PRICE_TEXT_IN", 0.75)
 PRICE_AUDIO_IN = _env_float("PRICE_AUDIO_IN", 3.00)
 PRICE_AUDIO_OUT = _env_float("PRICE_AUDIO_OUT", 12.00)
 AUDIO_TOKENS_PER_SECOND = 25
 
-# Asterisk
 ASTERISK_ARI_URL = os.getenv("ASTERISK_ARI_URL", "http://asterisk:8088")
 ASTERISK_ARI_USER = os.getenv("ASTERISK_ARI_USER", "asterisk")
 ASTERISK_ARI_PASSWORD = os.getenv("ASTERISK_ARI_PASSWORD", "asterisk")
