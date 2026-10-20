@@ -86,6 +86,7 @@ from core import (
     origin_permis,
     parse_working_hours,
     peste_limita,
+    web_session_budget,
     propusk_valabil,
     resolve_voice_name,
     run_archivist_and_notify_n8n,
@@ -396,6 +397,12 @@ async def run_webrtc_session(
     client_id: str,
     visitor_id: str,
     project_id: str = "",
+    *,
+    browser_lang: str = "",
+    landing_url: str = "",
+    referrer: str = "",
+    session_index: int = 1,
+    max_session_seconds: int = 180,
 ) -> None:
     call_id = uuid.uuid4().hex[:8]
     clog = logging.LoggerAdapter(log, {})
@@ -403,7 +410,14 @@ async def run_webrtc_session(
 
     client_data = await get_client_data(client_id) or {}
     persona = await get_persona(client_id)
-    call_lang = persona.language or DEFAULT_LANG
+    # Browser/device language wins when provided (widget sends navigator.language)
+    call_lang = (browser_lang or "").strip() or persona.language or DEFAULT_LANG
+    if "-" in call_lang:
+        call_lang = call_lang.split("-")[0].lower()
+    elif "_" in call_lang:
+        call_lang = call_lang.split("_")[0].lower()
+    else:
+        call_lang = call_lang.lower()[:8]
     tz_name = client_data.get("timezone") or "Europe/Chisinau"
     company = client_data.get("company_name") or client_id
     tg_chat = client_data.get("tg_chat_id_notify") or ""
@@ -418,6 +432,7 @@ async def run_webrtc_session(
     audit_pending_focus: str = ""
     latest_snapshot: Any = None  # Фаза 2.5 — последний ui-snapshot
     sentiment_fired: set[str] = set()  # анти-спам для morph
+    deadline_handle = None
 
     # Память / карточка по visitor_id (RPC → person_memory через end_client)
     contact, visitor_memory, time_ctx = await get_web_visitor_context(client_id, visitor_id)
@@ -447,6 +462,12 @@ async def run_webrtc_session(
         hours=hours,
         channel="web",
         caller_name=visitor_name,
+        landing_url=landing_url,
+        referrer=referrer,
+    )
+    clog.info(
+        "[%s] session_index=%s max_sec=%s lang=%s prompt_chars=%s",
+        call_id, session_index, max_session_seconds, call_lang, len(system_prompt),
     )
     tools = _build_tools_with_ui(client_data, readable_hours)
 
@@ -871,6 +892,34 @@ async def run_webrtc_session(
         except (TypeError, ValueError):
             dwell_sec = 0.0
 
+        # ----- Escape: visitor chose "don't want to talk" -----
+        if interaction in ("escape", "mute_voice", "dont_want_to_talk", "decline_voice"):
+            clog.info("[%s] visitor escape interaction=%s", call_id, interaction)
+            context.add_message({
+                "role": "user",
+                "content": "SYSTEM UI EVENT: visitor chose not to continue by voice. End the voice session immediately. Do not argue.",
+            })
+            if task is not None:
+                await task.queue_frames([CancelFrame()])
+            return
+
+        # ----- Phone verified via widget form / SMS -----
+        if interaction in ("phone_verified", "verify_phone"):
+            phone_raw = str(data.get("phone") or data.get("value") or "").strip()
+            if phone_raw and telefon_valid(phone_raw):
+                learned_phone = "".join(filter(str.isdigit, phone_raw))
+                clog.info("[%s] phone verified via UI", call_id)
+                context.add_message({
+                    "role": "user",
+                    "content": (
+                        f"SYSTEM UI EVENT: visitor verified phone on screen. "
+                        f"Use this number for booking/lead; do not ask them to dictate it."
+                    ),
+                })
+                if task is not None:
+                    await task.queue_frames([LLMRunFrame()])
+            return
+
         # ----- Screen audit result from client -----
         if interaction == "screen_audit":
             page_summary = str(data.get("page_summary") or data.get("summary") or "").strip()
@@ -1038,7 +1087,22 @@ async def run_webrtc_session(
             LLMRunFrame(),
         ])
 
+
+    async def _session_deadline() -> None:
+        try:
+            await asyncio.sleep(max(15, int(max_session_seconds)))
+            clog.info("[%s] session time budget %ss reached — ending", call_id, max_session_seconds)
+            if task is not None:
+                await task.queue_frames([CancelFrame()])
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            clog.warning("[%s] session deadline error: %s", call_id, exc)
+
+    deadline_handle = asyncio.create_task(_session_deadline())
+
     runner = PipelineRunner()
+
     try:
         await runner.run(task)
     except Exception as exc:
@@ -1047,6 +1111,8 @@ async def run_webrtc_session(
         duration = int(max(0.0, time.time() - start_ts))
         clog.info("[%s] WebRTC session ended, %ss", call_id, duration)
 
+        with contextlib.suppress(Exception):
+            deadline_handle.cancel()
         with contextlib.suppress(Exception):
             mixer.close()
 
@@ -1128,6 +1194,9 @@ async def webrtc_offer(request: Request) -> dict | JSONResponse:
     visitor_id = str(body.get("visitor_id") or "").strip()
     project_id = str(body.get("project_id") or "").strip()
     turnstile_token = str(body.get("turnstile_token") or body.get("cf-turnstile-response") or "").strip()
+    browser_lang = str(body.get("lang") or body.get("language") or body.get("locale") or "").strip()
+    landing_url = str(body.get("landing_url") or body.get("url") or body.get("page_url") or "").strip()[:500]
+    referrer = str(body.get("referrer") or body.get("ref") or "").strip()[:500]
 
     if not offer_sdp or not key:
         return JSONResponse({"error": "sdp and key required"}, status_code=400)
@@ -1174,10 +1243,13 @@ async def webrtc_offer(request: Request) -> dict | JSONResponse:
         log.warning("webrtc turnstile failed ip=%s", ip)
         return JSONResponse({"error": "verification failed"}, status_code=403)
 
-    depasit = await peste_limita(visitor_id, ip)
-    if depasit:
-        log.warning("webrtc daily limit: %s", depasit)
-        return JSONResponse({"error": "daily_limit", "detail": depasit}, status_code=429)
+    limit_err, session_index, max_session_seconds = await web_session_budget(visitor_id, ip)
+    if limit_err:
+        log.warning("webrtc daily limit: %s", limit_err)
+        return JSONResponse(
+            {"error": "daily_limit", "detail": limit_err, "session_index": session_index},
+            status_code=429,
+        )
 
     connection = SmallWebRTCConnection()
     await connection.initialize(sdp=offer_sdp, type=offer_type)
@@ -1191,12 +1263,25 @@ async def webrtc_offer(request: Request) -> dict | JSONResponse:
         ),
     )
 
+    vid = visitor_id or uuid.uuid4().hex
     asyncio.create_task(
-        run_webrtc_session(transport, client_id, visitor_id or uuid.uuid4().hex, project_id)
+        run_webrtc_session(
+            transport,
+            client_id,
+            vid,
+            project_id,
+            browser_lang=browser_lang,
+            landing_url=landing_url,
+            referrer=referrer,
+            session_index=session_index,
+            max_session_seconds=max_session_seconds,
+        )
     )
 
     answer = connection.get_answer()
     return {
         "sdp": answer["sdp"],
         "type": answer["type"],
+        "session_index": session_index,
+        "max_session_seconds": max_session_seconds,
     }
