@@ -59,7 +59,7 @@ from core.config import (
     WEB_CHAT_SESSION_TTL,
     WEB_OUTPUT_SAMPLE_RATE,
     WEB_SESSION_SECONDS_1, WEB_SESSION_SECONDS_2, WEB_SESSION_SECONDS_3,
-    WEB_PROMPT_CLIENT_MAX_CHARS, web_session_budget
+    WEB_PROMPT_CLIENT_MAX_CHARS,
     TURNSTILE_SECRET_KEY,
     WEB_MAX_CALLS_PER_IP,
     WEB_MAX_CALLS_PER_VISITOR,
@@ -130,6 +130,7 @@ from core.protection import (
     origin_permis,
     peste_limita,
     propusk_valabil,
+    web_session_budget,
 )
 
 __all__ = [
