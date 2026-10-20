@@ -114,6 +114,7 @@ from core.tools import (
     telefon_valid,
 )
 from core.archivist import run_archivist_and_notify_n8n
+from core.transcript import build_transcript
 from core.protection import (
     blocheaza,
     este_blocat,
@@ -228,6 +229,7 @@ __all__ = [
     "build_tools",
     # archivist
     "run_archivist_and_notify_n8n",
+    "build_transcript",
     "propusk_valabil",
     "este_blocat",
     "blocheaza",
