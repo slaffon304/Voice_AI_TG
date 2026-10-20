@@ -78,6 +78,12 @@ from core.audio import (
     pcm_rms,
     pcm_scale,
 )
+from core.hours import (
+    next_open_slot,
+    office_state,
+    parse_working_hours,
+)
+from core.prompt import build_system_prompt, render_client_template
 from core.persona import (
     TRAITS,
     VOICE_MAP,
@@ -214,6 +220,11 @@ __all__ = [
     "get_persona",
     "upload_audio_to_supabase",
     "ensure_end_client",
+    "parse_working_hours",
+    "office_state",
+    "next_open_slot",
+    "build_system_prompt",
+    "render_client_template",
     # tools
     "FRAZA_INAINTE",
     "DURATA_INTALNIRE_MIN",
