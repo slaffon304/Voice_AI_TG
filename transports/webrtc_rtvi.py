@@ -68,6 +68,9 @@ from core import (
     IDLE_TIMEOUT_SECONDS,
     MIN_SECONDS_BEFORE_END_CALL,
     TELEFON_INCOMPLET,
+    WebAIAudioCatcher,
+    WebAudioMixer,
+    WebUserAudioCatcher,
     build_system_prompt,
     build_tools,
     build_transcript,
@@ -91,6 +94,7 @@ from core import (
     slot_liber,
     telefon_valid,
     tz_for,
+    upload_audio_to_supabase,
 )
 
 router = APIRouter(tags=["webrtc-rtvi"])
@@ -446,6 +450,10 @@ async def run_webrtc_session(
     )
     tools = _build_tools_with_ui(client_data, readable_hours)
 
+    wav_path = f"/tmp/webrtc_{call_id}.wav"
+    mixer = WebAudioMixer(wav_path)
+    user_catcher = WebUserAudioCatcher(mixer)
+    ai_catcher = WebAIAudioCatcher(mixer)
 
     llm = GeminiLiveLLMService(
         api_key=GEMINI_API_KEY,
@@ -992,8 +1000,10 @@ async def run_webrtc_session(
     pipeline = Pipeline([
         transport.input(),
         rtvi,
+        user_catcher,
         context_aggregator.user(),
         llm,
+        ai_catcher,
         transport.output(),
         context_aggregator.assistant(),
     ])
@@ -1037,6 +1047,9 @@ async def run_webrtc_session(
         duration = int(max(0.0, time.time() - start_ts))
         clog.info("[%s] WebRTC session ended, %ss", call_id, duration)
 
+        with contextlib.suppress(Exception):
+            mixer.close()
+
         try:
             messages = []
             if context is not None:
@@ -1059,19 +1072,26 @@ async def run_webrtc_session(
             async def _post() -> None:
                 await asyncio.sleep(0.3)
                 try:
+                    audio_url = ""
+                    audio_path = None
+                    if user_replies > 0:
+                        audio_url = await upload_audio_to_supabase(client_id, wav_path) or ""
+                        audio_path = wav_path if audio_url else None
+                        clog.info("[%s] recording uploaded=%s", call_id, bool(audio_url))
+
                     await run_archivist_and_notify_n8n(
                         client_id=client_id,
                         phone=phone_for_crm,
                         client_name=visitor_name,
                         old_memory=visitor_memory,
                         chat_history=transcript,
-                        audio_url="",
+                        audio_url=audio_url,
                         sys_length=len(system_prompt),
                         direction="inbound",
                         call_status=call_status,
                         tz_name=tz_name,
                         usage_stats=usage_stats,
-                        audio_path=None,
+                        audio_path=audio_path,
                         project_id=project_id or "",
                         web_id=visitor_id or "",
                         platform="web_voice",
