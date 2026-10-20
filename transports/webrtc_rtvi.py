@@ -75,6 +75,7 @@ from core import (
     este_blocat,
     get_client_data,
     get_persona,
+    get_web_visitor_context,
     id_din_lookup,
     id_zapisi,
     log,
@@ -405,6 +406,7 @@ async def run_webrtc_session(
     start_ts = time.time()
 
     learned_phone = ""
+    visitor_name = ""
     zapis_id = ""
     saved_lead_hashes: set[str] = set()
     dwell_seen: set[str] = set()
@@ -413,17 +415,34 @@ async def run_webrtc_session(
     latest_snapshot: Any = None  # Фаза 2.5 — последний ui-snapshot
     sentiment_fired: set[str] = set()  # анти-спам для morph
 
+    # Память / карточка по visitor_id (RPC → person_memory через end_client)
+    contact, visitor_memory, time_ctx = await get_web_visitor_context(client_id, visitor_id)
+    if contact.get("phone") and telefon_valid(contact["phone"]):
+        learned_phone = "".join(filter(str.isdigit, str(contact["phone"])))
+    visitor_name = (contact.get("name") or "").strip()
+    if contact.get("event_id"):
+        zapis_id = str(contact["event_id"])
+    clog.info(
+        "[%s] web visitor memory time_ctx=%s found=%s phone=%s name=%s",
+        call_id,
+        time_ctx,
+        contact.get("found"),
+        (learned_phone[:4] + "***") if learned_phone else "-",
+        visitor_name or "-",
+    )
+
     # Часы из БД клиента + единая сборка промпта (как в GSM-контуре)
     hours = parse_working_hours(client_data.get("working_hours"))
     now = dt.datetime.now(tz_for(tz_name))
     system_prompt, readable_hours = build_system_prompt(
         client_data=client_data,
         persona=persona,
-        memory={"core": "", "short": "", "long": ""},
+        memory=visitor_memory,
         lang=call_lang,
         now=now,
         hours=hours,
         channel="web",
+        caller_name=visitor_name,
     )
     tools = _build_tools_with_ui(client_data, readable_hours)
 
@@ -1043,8 +1062,8 @@ async def run_webrtc_session(
                     await run_archivist_and_notify_n8n(
                         client_id=client_id,
                         phone=phone_for_crm,
-                        client_name="",
-                        old_memory={"core": "", "short": "", "long": ""},
+                        client_name=visitor_name,
+                        old_memory=visitor_memory,
                         chat_history=transcript,
                         audio_url="",
                         sys_length=len(system_prompt),
