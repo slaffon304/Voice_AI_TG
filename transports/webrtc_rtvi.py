@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as dt
 import hashlib
 import html
 import logging
@@ -60,8 +61,6 @@ from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 from core import (
-    build_transcript,
-    run_archivist_and_notify_n8n,
     DEFAULT_LANG,
     FARA_PROGRAMARE,
     GEMINI_API_KEY,
@@ -69,8 +68,9 @@ from core import (
     IDLE_TIMEOUT_SECONDS,
     MIN_SECONDS_BEFORE_END_CALL,
     TELEFON_INCOMPLET,
-    build_personality_block,
+    build_system_prompt,
     build_tools,
+    build_transcript,
     call_n8n,
     este_blocat,
     get_client_data,
@@ -80,13 +80,16 @@ from core import (
     log,
     normalizeaza_timp,
     origin_permis,
+    parse_working_hours,
     peste_limita,
     propusk_valabil,
     resolve_voice_name,
+    run_archivist_and_notify_n8n,
     sb_select,
     send_tg_alert,
     slot_liber,
     telefon_valid,
+    tz_for,
 )
 
 router = APIRouter(tags=["webrtc-rtvi"])
@@ -410,45 +413,20 @@ async def run_webrtc_session(
     latest_snapshot: Any = None  # Фаза 2.5 — последний ui-snapshot
     sentiment_fired: set[str] = set()  # анти-спам для morph
 
-    system_prompt = (
-        build_personality_block(persona, call_lang)
-        + "\n\n"
-        + (client_data.get("system_prompt") or "")
-        + "\n\n"
-        "CHANNEL: this is a voice session from the company's WEBSITE via WebRTC. "
-        "You can control the website UI with the control_website_ui tool. "
-        "When the user asks to see services, prices, contacts or wants to book — "
-        "call control_website_ui first, then give a short spoken answer. "
-        "You do not know the visitor's phone number unless they give it. "
-        "ANTI-DICTATION: never ask the visitor to dictate a phone number digit by digit. "
-        "If a phone is needed for booking or a lead, open the on-screen form "
-        "(control_website_ui section=booking_widget) and wait for the form data "
-        "from the UI. When a SYSTEM UI EVENT brings a phone number, use it. "
-        "DWELL: if you receive SYSTEM UI EVENT about the visitor lingering on a plan "
-        "or element, give one short helpful comment (1 sentence). Do not repeat. "
-        "ROI: when the visitor talks about missed calls or savings, call "
-        "update_roi_calculator, then speak net_monthly_savings from the result. "
-        "SCREEN AUDIT: when the visitor asks to review their page/CTA/form, call "
-        "request_screen_audit. Wait for SYSTEM UI EVENT with page summary, then "
-        "give 2–3 concrete observations and optionally highlight elements via "
-        "control_website_ui. Do not invent page content you were not given. "
-        "SENTIMENT (Фаза 3.5): listen for hesitation, soft tone, long pauses, "
-        "or objection words. When you detect doubt / price concern / trust gap, "
-        "call morph_ui_for_sentiment once, then briefly reassure while the UI "
-        "shows cases or guarantees. Do not call it repeatedly for the same signal. "
-        "DOM (Фаза 2.5): you may receive SYSTEM UI EVENT with ui-snapshot data. "
-        "Use dom_action for precise scroll_to / highlight / set_input_value / click "
-        "when you have a ref or target_id. Prefer high-level control_website_ui first. "
-        "UI MODE: always prefer the 'section' parameter of control_website_ui. "
-        "Only use the optional 'components' list when you need to compose a custom view "
-        "(concept mode). Series clients ignore components. "
-        "AGENT STATE: before longer actions (checking calendar, calculating ROI, "
-        "auditing page) call set_agent_state with an appropriate state "
-        "(searching, solving, working, composing…). Return to breathing or idle when done. "
-        "This drives the Thinking Orb the visitor sees."
+    # Часы из БД клиента + единая сборка промпта (как в GSM-контуре)
+    hours = parse_working_hours(client_data.get("working_hours"))
+    now = dt.datetime.now(tz_for(tz_name))
+    system_prompt, readable_hours = build_system_prompt(
+        client_data=client_data,
+        persona=persona,
+        memory={"core": "", "short": "", "long": ""},
+        lang=call_lang,
+        now=now,
+        hours=hours,
+        channel="web",
     )
+    tools = _build_tools_with_ui(client_data, readable_hours)
 
-    tools = _build_tools_with_ui(client_data, "")
 
     llm = GeminiLiveLLMService(
         api_key=GEMINI_API_KEY,
