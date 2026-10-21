@@ -2754,9 +2754,13 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Lab Upgrade GSM Voice Agent", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS or ["https://dashboard.labupgrade.ai"],
-    allow_methods=["GET", "POST"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_origins=CORS_ORIGINS or [
+        "https://dashboard.labupgrade.ai",
+        "https://test.labupgrade.ai",
+        "https://labupgrade.ai",
+    ],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
 )
 app.include_router(webrtc_router)
 
