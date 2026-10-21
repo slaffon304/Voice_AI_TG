@@ -592,33 +592,61 @@
   function getTurnstileToken() {
     if (!state.turnstileSiteKey) return Promise.resolve("");
     return loadTurnstile().then(function () {
-      return new Promise(function (resolve, reject) {
-        var host = document.createElement("div");
-        host.style.cssText =
-          "position:fixed;left:-9999px;width:1px;height:1px;overflow:hidden";
-        document.body.appendChild(host);
-        var wid = window.turnstile.render(host, {
-          sitekey: state.turnstileSiteKey,
-          size: "invisible",
-          callback: function (token) {
-            try {
-              window.turnstile.remove(wid);
-            } catch (e) {}
-            host.remove();
-            resolve(token || "");
-          },
-          "error-callback": function () {
-            try {
-              window.turnstile.remove(wid);
-            } catch (e) {}
-            host.remove();
-            reject(new Error("turnstile"));
-          },
-        });
+      return new Promise(function (resolve) {
+        var done = false;
+        function finish(token) {
+          if (done) return;
+          done = true;
+          resolve(token || "");
+        }
+        // Mobile often hangs on invisible Turnstile — never block mic/WebRTC.
+        var timer = setTimeout(function () {
+          console.warn("[LU GenUI] turnstile timeout — continue without token");
+          finish("");
+        }, 2500);
         try {
-          window.turnstile.execute(wid);
-        } catch (e) {}
+          var host = document.createElement("div");
+          host.style.cssText =
+            "position:fixed;left:-9999px;width:1px;height:1px;overflow:hidden";
+          document.body.appendChild(host);
+          var wid = window.turnstile.render(host, {
+            sitekey: state.turnstileSiteKey,
+            size: "invisible",
+            callback: function (token) {
+              clearTimeout(timer);
+              try {
+                window.turnstile.remove(wid);
+              } catch (e) {}
+              try {
+                host.remove();
+              } catch (e) {}
+              finish(token || "");
+            },
+            "error-callback": function () {
+              clearTimeout(timer);
+              try {
+                window.turnstile.remove(wid);
+              } catch (e) {}
+              try {
+                host.remove();
+              } catch (e) {}
+              console.warn("[LU GenUI] turnstile error — continue without token");
+              finish("");
+            },
+          });
+          try {
+            window.turnstile.execute(wid);
+          } catch (e) {
+            clearTimeout(timer);
+            finish("");
+          }
+        } catch (e) {
+          clearTimeout(timer);
+          finish("");
+        }
       });
+    }).catch(function () {
+      return "";
     });
   }
 
@@ -816,13 +844,23 @@
 
     var started = false;
     function tryStart() {
-      if (started || state.escaped) return;
+      if (started || state.escaped || state.connecting || state.connected) return;
       started = true;
       window.removeEventListener("pointerdown", tryStart, true);
+      window.removeEventListener("touchstart", tryStart, true);
+      window.removeEventListener("click", tryStart, true);
       window.removeEventListener("keydown", tryStart, true);
-      startSession();
+      startSession().catch(function () {
+        // Allow one more user gesture if first start failed early
+        started = false;
+        window.addEventListener("pointerdown", tryStart, true);
+        window.addEventListener("touchstart", tryStart, true);
+        window.addEventListener("click", tryStart, true);
+      });
     }
     window.addEventListener("pointerdown", tryStart, true);
+    window.addEventListener("touchstart", tryStart, true);
+    window.addEventListener("click", tryStart, true);
     window.addEventListener("keydown", tryStart, true);
 
     if (navigator.permissions && navigator.permissions.query) {
