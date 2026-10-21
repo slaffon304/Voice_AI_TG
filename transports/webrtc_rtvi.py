@@ -51,7 +51,6 @@ from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.frameworks.rtvi import (
-    RTVIConfig,
     RTVIFunctionCallReportLevel,
     RTVIObserver,
     RTVIObserverParams,
@@ -572,7 +571,7 @@ async def run_webrtc_session(
         ),
     )
 
-    rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
+    rtvi = RTVIProcessor()
     rtvi_observer = RTVIObserver(
         rtvi,
         params=RTVIObserverParams(
