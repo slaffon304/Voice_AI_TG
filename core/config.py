@@ -38,7 +38,7 @@ def _env_bool(name: str, default: bool) -> bool:
 # Ключи и сервисы
 # =============================================================================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").replace("/rest/v1", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 REDIS_URL = os.getenv("REDIS_URL")
 N8N_BASE_URL = os.getenv("N8N_BASE_URL")
