@@ -1409,8 +1409,8 @@ async def run_webrtc_session(
             clog.exception("[%s] post-processing failed: %s", call_id, fin_exc)
 
 
-@router.post("/api/offer")
-async def webrtc_offer(request: Request) -> dict | JSONResponse:
+@router.post("/api/offer", response_model=None)
+async def webrtc_offer(request: Request):
     """Signalling endpoint for SmallWebRTCTransport (SDP offer → answer)."""
     try:
         body = await request.json()
