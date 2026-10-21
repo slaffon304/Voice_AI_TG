@@ -18,6 +18,8 @@ Legacy GSM и /ws НЕ затрагиваются.
   Agentic Tool-State: set_agent_state → Thinking Orb (thinking-orbs)
 
 Защита /api/offer: origin, blacklist, Turnstile, суточные лимиты.
+  Soft deadline (warn → close).
+  Mid-session abuse: verify → block (как legacy).
 """
 
 from __future__ import annotations
@@ -37,8 +39,10 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pipecat.frames.frames import (
     CancelFrame,
+    Frame,
     LLMMessagesAppendFrame,
     LLMRunFrame,
+    TranscriptionFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -56,6 +60,7 @@ from pipecat.processors.frameworks.rtvi import (
 )
 from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, GeminiVADParams
 from pipecat.services.llm_service import FunctionCallParams
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
@@ -75,6 +80,7 @@ from core import (
     build_tools,
     build_transcript,
     call_n8n,
+    blocheaza,
     este_blocat,
     get_client_data,
     get_persona,
@@ -101,6 +107,40 @@ from core import (
 router = APIRouter(tags=["webrtc-rtvi"])
 
 DWELL_MIN_SECONDS = 3.0
+# Soft close: предупреждение за столько секунд до конца budget
+SOFT_DEADLINE_WARN_BEFORE = 30
+# Повторов «списка вопросов» до требования верификации / блока
+ABUSE_REPEAT_THRESHOLD = 3
+
+
+class WebAbuseProbe(FrameProcessor):
+    """Детект зачитывания списка / не-разговора (как AbuseProbe в main.py)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.replici: list[str] = []
+        self.repetari = 0
+
+    @staticmethod
+    def _cheie(text: str) -> str:
+        cuvinte = re.findall(r"\w+", text.lower())
+        return " ".join(sorted(c for c in cuvinte if len(c) > 3))
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame):
+            text = (getattr(frame, "text", "") or "").strip()
+            if len(text) > 40:
+                cheie = self._cheie(text)
+                for veche in self.replici:
+                    comune = set(cheie.split()) & set(veche.split())
+                    if comune and len(comune) >= len(set(cheie.split())) * 0.5:
+                        self.repetari += 1
+                        break
+                self.replici.append(cheie)
+        await self.push_frame(frame, direction)
+
+
 
 ROI_DEFAULTS = {
     "cost_per_missed_lead": 50.0,
@@ -330,6 +370,32 @@ AGENT_STATE_TOOL = {
 }
 
 
+
+FLAG_ABUSE_TOOL = {
+    "name": "flag_session_abuse",
+    "description": (
+        "Call when the visitor is clearly abusing the session: reading a script of "
+        "competitor questions, spamming, probing internals, or acting in bad faith. "
+        "Triggers on-screen identity verification (not a 'demo ended' message)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reason": {
+                "type": "string",
+                "description": "Short internal reason (repetitions, competitor probing, spam)",
+            },
+            "severity": {
+                "type": "string",
+                "enum": ["require_verify", "block"],
+                "description": "require_verify first; block only if already verified and abuse continues",
+            },
+        },
+        "required": ["reason"],
+    },
+}
+
+
 def _build_tools_with_ui(client_data: dict, readable_hours: str) -> list[dict]:
     base = build_tools(client_data, readable_hours, web=True)
     base.append(UI_NAVIGATION_TOOL)
@@ -338,6 +404,7 @@ def _build_tools_with_ui(client_data: dict, readable_hours: str) -> list[dict]:
     base.append(SENTIMENT_MORPH_TOOL)
     base.append(DOM_ACTION_TOOL)
     base.append(AGENT_STATE_TOOL)
+    base.append(FLAG_ABUSE_TOOL)
     return [{"function_declarations": base}]
 
 
@@ -398,6 +465,7 @@ async def run_webrtc_session(
     visitor_id: str,
     project_id: str = "",
     *,
+    visitor_ip: str = "",
     browser_lang: str = "",
     landing_url: str = "",
     referrer: str = "",
@@ -433,11 +501,17 @@ async def run_webrtc_session(
     latest_snapshot: Any = None  # Фаза 2.5 — последний ui-snapshot
     sentiment_fired: set[str] = set()  # анти-спам для morph
     deadline_handle = None
+    warn_handle = None
+    abuse_watch_handle = None
+    abuse_stage = "none"  # none | verify_required | verified | blocked
+    phone_verified_session = False
+    abuse_probe = WebAbuseProbe()
 
     # Память / карточка по visitor_id (RPC → person_memory через end_client)
     contact, visitor_memory, time_ctx = await get_web_visitor_context(client_id, visitor_id)
     if contact.get("phone") and telefon_valid(contact["phone"]):
         learned_phone = "".join(filter(str.isdigit, str(contact["phone"])))
+        phone_verified_session = True
     visitor_name = (contact.get("name") or "").strip()
     if contact.get("event_id"):
         zapis_id = str(contact["event_id"])
@@ -502,6 +576,7 @@ async def run_webrtc_session(
                 "morph_ui_for_sentiment": RTVIFunctionCallReportLevel.FULL,
                 "dom_action": RTVIFunctionCallReportLevel.FULL,
                 "set_agent_state": RTVIFunctionCallReportLevel.FULL,
+                "flag_session_abuse": RTVIFunctionCallReportLevel.FULL,
                 "Booking_tool": RTVIFunctionCallReportLevel.ARGUMENTS,
             }
         ),
@@ -862,7 +937,71 @@ async def run_webrtc_session(
         await params.result_callback({"status": "ending", "reason": reason})
 
     # Register tools
+
+    async def _require_verify(reason: str) -> None:
+        nonlocal abuse_stage
+        if abuse_stage in ("verify_required", "blocked"):
+            return
+        abuse_stage = "verify_required"
+        clog.warning("[%s] abuse verify required: %s", call_id, reason)
+        if task is not None:
+            await task.queue_frames([
+                RTVIUICommandFrame(
+                    command="require_phone_verification",
+                    payload={
+                        "reason": "abuse_protection",
+                        "message": (
+                            "Open voice access is limited because of competitors "
+                            "and bad-faith visitors. Confirm your phone on screen to continue."
+                        ),
+                    },
+                )
+            ])
+            context.add_message({
+                "role": "user",
+                "content": (
+                    "SYSTEM: Identity verification required due to suspicious activity. "
+                    "Tell the visitor honestly (no 'demo' wording) that we limit open access "
+                    "because of competitors/abuse, and ask them to confirm the phone on screen. "
+                    "Do not continue deep product detail until SYSTEM UI EVENT phone_verified."
+                ),
+            })
+            await task.queue_frames([LLMRunFrame()])
+
+    async def _block_abuse(reason: str) -> None:
+        nonlocal abuse_stage
+        abuse_stage = "blocked"
+        clog.warning("[%s] abuse block: %s", call_id, reason)
+        await blocheaza(client_id, visitor_id, visitor_ip, reason)
+        if task is not None:
+            await task.queue_frames([
+                RTVIUICommandFrame(
+                    command="session_blocked",
+                    payload={"reason": reason},
+                ),
+                CancelFrame(),
+            ])
+
+    async def process_flag_session_abuse(params: FunctionCallParams):
+        reason = str(params.arguments.get("reason") or "flagged").strip()[:120]
+        severity = str(params.arguments.get("severity") or "require_verify").strip()
+        if severity == "block" and (phone_verified_session or abuse_stage == "verified"):
+            await params.result_callback({"status": "blocked", "reason": reason})
+            await _block_abuse(f"post_verify:{reason}")
+            return
+        if abuse_stage == "none" or not phone_verified_session:
+            await _require_verify(reason)
+            await params.result_callback({
+                "status": "verify_required",
+                "instruction": "Ask visitor to confirm phone on screen. No demo wording.",
+            })
+            return
+        # Already verified once in this session and model asks block / re-flag
+        await params.result_callback({"status": "blocked", "reason": reason})
+        await _block_abuse(f"repeat_after_verify:{reason}")
+
     llm.register_function("control_website_ui", process_control_website_ui)
+    llm.register_function("flag_session_abuse", process_flag_session_abuse)
     llm.register_function("update_roi_calculator", process_update_roi)
     llm.register_function("request_screen_audit", process_request_screen_audit)
     llm.register_function("morph_ui_for_sentiment", process_morph_ui_for_sentiment)
@@ -877,7 +1016,7 @@ async def run_webrtc_session(
 
     @rtvi.event_handler("on_client_message")
     async def on_client_message(rtvi_proc, msg):
-        nonlocal learned_phone, audit_pending_focus
+        nonlocal learned_phone, audit_pending_focus, phone_verified_session, abuse_stage
         msg_type = getattr(msg, "type", None) or (msg.get("type") if isinstance(msg, dict) else None)
         if msg_type != "ui_user_interaction":
             return
@@ -908,12 +1047,16 @@ async def run_webrtc_session(
             phone_raw = str(data.get("phone") or data.get("value") or "").strip()
             if phone_raw and telefon_valid(phone_raw):
                 learned_phone = "".join(filter(str.isdigit, phone_raw))
-                clog.info("[%s] phone verified via UI", call_id)
+                phone_verified_session = True
+                if abuse_stage == "verify_required":
+                    abuse_stage = "verified"
+                clog.info("[%s] phone verified via UI stage=%s", call_id, abuse_stage)
                 context.add_message({
                     "role": "user",
                     "content": (
-                        f"SYSTEM UI EVENT: visitor verified phone on screen. "
-                        f"Use this number for booking/lead; do not ask them to dictate it."
+                        "SYSTEM UI EVENT: visitor verified phone on screen. "
+                        "Use this number for booking/lead; do not ask them to dictate it. "
+                        "You may continue the conversation."
                     ),
                 })
                 if task is not None:
@@ -1051,6 +1194,7 @@ async def run_webrtc_session(
         rtvi,
         user_catcher,
         context_aggregator.user(),
+        abuse_probe,
         llm,
         ai_catcher,
         transport.output(),
@@ -1088,18 +1232,80 @@ async def run_webrtc_session(
         ])
 
 
+    async def _session_soft_warn() -> None:
+        """За SOFT_DEADLINE_WARN_BEFORE до конца — карточка + короткая реплика."""
+        try:
+            total = max(15, int(max_session_seconds))
+            warn_at = max(5, total - SOFT_DEADLINE_WARN_BEFORE)
+            await asyncio.sleep(warn_at)
+            if task is None or abuse_stage == "blocked":
+                return
+            remaining = max(5, total - warn_at)
+            clog.info("[%s] soft deadline warn, ~%ss left", call_id, remaining)
+            await task.queue_frames([
+                RTVIUICommandFrame(
+                    command="session_ending_soon",
+                    payload={
+                        "remaining_seconds": remaining,
+                        "session_index": session_index,
+                    },
+                ),
+                LLMMessagesAppendFrame(messages=[{
+                    "role": "user",
+                    "content": (
+                        f"SYSTEM: About {remaining} seconds left in this voice session. "
+                        "In one short sentence, steer to a concrete next step "
+                        "(verified contact or booking on screen). No 'demo ended' wording."
+                    ),
+                }]),
+                LLMRunFrame(),
+            ])
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            clog.warning("[%s] soft warn error: %s", call_id, exc)
+
     async def _session_deadline() -> None:
         try:
             await asyncio.sleep(max(15, int(max_session_seconds)))
             clog.info("[%s] session time budget %ss reached — ending", call_id, max_session_seconds)
             if task is not None:
-                await task.queue_frames([CancelFrame()])
+                await task.queue_frames([
+                    RTVIUICommandFrame(
+                        command="session_ended",
+                        payload={"reason": "time_budget", "session_index": session_index},
+                    ),
+                    CancelFrame(),
+                ])
         except asyncio.CancelledError:
             return
         except Exception as exc:
             clog.warning("[%s] session deadline error: %s", call_id, exc)
 
+    async def _abuse_watchdog() -> None:
+        """Как abuse_watchdog в main.py: повторы → verify → block после verify."""
+        try:
+            while True:
+                await asyncio.sleep(5.0)
+                if abuse_probe.repetari < ABUSE_REPEAT_THRESHOLD:
+                    continue
+                if abuse_stage == "blocked":
+                    return
+                if abuse_stage in ("none",) and not phone_verified_session:
+                    await _require_verify(f"repetari:{abuse_probe.repetari}")
+                    abuse_probe.repetari = 0  # даём шанс после UI
+                    continue
+                if abuse_stage in ("verified", "verify_required") or phone_verified_session:
+                    await _block_abuse(f"repetari_after_gate:{abuse_probe.repetari}")
+                    return
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            clog.warning("[%s] abuse watchdog error: %s", call_id, exc)
+
+    warn_handle = asyncio.create_task(_session_soft_warn())
     deadline_handle = asyncio.create_task(_session_deadline())
+    abuse_watch_handle = asyncio.create_task(_abuse_watchdog())
 
     runner = PipelineRunner()
 
@@ -1113,6 +1319,10 @@ async def run_webrtc_session(
 
         with contextlib.suppress(Exception):
             deadline_handle.cancel()
+        with contextlib.suppress(Exception):
+            warn_handle.cancel()
+        with contextlib.suppress(Exception):
+            abuse_watch_handle.cancel()
         with contextlib.suppress(Exception):
             mixer.close()
 
@@ -1270,6 +1480,7 @@ async def webrtc_offer(request: Request) -> dict | JSONResponse:
             client_id,
             vid,
             project_id,
+            visitor_ip=ip,
             browser_lang=browser_lang,
             landing_url=landing_url,
             referrer=referrer,
