@@ -615,7 +615,11 @@ async def run_webrtc_session(
                 RTVIUICommandFrame(
                     command="navigate_and_render",
                     payload=payload,
-                )
+                ),
+                RTVIUICommandFrame(
+                    command="set_agent_state",
+                    payload={"state": "breathing"},
+                ),
             ])
         await params.result_callback({
             "status": "ui_updated",
@@ -643,6 +647,10 @@ async def run_webrtc_session(
                     payload={"section": "roi_calculator", "highlight": None, "prefill": result},
                 ),
                 RTVIUICommandFrame(command="update_roi", payload=result),
+                RTVIUICommandFrame(
+                    command="set_agent_state",
+                    payload={"state": "breathing"},
+                ),
             ])
         await params.result_callback({
             "status": "roi_updated",
@@ -763,7 +771,11 @@ async def run_webrtc_session(
 
         if task is not None:
             await task.queue_frames([
-                RTVIUICommandFrame(command=action, payload=payload)
+                RTVIUICommandFrame(command=action, payload=payload),
+                RTVIUICommandFrame(
+                    command="set_agent_state",
+                    payload={"state": "breathing"},
+                ),
             ])
 
         await params.result_callback({
