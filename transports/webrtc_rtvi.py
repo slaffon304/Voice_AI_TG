@@ -36,7 +36,8 @@ import uuid
 from typing import Any, Optional
 
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from pathlib import Path
 from pipecat.frames.frames import (
     CancelFrame,
     Frame,
@@ -105,6 +106,13 @@ from core import (
 )
 
 router = APIRouter(tags=["webrtc-rtvi"])
+
+_STATIC = Path(__file__).resolve().parent.parent / "static"
+
+@router.get("/widget-genui.js")
+async def serve_widget_genui():
+    return FileResponse(_STATIC / "widget-genui.js", media_type="application/javascript")
+
 
 DWELL_MIN_SECONDS = 3.0
 # Soft close: предупреждение за столько секунд до конца budget
@@ -1403,7 +1411,7 @@ async def webrtc_offer(request: Request) -> dict | JSONResponse:
     key = str(body.get("key") or body.get("widget_key") or "").strip()
     visitor_id = str(body.get("visitor_id") or "").strip()
     project_id = str(body.get("project_id") or "").strip()
-    turnstile_token = str(body.get("turnstile_token") or body.get("cf-turnstile-response") or "").strip()
+    turnstile_token = str(body.get("turnstile_token") or body.get("t") or body.get("cf-turnstile-response") or "").strip()
     browser_lang = str(body.get("lang") or body.get("language") or body.get("locale") or "").strip()
     landing_url = str(body.get("landing_url") or body.get("url") or body.get("page_url") or "").strip()[:500]
     referrer = str(body.get("referrer") or body.get("ref") or "").strip()[:500]
