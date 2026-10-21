@@ -1409,13 +1409,31 @@ async def run_webrtc_session(
             clog.exception("[%s] post-processing failed: %s", call_id, fin_exc)
 
 
+def _cors_headers(request: Request) -> dict[str, str]:
+    """Minimal CORS for browser widget on client sites."""
+    origin = (request.headers.get("origin") or "").strip()
+    # Reflect allowed-looking https origins; tighten via env on the app middleware.
+    allow = origin if origin.startswith("https://") else "*"
+    return {
+        "Access-Control-Allow-Origin": allow,
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type",
+        "Access-Control-Max-Age": "86400",
+        "Vary": "Origin",
+    }
+
+
+@router.options("/api/offer")
+async def webrtc_offer_options(request: Request):
+    return JSONResponse({}, status_code=204, headers=_cors_headers(request))
+
 @router.post("/api/offer", response_model=None)
 async def webrtc_offer(request: Request):
     """Signalling endpoint for SmallWebRTCTransport (SDP offer → answer)."""
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400)
+        return JSONResponse({"error": "invalid json"}, status_code=400, headers=_cors_headers(request))
 
     offer_sdp = body.get("sdp")
     offer_type = body.get("type", "offer")
@@ -1428,7 +1446,7 @@ async def webrtc_offer(request: Request):
     referrer = str(body.get("referrer") or body.get("ref") or "").strip()[:500]
 
     if not offer_sdp or not key:
-        return JSONResponse({"error": "sdp and key required"}, status_code=400)
+        return JSONResponse({"error": "sdp and key required"}, status_code=400, headers=_cors_headers(request))
 
     forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
     ip = forwarded or (request.client.host if request.client else "")
@@ -1447,10 +1465,10 @@ async def webrtc_offer(request: Request):
         )
     except Exception as exc:
         log.error("webrtc channel lookup failed: %s", exc)
-        return JSONResponse({"error": "channel lookup failed"}, status_code=500)
+        return JSONResponse({"error": "channel lookup failed"}, status_code=500, headers=_cors_headers(request))
 
     if not channel_rows or not channel_rows[0].get("client_id"):
-        return JSONResponse({"error": "unknown widget key"}, status_code=403)
+        return JSONResponse({"error": "unknown widget key"}, status_code=403, headers=_cors_headers(request))
 
     row = channel_rows[0]
     client_id = str(row["client_id"])
@@ -1458,19 +1476,19 @@ async def webrtc_offer(request: Request):
         project_id = str(row.get("project_id") or "")
 
     if row.get("voice_enabled") is False:
-        return JSONResponse({"error": "voice disabled"}, status_code=403)
+        return JSONResponse({"error": "voice disabled"}, status_code=403, headers=_cors_headers(request))
 
     if not origin_permis(origin, row.get("allowed_origins")):
         log.warning("webrtc origin refused: %s key=%s", origin, key[:12])
-        return JSONResponse({"error": "origin not allowed"}, status_code=403)
+        return JSONResponse({"error": "origin not allowed"}, status_code=403, headers=_cors_headers(request))
 
     if await este_blocat(visitor_id, ip):
         log.warning("webrtc blocked visitor=%s ip=%s", visitor_id[:12], ip)
-        return JSONResponse({"error": "blocked"}, status_code=403)
+        return JSONResponse({"error": "blocked"}, status_code=403, headers=_cors_headers(request))
 
     if not await propusk_valabil(turnstile_token, ip, str(row.get("turnstile_secret_key") or "")):
         log.warning("webrtc turnstile failed ip=%s", ip)
-        return JSONResponse({"error": "verification failed"}, status_code=403)
+        return JSONResponse({"error": "verification failed"}, status_code=403, headers=_cors_headers(request))
 
     limit_err, session_index, max_session_seconds = await web_session_budget(visitor_id, ip)
     if limit_err:
@@ -1478,6 +1496,7 @@ async def webrtc_offer(request: Request):
         return JSONResponse(
             {"error": "daily_limit", "detail": limit_err, "session_index": session_index},
             status_code=429,
+            headers=_cors_headers(request),
         )
 
     connection = SmallWebRTCConnection()
@@ -1509,9 +1528,12 @@ async def webrtc_offer(request: Request):
     )
 
     answer = connection.get_answer()
-    return {
-        "sdp": answer["sdp"],
-        "type": answer["type"],
-        "session_index": session_index,
-        "max_session_seconds": max_session_seconds,
-    }
+    return JSONResponse(
+        {
+            "sdp": answer["sdp"],
+            "type": answer["type"],
+            "session_index": session_index,
+            "max_session_seconds": max_session_seconds,
+        },
+        headers=_cors_headers(request),
+    )
