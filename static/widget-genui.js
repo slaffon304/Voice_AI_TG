@@ -253,7 +253,7 @@
       contact: ["contact", "contacts"],
       booking_widget: ["booking_widget", "booking", "contactForm", "contact"],
       hero: ["hero", "top"],
-      roi_calculator: ["roi_calculator", "pricing"],
+      roi_calculator: ["roi_calculator"],
     };
     var keys = aliases[key] || [key];
     var i, k, el;
@@ -273,117 +273,162 @@
     return null;
   }
 
+  function injectFocusStyles() {
+    if ($("lu-focus-css")) return;
+    var s = document.createElement("style");
+    s.id = "lu-focus-css";
+    s.textContent = [
+      "html.lu-voice-live section.section-pad,",
+      "html.lu-voice-live #partners,",
+      "html.lu-voice-live #news,",
+      "html.lu-voice-live #compliance {",
+      "  transition: opacity .35s ease, filter .35s ease;",
+      "  opacity: .28;",
+      "  filter: grayscale(.35);",
+      "  pointer-events: none;",
+      "}",
+      "html.lu-voice-live section.lu-active,",
+      "html.lu-voice-live .lu-active {",
+      "  opacity: 1 !important;",
+      "  filter: none !important;",
+      "  pointer-events: auto !important;",
+      "  outline: 2px solid rgba(99,102,241,.55);",
+      "  outline-offset: 4px;",
+      "  border-radius: 12px;",
+      "  position: relative;",
+      "  z-index: 2;",
+      "}",
+      "html.lu-voice-live #lu-roi-inline {",
+      "  position: fixed; left: 50%; bottom: 88px; transform: translateX(-50%);",
+      "  z-index: 99996; width: min(420px, calc(100vw - 24px));",
+      "  background: rgba(15,23,42,.92); color: #f8fafc;",
+      "  border-radius: 14px; padding: 12px 14px;",
+      "  box-shadow: 0 8px 28px rgba(0,0,0,.35);",
+      "  border: 1px solid rgba(255,255,255,.1);",
+      "  font: 13px/1.4 system-ui,sans-serif;",
+      "}",
+      "html.lu-voice-live #lu-section-stage { display: none !important; }",
+    ].join("\\n");
+    document.head.appendChild(s);
+  }
+
+  function clearInPageFocus() {
+    document.querySelectorAll(".lu-active").forEach(function (el) {
+      el.classList.remove("lu-active");
+    });
+    var roi = $("lu-roi-inline");
+    if (roi) roi.style.display = "none";
+  }
+
   function focusSection(section, highlight) {
     section = (section || "").trim();
     if (!section) {
       console.warn("[LU] navigate without section");
       return null;
     }
+    injectFocusStyles();
+    document.documentElement.classList.add("lu-voice-live");
     if (!Object.keys(state.sectionMap || {}).length) scanPageSections();
-    var el = findSection(section);
-    document.documentElement.setAttribute("data-lu-active-section", section);
 
-    var target = null;
+    var key = section.toLowerCase();
+    document.documentElement.setAttribute("data-lu-active-section", key);
+
+    /* ROI: inline strip near orb — not a framed dialog */
+    if (key === "roi_calculator") {
+      clearInPageFocus();
+      showRoiInline(state.lastRoi || {});
+      console.info("[LU] in-page ROI", state.lastRoi || {});
+      try {
+        window.dispatchEvent(
+          new CustomEvent("lu:navigate", { detail: { section: key, mode: "inline_roi" } })
+        );
+      } catch (e) {}
+      return null;
+    }
+
+    var el = findSection(section);
+    clearInPageFocus();
+    var roi = $("lu-roi-inline");
+    if (roi) roi.style.display = "none";
+
+    if (el) {
+      el.classList.add("lu-active");
+      /* Prefer focusing the useful child grid if present */
+      var useful = pickUsefulContent(key, el);
+      if (useful && useful !== el) useful.classList.add("lu-active");
+      flashHighlight(el, 1600);
+      console.info("[LU] in-page focus", key, el.id || el.className);
+    } else {
+      console.warn("[LU] section missing in DOM", key, Object.keys(state.sectionMap || {}));
+    }
+
     if (highlight) {
-      target =
+      var target =
         findTarget(null, highlight) ||
         (el &&
           (el.querySelector("#" + highlight) ||
             el.querySelector('[data-id="' + highlight + '"]')));
+      if (target) {
+        target.classList.add("lu-active");
+        flashHighlight(target, 2000);
+      }
     }
-
-    showSectionStage(section, el, target || el);
 
     try {
       window.dispatchEvent(
         new CustomEvent("lu:navigate", {
-          detail: { section: section, highlight: highlight || null, found: !!el },
+          detail: { section: key, highlight: highlight || null, found: !!el, mode: "in_page" },
         })
       );
     } catch (e) {}
     return el;
   }
 
-  /** Rebuild the working view around the matched page block (series). No page scroll. */
-  function showSectionStage(section, sourceEl, highlightEl) {
-    var stage = $("lu-section-stage");
-    if (!stage) {
-      stage = document.createElement("div");
-      stage.id = "lu-section-stage";
-      stage.style.cssText =
-        "position:fixed;inset:0;z-index:99990;display:none;flex-direction:column;" +
-        "background:rgba(6,8,12,.94);padding:max(12px,env(safe-area-inset-top)) 12px 100px;" +
-        "color:#f1f5f9;font:15px/1.45 system-ui,sans-serif";
-      var bar = document.createElement("div");
-      bar.style.cssText =
-        "display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px";
-      var title = document.createElement("div");
-      title.id = "lu-section-stage-title";
-      title.style.cssText = "font:700 14px/1.2 system-ui";
-      var close = document.createElement("button");
-      close.type = "button";
-      close.textContent = "✕";
-      close.style.cssText =
-        "border:0;background:rgba(255,255,255,.1);color:#fff;width:36px;height:36px;" +
-        "border-radius:10px;cursor:pointer;font-size:16px";
-      close.onclick = function () {
-        stage.style.display = "none";
-        document.documentElement.classList.remove("lu-stage-open");
-      };
-      bar.appendChild(title);
-      bar.appendChild(close);
-      var body = document.createElement("div");
-      body.id = "lu-section-stage-body";
-      body.style.cssText =
-        "flex:1;min-height:0;overflow:auto;border-radius:16px;background:#fff;color:#0f172a;" +
-        "padding:16px;box-shadow:0 8px 32px rgba(0,0,0,.35)";
-      stage.appendChild(bar);
-      stage.appendChild(body);
-      document.body.appendChild(stage);
+  function pickUsefulContent(key, sourceEl) {
+    if (!sourceEl) return null;
+    if (key === "services") {
+      return sourceEl.querySelector(".service-grid") || sourceEl;
     }
-
-    var titleEl = $("lu-section-stage-title");
-    var body = $("lu-section-stage-body");
-    if (titleEl) titleEl.textContent = String(section).replace(/_/g, " ");
-    if (body) body.innerHTML = "";
-
-    if (sourceEl) {
-      var clone = sourceEl.cloneNode(true);
-      clone.id = (clone.id || section) + "-lu-stage";
-      clone.querySelectorAll("script").forEach(function (s) {
-        s.remove();
-      });
-      clone.style.display = "block";
-      clone.style.visibility = "visible";
-      clone.style.opacity = "1";
-      clone.style.position = "static";
-      clone.style.maxWidth = "960px";
-      clone.style.margin = "0 auto";
-      if (body) body.appendChild(clone);
-      if (highlightEl && body) {
-        try {
-          flashHighlight(clone, 2500);
-        } catch (e) {}
-      }
-      console.info("[LU] stage show", section, "from", sourceEl.id || sourceEl.className);
-    } else {
-      if (body) {
-        var safe = String(section).replace(/</g, "");
-        body.innerHTML =
-          "<p style='margin:0 0 8px'><b>" +
-          safe +
-          "</b></p>" +
-          "<p style='opacity:.75;margin:0'>Block not found in page DOM. Add id=\"" +
-          safe +
-          "\" or data-lu-section=\"" +
-          safe +
-          "\" on the client site.</p>";
-      }
-      console.warn("[LU] stage miss", section, "map", Object.keys(state.sectionMap || {}));
+    if (key === "pricing") {
+      return (
+        sourceEl.querySelector(".pricing-track") ||
+        sourceEl.querySelector(".pricing-carousel") ||
+        sourceEl
+      );
     }
+    if (key === "booking_widget" || key === "contacts" || key === "contact") {
+      return sourceEl.querySelector("form") || sourceEl.querySelector("#contactForm") || sourceEl;
+    }
+    return sourceEl;
+  }
 
-    stage.style.display = "flex";
-    document.documentElement.classList.add("lu-stage-open");
+  function showRoiInline(fig) {
+    fig = fig || {};
+    var box = $("lu-roi-inline");
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "lu-roi-inline";
+      document.body.appendChild(box);
+    }
+    var net = fig.net_monthly_savings;
+    var recovered = fig.recovered_leads_per_month;
+    var missed = fig.missed_calls_per_month;
+    var capture = fig.capture_rate;
+    var lines = [];
+    if (missed != null) lines.push("Missed/mo: <b>" + missed + "</b>");
+    if (capture != null) lines.push("Capture: <b>" + Math.round(Number(capture) * 100) + "%</b>");
+    if (recovered != null) lines.push("Recovered: <b>" + recovered + "</b>");
+    if (net != null) lines.push("Net/mo: <b style='color:#34d399'>" + net + "</b>");
+    box.innerHTML =
+      "<div style='font-weight:700;margin-bottom:6px;opacity:.85'>ROI</div>" +
+      (lines.length
+        ? "<div style='display:flex;flex-wrap:wrap;gap:8px 14px'>" +
+          lines.map(function (l) {
+            return "<span>" + l + "</span>";
+          }).join("") +
+          "</div>"
+        : "<span style='opacity:.7'>…</span>");
+    box.style.display = "block";
   }
 
   function ensureChrome() {
@@ -391,7 +436,13 @@
       var btn = document.createElement("button");
       btn.id = "lu-escape-voice";
       btn.type = "button";
-      btn.textContent = "Не хочу говорить";
+      var _loc = (navigator.language || "en").toLowerCase();
+      btn.textContent =
+        _loc.indexOf("ru") === 0
+          ? "Не хочу говорить"
+          : _loc.indexOf("ro") === 0
+            ? "Nu vreau să vorbesc"
+            : "I don't want to talk";
       btn.setAttribute("aria-label", "Stop voice assistant");
       btn.style.cssText =
         "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:99999;" +
@@ -682,6 +733,7 @@
 
   function handleUpdateRoi(payload) {
     payload = payload || {};
+    state.lastRoi = payload;
     try {
       window.dispatchEvent(new CustomEvent("lu:roi", { detail: payload }));
     } catch (e) {}
@@ -1130,6 +1182,12 @@
     console.info("[LU GenUI] stop", reason || "");
     state.connected = false;
     state.connecting = false;
+    if (reason === "escape" || reason === "pagehide") {
+      document.documentElement.classList.remove("lu-voice-live");
+      clearInPageFocus();
+      var st = $("lu-section-stage");
+      if (st) st.style.display = "none";
+    }
     setAgentState("idle");
     try {
       if (state.dc) state.dc.close();
@@ -1312,9 +1370,18 @@
 
   async function boot() {
     ensureChrome();
+    injectFocusStyles();
     scanPageSections();
-    setTimeout(scanPageSections, 1500);
-    setTimeout(scanPageSections, 4000);
+    /* Immediate in-page change — before voice (user wants effect on load) */
+    document.documentElement.classList.add("lu-voice-live");
+    focusSection("services");
+
+    setTimeout(scanPageSections, 1200);
+    setTimeout(function () {
+      scanPageSections();
+      if (!document.querySelector(".lu-active")) focusSection("services");
+    }, 2500);
+
     var cfg = await loadConfig();
     console.info("[LU GenUI] boot", {
       key: widgetKey.slice(0, 8) + "…",
@@ -1326,7 +1393,6 @@
     if (!state.voiceEnabled) return;
 
     if (state.turnstileSiteKey) {
-      // Only load script early; do not render widgets until user gesture
       loadTurnstile().catch(function () {});
     }
 
@@ -1336,35 +1402,25 @@
     function tryStart() {
       if (started || state.escaped || state.connecting || state.connected) return;
       started = true;
-      window.removeEventListener("pointerdown", tryStart, true);
-      window.removeEventListener("touchstart", tryStart, true);
-      window.removeEventListener("click", tryStart, true);
-      window.removeEventListener("keydown", tryStart, true);
-      startSession().catch(function () {
-        // Allow one more user gesture if first start failed early
+      startSession().catch(function (err) {
+        console.warn("[LU] startSession", err);
         started = false;
-        window.addEventListener("pointerdown", tryStart, true);
-        window.addEventListener("touchstart", tryStart, true);
-        window.addEventListener("click", tryStart, true);
       });
     }
-    window.addEventListener("pointerdown", tryStart, true);
-    window.addEventListener("touchstart", tryStart, true);
-    window.addEventListener("click", tryStart, true);
-    window.addEventListener("keydown", tryStart, true);
 
-    if (navigator.permissions && navigator.permissions.query) {
-      navigator.permissions
-        .query({ name: "microphone" })
-        .then(function (status) {
-          if (status.state === "granted") {
-            setTimeout(function () {
-              if (!started && !state.escaped) tryStart();
-            }, 600);
-          }
-        })
-        .catch(function () {});
-    }
+    /* Start as soon as possible; mic may still need a gesture on some browsers */
+    tryStart();
+    setTimeout(function () {
+      if (!state.connected && !state.connecting && !state.escaped) tryStart();
+    }, 800);
+
+    window.addEventListener(
+      "pointerdown",
+      function once() {
+        if (!state.connected && !state.connecting && !state.escaped) tryStart();
+      },
+      true
+    );
 
     window.addEventListener("pagehide", function () {
       stopSession("pagehide");
