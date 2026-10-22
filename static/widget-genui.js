@@ -102,6 +102,121 @@
     );
   }
 
+  /** Dynamic Viewport: one stage in focus — morph content, do not scroll the page. */
+  function ensureGenuiStage() {
+    var stage = $("lu-genui-stage");
+    if (stage) return stage;
+    stage = document.createElement("div");
+    stage.id = "lu-genui-stage";
+    stage.setAttribute("data-lu-canvas", "1");
+    stage.style.cssText =
+      "position:fixed;inset:0;z-index:99990;display:none;flex-direction:column;" +
+      "background:rgba(8,10,18,.92);backdrop-filter:blur(10px);" +
+      "padding:max(16px, env(safe-area-inset-top)) 16px 100px;overflow:auto;" +
+      "color:#f8fafc;font:16px/1.45 system-ui,sans-serif";
+    var bar = document.createElement("div");
+    bar.style.cssText =
+      "display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:12px";
+    var title = document.createElement("div");
+    title.id = "lu-genui-stage-title";
+    title.style.cssText = "font:700 14px/1.2 system-ui;letter-spacing:.02em;opacity:.9";
+    title.textContent = "Lab Upgrade";
+    var close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "✕";
+    close.setAttribute("aria-label", "Close canvas");
+    close.style.cssText =
+      "border:0;background:rgba(255,255,255,.12);color:#fff;width:36px;height:36px;" +
+      "border-radius:10px;cursor:pointer;font-size:16px";
+    close.onclick = function () {
+      stage.style.display = "none";
+      document.documentElement.classList.remove("lu-canvas-open");
+    };
+    bar.appendChild(title);
+    bar.appendChild(close);
+    var body = document.createElement("div");
+    body.id = "lu-genui-stage-body";
+    body.style.cssText =
+      "flex:1;min-height:0;overflow:auto;border-radius:16px;" +
+      "background:rgba(255,255,255,.04);padding:16px;border:1px solid rgba(255,255,255,.08)";
+    stage.appendChild(bar);
+    stage.appendChild(body);
+    document.body.appendChild(stage);
+    return stage;
+  }
+
+  function morphCanvasToSection(section, highlight, prefill) {
+    var stage = ensureGenuiStage();
+    var body = $("lu-genui-stage-body");
+    var title = $("lu-genui-stage-title");
+    if (title) title.textContent = String(section || "view").replace(/_/g, " ");
+    if (body) body.innerHTML = "";
+
+    var src = findSection(section);
+    if (src) {
+      var clone = src.cloneNode(true);
+      clone.id = (clone.id || section || "block") + "-lu-clone";
+      clone.style.display = "block";
+      clone.style.visibility = "visible";
+      clone.style.opacity = "1";
+      clone.style.position = "static";
+      clone.style.maxWidth = "960px";
+      clone.style.margin = "0 auto";
+      if (body) body.appendChild(clone);
+    } else if (body) {
+      body.innerHTML =
+        "<p style='opacity:.85'>Se încarcă: <b>" +
+        String(section || "").replace(/</g, "") +
+        "</b></p>" +
+        "<p style='opacity:.55;font-size:13px'>Adaugă pe pagină id sau data-section=\"" +
+        String(section || "") +
+        "\" pentru conținut real în canvas.</p>";
+    }
+
+    stage.style.display = "flex";
+    document.documentElement.classList.add("lu-canvas-open");
+    document.documentElement.setAttribute("data-lu-active-section", section || "");
+
+    if (highlight && body) {
+      var target =
+        body.querySelector("#" + CSS.escape(highlight)) ||
+        body.querySelector('[data-id="' + highlight + '"]') ||
+        body.querySelector('[data-lu-id="' + highlight + '"]');
+      if (target) flashHighlight(target, 2800);
+    }
+
+    if (prefill && typeof prefill === "object" && body) {
+      Object.keys(prefill).forEach(function (key) {
+        var val = prefill[key];
+        if (val == null) return;
+        var field =
+          body.querySelector('[name="' + key + '"]') ||
+          body.querySelector("#" + key) ||
+          body.querySelector('[data-field="' + key + '"]');
+        if (field && "value" in field) {
+          field.value = String(val);
+          try {
+            field.dispatchEvent(new Event("input", { bubbles: true }));
+            field.dispatchEvent(new Event("change", { bubbles: true }));
+          } catch (e) {}
+        }
+      });
+    }
+
+    try {
+      window.dispatchEvent(
+        new CustomEvent("lu:navigate", {
+          detail: {
+            section: section,
+            highlight: highlight,
+            prefill: prefill,
+            mode: "canvas_morph",
+          },
+        })
+      );
+    } catch (e) {}
+  }
+
   function findTarget(ref, targetId) {
     if (targetId) {
       var byId = $(targetId) || qs('[data-id="' + targetId + '"]');
@@ -247,48 +362,14 @@
     var section = payload.section;
     var highlight = payload.highlight || payload.highlight_element;
     var prefill = payload.prefill || payload.prefill_data || {};
-    var el = findSection(section);
-    if (el && el.scrollIntoView) {
-      el.scrollIntoView({ behavior: "smooth", block: "start" });
-    }
-    document.documentElement.setAttribute("data-lu-active-section", section || "");
-    try {
-      window.dispatchEvent(
-        new CustomEvent("lu:navigate", {
-          detail: {
-            section: section,
-            highlight: highlight,
-            prefill: prefill,
-            components: payload.components || null,
-          },
-        })
-      );
-    } catch (e) {}
-
-    if (highlight) {
-      var target =
-        findTarget(null, highlight) ||
-        (el && (qs("#" + highlight, el) || qs('[data-id="' + highlight + '"]', el)));
-      if (target) flashHighlight(target, 2800);
-    }
-
-    if (prefill && typeof prefill === "object") {
-      Object.keys(prefill).forEach(function (key) {
-        var val = prefill[key];
-        if (val == null) return;
-        var field =
-          qs('[name="' + key + '"]') ||
-          qs("#" + key) ||
-          qs('[data-field="' + key + '"]') ||
-          (el && (qs('[name="' + key + '"]', el) || qs("#" + key, el)));
-        if (field && "value" in field) {
-          field.value = String(val);
-          try {
-            field.dispatchEvent(new Event("input", { bubbles: true }));
-            field.dispatchEvent(new Event("change", { bubbles: true }));
-          } catch (e) {}
-        }
-      });
+    // Concept: morph Dynamic Viewport — never mechanical page scroll.
+    morphCanvasToSection(section, highlight, prefill);
+    if (payload.components && payload.components.length) {
+      try {
+        window.dispatchEvent(
+          new CustomEvent("lu:components", { detail: { components: payload.components } })
+        );
+      } catch (e) {}
     }
   }
 
@@ -300,7 +381,14 @@
       return;
     }
     if (command === "scroll_to") {
-      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      // Canvas mode: bring target into stage focus without window scroll-jump
+      flashHighlight(el, 2000);
+      var stageBody = $("lu-genui-stage-body");
+      if (stageBody && stageBody.contains(el)) {
+        try {
+          el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        } catch (e) {}
+      }
     } else if (command === "highlight") {
       flashHighlight(el, payload.duration_ms || 2000);
     } else if (command === "set_input_value") {
@@ -342,10 +430,7 @@
         else el.textContent = String(map[id]);
       }
     });
-    var section = findSection("roi_calculator");
-    if (section && section.scrollIntoView) {
-      section.scrollIntoView({ behavior: "smooth", block: "start" });
-    }
+    morphCanvasToSection("roi_calculator", null, null);
   }
 
   function collectPageSummary(focus) {
