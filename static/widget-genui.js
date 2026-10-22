@@ -321,7 +321,7 @@
       "/* kill our old parallel shells if any left in DOM */",
       "html.lu-agent #lu-viewport,",
       "html.lu-agent #lu-section-stage { display: none !important; }",
-    ].join("\\n");
+    ].join("\n");
     document.head.appendChild(s);
   }
 
@@ -904,7 +904,12 @@
       /* Pipecat RawClientMessageData expects `t` (type short-key) */
       var type = (obj && (obj.t || obj.type)) || "ui_user_interaction";
       var data = (obj && obj.data) || obj || {};
+      var msgId =
+        window.crypto && crypto.randomUUID
+          ? crypto.randomUUID()
+          : "m" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
       var wire = {
+        id: msgId,
         label: "rtvi-ai",
         type: "client-message",
         data: {
