@@ -273,197 +273,148 @@
     return null;
   }
 
-  function ensureViewport() {
-    var vp = $("lu-viewport");
-    if (vp) return vp;
-    vp = document.createElement("div");
-    vp.id = "lu-viewport";
-    vp.setAttribute("data-lu-viewport", "1");
-    vp.style.cssText =
-      "position:fixed;inset:0;z-index:99990;display:none;flex-direction:column;" +
-      "background:#0a0c10;color:#f1f5f9;" +
-      "padding:max(12px,env(safe-area-inset-top)) 16px 100px;" +
-      "font:15px/1.45 system-ui,sans-serif;overflow:hidden";
-    var body = document.createElement("div");
-    body.id = "lu-viewport-body";
-    body.style.cssText =
-      "flex:1;min-height:0;overflow:auto;-webkit-overflow-scrolling:touch;" +
-      "max-width:720px;width:100%;margin:0 auto";
-    vp.appendChild(body);
-    document.body.appendChild(vp);
-    return vp;
+  function injectSiteAgentCss() {
+    if ($("lu-site-agent-css")) return;
+    var s = document.createElement("style");
+    s.id = "lu-site-agent-css";
+    s.textContent = [
+      "/* Agent mode: only the active site section is the working surface */",
+      "html.lu-agent body > *:not(#lu-viewport-shield):not(#lu-escape-voice):not(#lu-voice-orb-wrap):not(#lu-roi-inline):not(#lu-turnstile-modal):not(script):not(style):not(link) {",
+      "  /* do not blanket-hide — we target sections */",
+      "}",
+      "html.lu-agent section.section-pad,",
+      "html.lu-agent section.hero,",
+      "html.lu-agent #partners,",
+      "html.lu-agent #news,",
+      "html.lu-agent #compliance,",
+      "html.lu-agent header.site-header,",
+      "html.lu-agent .site-header,",
+      "html.lu-agent .mobile-menu,",
+      "html.lu-agent footer,",
+      "html.lu-agent .final-cta,",
+      "html.lu-agent .sticky-cta,",
+      "html.lu-agent .foot-bottom {",
+      "  display: none !important;",
+      "}",
+      "html.lu-agent section.lu-agent-show,",
+      "html.lu-agent #services.lu-agent-show,",
+      "html.lu-agent #pricing.lu-agent-show,",
+      "html.lu-agent #contact.lu-agent-show {",
+      "  display: block !important;",
+      "  visibility: visible !important;",
+      "  opacity: 1 !important;",
+      "  position: relative !important;",
+      "  min-height: 100vh;",
+      "  padding-top: 56px !important;",
+      "  padding-bottom: 120px !important;",
+      "  z-index: 1;",
+      "}",
+      "html.lu-agent #lu-roi-inline {",
+      "  display: block;",
+      "  position: relative;",
+      "  max-width: 960px;",
+      "  margin: 24px auto 120px;",
+      "  padding: 0 16px 120px;",
+      "}",
+      "html.lu-agent #lu-voice-orb-wrap { z-index: 100000; }",
+      "html.lu-agent #lu-escape-voice { z-index: 100001; }",
+      "/* kill our old parallel shells if any left in DOM */",
+      "html.lu-agent #lu-viewport,",
+      "html.lu-agent #lu-section-stage { display: none !important; }",
+    ].join("\\n");
+    document.head.appendChild(s);
   }
 
-  function openViewport() {
-    var vp = ensureViewport();
-    vp.style.display = "flex";
-    document.documentElement.classList.add("lu-viewport-on");
-    document.body.style.overflow = "hidden";
-  }
-
-  function closeViewport() {
-    var vp = $("lu-viewport");
-    if (vp) vp.style.display = "none";
-    document.documentElement.classList.remove("lu-viewport-on");
-    document.body.style.overflow = "";
-  }
-
-  function setViewportHtml(html) {
-    openViewport();
-    var body = $("lu-viewport-body");
-    if (body) body.innerHTML = html;
-  }
-
-  function setViewportNode(node) {
-    openViewport();
-    var body = $("lu-viewport-body");
-    if (!body) return;
-    body.innerHTML = "";
-    if (node) body.appendChild(node);
-  }
-
-  function cardStyle() {
-    return (
-      "background:#12161e;border:1px solid rgba(255,255,255,.08);border-radius:14px;" +
-      "padding:14px 16px;margin:0 0 12px"
-    );
-  }
-
-  function renderServicesView(sourceEl) {
-    var wrap = document.createElement("div");
-    var h = document.createElement("h2");
-    h.style.cssText = "margin:0 0 14px;font-size:1.35rem;font-weight:700";
-    h.textContent = "Services";
-    wrap.appendChild(h);
-    var grid =
-      (sourceEl && sourceEl.querySelector(".service-grid")) ||
-      (sourceEl && sourceEl.querySelectorAll(".service-card").length
-        ? sourceEl
-        : null);
-    var cards = grid
-      ? grid.querySelectorAll(".service-card, article")
-      : [];
-    if (cards.length) {
-      cards.forEach(function (c) {
-        var title = (c.querySelector("h3") && c.querySelector("h3").textContent) || "";
-        var desc = (c.querySelector("p") && c.querySelector("p").textContent) || "";
-        var item = document.createElement("div");
-        item.style.cssText = cardStyle();
-        item.innerHTML =
-          "<div style='font-weight:700;margin-bottom:6px'>" +
-          escapeHtml(title.trim()) +
-          "</div><div style='opacity:.8;font-size:14px'>" +
-          escapeHtml(desc.trim()) +
-          "</div>";
-        wrap.appendChild(item);
-      });
-    } else {
-      var p = document.createElement("p");
-      p.style.opacity = "0.75";
-      p.textContent = "Services";
-      wrap.appendChild(p);
-    }
-    return wrap;
-  }
-
-  function renderPricingView(sourceEl) {
-    var wrap = document.createElement("div");
-    var h = document.createElement("h2");
-    h.style.cssText = "margin:0 0 14px;font-size:1.35rem;font-weight:700";
-    h.textContent = "Pricing";
-    wrap.appendChild(h);
-    var cards = sourceEl
-      ? sourceEl.querySelectorAll(
-          ".pricing-card, [class*='price-card'], .pricing-track > *, article"
-        )
-      : [];
-    var n = 0;
-    cards.forEach(function (c) {
-      var text = (c.innerText || "").replace(/\\s+/g, " ").trim();
-      if (text.length < 8 || text.length > 400) return;
-      n++;
-      if (n > 6) return;
-      var item = document.createElement("div");
-      item.style.cssText = cardStyle();
-      item.textContent = text.slice(0, 280);
-      wrap.appendChild(item);
+  function clearAgentShow() {
+    document.querySelectorAll(".lu-agent-show").forEach(function (el) {
+      el.classList.remove("lu-agent-show");
     });
-    if (!n) {
-      var p = document.createElement("p");
-      p.style.opacity = "0.75";
-      p.textContent = "Plans on request — ask what to automate.";
-      wrap.appendChild(p);
+    var roi = $("lu-roi-inline");
+    if (roi) {
+      roi.style.display = "none";
+      roi.innerHTML = "";
     }
-    return wrap;
   }
 
-  function renderRoiView(fig) {
+  function showSiteSection(el) {
+    if (!el) return;
+    injectSiteAgentCss();
+    document.documentElement.classList.add("lu-agent");
+    clearAgentShow();
+    el.classList.add("lu-agent-show");
+    /* keep page from scrolling under — pin scroll top without scrollIntoView animation */
+    try {
+      window.scrollTo(0, 0);
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+    } catch (e) {}
+  }
+
+  function showRoiOnSite(fig) {
+    injectSiteAgentCss();
+    document.documentElement.classList.add("lu-agent");
+    clearAgentShow();
+    /* Prefer a real host on the page if client added one */
+    var host =
+      document.getElementById("roi_calculator") ||
+      document.querySelector('[data-lu-section="roi_calculator"]');
+    var box = $("lu-roi-inline");
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "lu-roi-inline";
+      /* insert near pricing if possible so it inherits page flow */
+      var pricing = document.getElementById("pricing");
+      if (pricing && pricing.parentNode) {
+        pricing.parentNode.insertBefore(box, pricing.nextSibling);
+      } else {
+        document.body.appendChild(box);
+      }
+    }
     fig = fig || state.lastRoi || {};
-    var wrap = document.createElement("div");
-    var h = document.createElement("h2");
-    h.style.cssText = "margin:0 0 14px;font-size:1.35rem;font-weight:700";
-    h.textContent = "ROI";
-    wrap.appendChild(h);
+    /* Use page-like surface: light cards if site is light, else neutral */
+    var isDark = false;
+    try {
+      var bg = getComputedStyle(document.body).backgroundColor || "";
+      isDark = bg.indexOf("rgb(0") === 0 || bg.indexOf("rgb(10") === 0;
+    } catch (e) {}
+    box.style.cssText = isDark
+      ? "display:block;max-width:960px;margin:24px auto;padding:16px 16px 120px;color:inherit"
+      : "display:block;max-width:960px;margin:24px auto;padding:16px 16px 120px;color:#0f172a";
+    var cardBg = isDark ? "rgba(255,255,255,.06)" : "#fff";
+    var border = isDark ? "rgba(255,255,255,.1)" : "#e2e8f0";
     function row(label, val, hi) {
-      var d = document.createElement("div");
-      d.style.cssText =
-        cardStyle() +
-        ";display:flex;justify-content:space-between;gap:12px;align-items:baseline";
-      d.innerHTML =
-        "<span style='opacity:.75'>" +
-        escapeHtml(label) +
-        "</span><strong style='font-size:1.05rem;" +
-        (hi ? "color:#34d399" : "") +
+      return (
+        "<div style='display:flex;justify-content:space-between;gap:12px;padding:14px 16px;" +
+        "margin:0 0 10px;border-radius:14px;background:" +
+        cardBg +
+        ";border:1px solid " +
+        border +
+        "'><span style='opacity:.75'>" +
+        String(label) +
+        "</span><strong style='" +
+        (hi ? "color:#059669" : "") +
         "'>" +
-        escapeHtml(String(val)) +
-        "</strong>";
-      wrap.appendChild(d);
+        String(val) +
+        "</strong></div>"
+      );
     }
-    if (fig.missed_calls_per_month != null) row("Missed / month", fig.missed_calls_per_month);
-    if (fig.cost_per_missed_lead != null) row("Cost per lead", fig.cost_per_missed_lead);
+    var html = "<div class='section-head' style='margin-bottom:12px'><h2 style='margin:0;font-size:1.4rem'>ROI</h2></div>";
+    if (fig.missed_calls_per_month != null)
+      html += row("Missed / month", fig.missed_calls_per_month);
+    if (fig.cost_per_missed_lead != null)
+      html += row("Cost per lead", fig.cost_per_missed_lead);
     if (fig.capture_rate != null)
-      row("Capture", Math.round(Number(fig.capture_rate) * 100) + "%");
+      html += row("Capture", Math.round(Number(fig.capture_rate) * 100) + "%");
     if (fig.recovered_leads_per_month != null)
-      row("Recovered leads", fig.recovered_leads_per_month);
+      html += row("Recovered leads", fig.recovered_leads_per_month);
     if (fig.net_monthly_savings != null)
-      row("Net monthly savings", fig.net_monthly_savings, true);
-    if (fig.missed_calls_per_month == null && fig.net_monthly_savings == null) {
-      var p = document.createElement("p");
-      p.style.opacity = "0.75";
-      p.textContent = "…";
-      wrap.appendChild(p);
-    }
-    return wrap;
-  }
-
-  function renderContactsView(sourceEl) {
-    var wrap = document.createElement("div");
-    var h = document.createElement("h2");
-    h.style.cssText = "margin:0 0 14px;font-size:1.35rem;font-weight:700";
-    h.textContent = "Contact";
-    wrap.appendChild(h);
-    var form = sourceEl && (sourceEl.querySelector("form") || sourceEl.querySelector("#contactForm"));
-    if (form) {
-      var clone = form.cloneNode(true);
-      clone.querySelectorAll("script").forEach(function (s) {
-        s.remove();
-      });
-      clone.style.cssText = cardStyle() + ";background:#fff;color:#0f172a";
-      wrap.appendChild(clone);
-    } else {
-      var p = document.createElement("p");
-      p.style.opacity = "0.75";
-      p.textContent = "Contact form";
-      wrap.appendChild(p);
-    }
-    return wrap;
-  }
-
-  function escapeHtml(s) {
-    return String(s || "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
+      html += row("Net monthly savings", fig.net_monthly_savings, true);
+    box.innerHTML = html;
+    box.classList.add("lu-agent-show");
+    box.style.display = "block";
+    try {
+      window.scrollTo(0, 0);
+    } catch (e) {}
   }
 
   function focusSection(section, highlight) {
@@ -472,39 +423,39 @@
     if (!Object.keys(state.sectionMap || {}).length) scanPageSections();
     var key = section.toLowerCase();
     document.documentElement.setAttribute("data-lu-active-section", key);
-    var el = findSection(key);
 
-    var view;
     if (key === "roi_calculator") {
-      view = renderRoiView(state.lastRoi || {});
-    } else if (key === "services") {
-      view = renderServicesView(el);
-    } else if (key === "pricing") {
-      view = renderPricingView(el);
-    } else if (key === "contacts" || key === "contact" || key === "booking_widget") {
-      view = renderContactsView(el || findSection("contacts") || findSection("contact"));
-    } else if (key === "cases") {
-      view = renderServicesView(el); /* fallback cards style */
-      var h = view.querySelector("h2");
-      if (h) h.textContent = "Cases";
-    } else {
-      view = document.createElement("div");
-      var h2 = document.createElement("h2");
-      h2.style.cssText = "margin:0 0 12px;font-size:1.25rem";
-      h2.textContent = key.replace(/_/g, " ");
-      view.appendChild(h2);
-      if (el) {
-        var snippet = document.createElement("div");
-        snippet.style.cssText = cardStyle();
-        snippet.textContent = (el.innerText || "").replace(/\\s+/g, " ").trim().slice(0, 600);
-        view.appendChild(snippet);
-      }
+      showRoiOnSite(state.lastRoi || {});
+      console.info("[LU] site ROI");
+      return null;
     }
-    setViewportNode(view);
-    console.info("[LU] viewport", key, "dom=", !!(el && el.id));
+
+    var el = findSection(key);
+    if (!el && (key === "contacts" || key === "booking_widget")) {
+      el = findSection("contact") || document.getElementById("contact");
+    }
+    if (!el && key === "hero") {
+      el = document.querySelector("h1") && document.querySelector("h1").closest("section");
+    }
+
+    if (el) {
+      showSiteSection(el);
+      if (highlight) {
+        var t =
+          el.querySelector("#" + highlight) ||
+          el.querySelector('[data-id="' + highlight + '"]');
+        if (t) flashHighlight(t, 2000);
+      }
+      console.info("[LU] site section", key, el.id || el.className);
+    } else {
+      console.warn("[LU] no DOM section", key, Object.keys(state.sectionMap || {}));
+    }
+
     try {
       window.dispatchEvent(
-        new CustomEvent("lu:navigate", { detail: { section: key, mode: "viewport" } })
+        new CustomEvent("lu:navigate", {
+          detail: { section: key, mode: "site_dom", found: !!el },
+        })
       );
     } catch (e) {}
     return el;
@@ -1208,22 +1159,43 @@
     });
   }
 
+  function pageLocale() {
+    var lang = (
+      document.documentElement.getAttribute("lang") ||
+      navigator.language ||
+      "en"
+    ).toLowerCase();
+    if (lang.indexOf("ro") === 0) return "ro";
+    if (lang.indexOf("ru") === 0) return "ru";
+    return "en";
+  }
+
   function showManagedChallenge(ok, fail) {
     if (document.getElementById("lu-turnstile-modal")) return;
+    var L = pageLocale();
+    var title =
+      L === "ro" ? "Verificare" : L === "ru" ? "Проверка" : "Check";
+    var cancel =
+      L === "ro" ? "Anulează" : L === "ru" ? "Отмена" : "Cancel";
     var wrap = document.createElement("div");
     wrap.id = "lu-turnstile-modal";
     wrap.style.cssText =
-      "position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.55);" +
-      "display:flex;align-items:center;justify-content:center;padding:16px";
+      "position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.4);" +
+      "display:flex;align-items:flex-end;justify-content:center;padding:16px 16px 100px";
     var box = document.createElement("div");
     box.style.cssText =
-      "background:#fff;color:#111;max-width:340px;width:100%;border-radius:16px;" +
-      "padding:20px;font:14px/1.4 system-ui,sans-serif;text-align:center";
+      "background:#0b0f14;color:#e5e7eb;max-width:300px;width:100%;border-radius:14px;" +
+      "padding:12px;font:13px/1.35 system-ui,sans-serif;text-align:center;" +
+      "border:1px solid rgba(255,255,255,.1);box-shadow:0 12px 40px rgba(0,0,0,.4)";
     box.innerHTML =
-      "<p style='margin:0 0 14px;font-weight:600'>Подтвердите, что вы человек</p>" +
+      "<p style='margin:0 0 10px;font-weight:600'>" +
+      title +
+      "</p>" +
       "<div id='lu-turnstile-slot' style='display:flex;justify-content:center;min-height:65px'></div>" +
-      "<button type='button' id='lu-turnstile-cancel' style='margin-top:14px;border:0;background:transparent;" +
-      "color:#666;font:13px system-ui;cursor:pointer'>Отмена</button>";
+      "<button type='button' id='lu-turnstile-cancel' style='margin-top:8px;border:0;background:transparent;" +
+      "color:#94a3b8;font:12px system-ui;cursor:pointer'>" +
+      cancel +
+      "</button>";
     wrap.appendChild(box);
     document.body.appendChild(wrap);
 
@@ -1235,19 +1207,18 @@
         wrap.remove();
       } catch (e) {}
     }
-
     document.getElementById("lu-turnstile-cancel").onclick = function () {
       close();
       fail("turnstile_cancelled");
     };
-
     var slot = document.getElementById("lu-turnstile-slot");
     var wid = null;
     try {
       wid = window.turnstile.render(slot, {
         sitekey: state.turnstileSiteKey,
         size: "normal",
-        theme: "light",
+        theme: "dark",
+        language: L,
         callback: function (token) {
           close();
           ok(token);
@@ -1273,7 +1244,10 @@
     state.connected = false;
     state.connecting = false;
     if (reason === "escape" || reason === "pagehide") {
-      closeViewport();
+      document.documentElement.classList.remove("lu-agent");
+      clearAgentShow();
+      var vp = $("lu-viewport");
+      if (vp) vp.style.display = "none";
     }
     setAgentState("idle");
     try {
@@ -1457,8 +1431,13 @@
 
   async function boot() {
     ensureChrome();
+    /* Remove legacy parallel UI shells if left from older widget builds */
+    ["lu-viewport", "lu-section-stage", "lu-section-dock"].forEach(function (id) {
+      var n = document.getElementById(id);
+      if (n && n.parentNode) n.parentNode.removeChild(n);
+    });
     scanPageSections();
-    /* On load: one working viewport (not the long landing, not a dialog with X) */
+    /* On load: real site #services only (site CSS), not a parallel skin */
     focusSection("services");
 
     setTimeout(scanPageSections, 1200);
