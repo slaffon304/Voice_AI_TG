@@ -277,50 +277,106 @@
     if ($("lu-site-agent-css")) return;
     var s = document.createElement("style");
     s.id = "lu-site-agent-css";
+    /* Real newlines — required for the cascade to parse */
     s.textContent = [
-      "/* Agent mode: only the active site section is the working surface */",
-      "html.lu-agent body > *:not(#lu-viewport-shield):not(#lu-escape-voice):not(#lu-voice-orb-wrap):not(#lu-roi-inline):not(#lu-turnstile-modal):not(script):not(style):not(link) {",
-      "  /* do not blanket-hide — we target sections */",
-      "}",
+      "/* Generative canvas: same brand surface, one active stage */",
+      "html.lu-agent { scroll-behavior: auto; }",
+      "html.lu-agent body { overflow-x: hidden; }",
       "html.lu-agent section.section-pad,",
       "html.lu-agent section.hero,",
+      "html.lu-agent section.suite,",
+      "html.lu-agent section.pricing,",
+      "html.lu-agent section.partners,",
+      "html.lu-agent section.news,",
+      "html.lu-agent section.compliance,",
+      "html.lu-agent section.contact,",
+      "html.lu-agent section.story,",
+      "html.lu-agent section.integrations,",
+      "html.lu-agent section.final-cta,",
       "html.lu-agent #partners,",
       "html.lu-agent #news,",
       "html.lu-agent #compliance,",
-      "html.lu-agent header.site-header,",
-      "html.lu-agent .site-header,",
-      "html.lu-agent .mobile-menu,",
-      "html.lu-agent footer,",
+      "html.lu-agent #services,",
+      "html.lu-agent #pricing,",
+      "html.lu-agent #contact,",
       "html.lu-agent .final-cta,",
       "html.lu-agent .sticky-cta,",
-      "html.lu-agent .foot-bottom {",
+      "html.lu-agent .foot-bottom,",
+      "html.lu-agent footer {",
       "  display: none !important;",
       "}",
       "html.lu-agent section.lu-agent-show,",
       "html.lu-agent #services.lu-agent-show,",
       "html.lu-agent #pricing.lu-agent-show,",
-      "html.lu-agent #contact.lu-agent-show {",
+      "html.lu-agent #contact.lu-agent-show,",
+      "html.lu-agent #news.lu-agent-show,",
+      "html.lu-agent #partners.lu-agent-show {",
       "  display: block !important;",
       "  visibility: visible !important;",
       "  opacity: 1 !important;",
       "  position: relative !important;",
-      "  min-height: 100vh;",
-      "  padding-top: 56px !important;",
-      "  padding-bottom: 120px !important;",
-      "  z-index: 1;",
+      "  min-height: calc(100vh - 72px);",
+      "  padding-top: 72px !important;",
+      "  padding-bottom: 140px !important;",
+      "  z-index: 2;",
+      "}",
+      "/* Keep site header/nav visible as chrome of the canvas */",
+      "html.lu-agent header.site-header,",
+      "html.lu-agent .site-header {",
+      "  display: block !important;",
+      "  position: fixed !important;",
+      "  top: 0; left: 0; right: 0;",
+      "  z-index: 50;",
       "}",
       "html.lu-agent #lu-roi-inline {",
-      "  display: block;",
+      "  display: block !important;",
       "  position: relative;",
-      "  max-width: 960px;",
-      "  margin: 24px auto 120px;",
-      "  padding: 0 16px 120px;",
+      "  z-index: 3;",
+      "  min-height: calc(100vh - 72px);",
+      "  padding: 88px 20px 140px;",
+      "  box-sizing: border-box;",
       "}",
       "html.lu-agent #lu-voice-orb-wrap { z-index: 100000; }",
       "html.lu-agent #lu-escape-voice { z-index: 100001; }",
-      "/* kill our old parallel shells if any left in DOM */",
       "html.lu-agent #lu-viewport,",
       "html.lu-agent #lu-section-stage { display: none !important; }",
+      "/* ROI surface — LabUpgrade dark glass, not generic white admin */",
+      "#lu-roi-inline .lu-roi-shell {",
+      "  max-width: 720px;",
+      "  margin: 0 auto;",
+      "  padding: 28px 24px 32px;",
+      "  border-radius: 24px;",
+      "  background: linear-gradient(160deg, rgba(255,255,255,.10), rgba(255,255,255,.04));",
+      "  border: 1px solid rgba(255,255,255,.14);",
+      "  box-shadow: 0 24px 80px rgba(0,0,0,.35);",
+      "  color: #f8fafc;",
+      "  backdrop-filter: blur(18px);",
+      "  -webkit-backdrop-filter: blur(18px);",
+      "  font-family: inherit;",
+      "}",
+      "#lu-roi-inline .lu-roi-kicker {",
+      "  font-size: 12px; letter-spacing: .14em; text-transform: uppercase;",
+      "  opacity: .65; margin: 0 0 8px;",
+      "}",
+      "#lu-roi-inline .lu-roi-title {",
+      "  font-size: clamp(1.4rem, 3vw, 1.85rem); font-weight: 600;",
+      "  margin: 0 0 6px; letter-spacing: -0.02em;",
+      "}",
+      "#lu-roi-inline .lu-roi-sub {",
+      "  opacity: .7; font-size: .95rem; margin: 0 0 22px; line-height: 1.45;",
+      "}",
+      "#lu-roi-inline .lu-roi-row {",
+      "  display: flex; justify-content: space-between; align-items: baseline;",
+      "  gap: 16px; padding: 14px 0;",
+      "  border-bottom: 1px solid rgba(255,255,255,.1);",
+      "}",
+      "#lu-roi-inline .lu-roi-row:last-child { border-bottom: 0; }",
+      "#lu-roi-inline .lu-roi-row span { opacity: .72; font-size: .92rem; }",
+      "#lu-roi-inline .lu-roi-row strong { font-size: 1.05rem; font-weight: 600; }",
+      "#lu-roi-inline .lu-roi-row.lu-roi-hi strong { color: #6ee7b7; font-size: 1.25rem; }",
+      "#lu-roi-inline .lu-roi-note {",
+      "  margin-top: 18px; font-size: .8rem; opacity: .55; line-height: 1.4;",
+      "}",
     ].join("\n");
     document.head.appendChild(s);
   }
@@ -354,67 +410,66 @@
     injectSiteAgentCss();
     document.documentElement.classList.add("lu-agent");
     clearAgentShow();
-    /* Prefer a real host on the page if client added one */
-    var host =
-      document.getElementById("roi_calculator") ||
-      document.querySelector('[data-lu-section="roi_calculator"]');
+    fig = fig || state.lastRoi || {};
+    state.lastRoi = fig;
+
     var box = $("lu-roi-inline");
     if (!box) {
       box = document.createElement("div");
       box.id = "lu-roi-inline";
-      /* insert near pricing if possible so it inherits page flow */
-      var pricing = document.getElementById("pricing");
-      if (pricing && pricing.parentNode) {
-        pricing.parentNode.insertBefore(box, pricing.nextSibling);
-      } else {
-        document.body.appendChild(box);
-      }
+      document.body.appendChild(box);
     }
-    fig = fig || state.lastRoi || {};
-    /* Use page-like surface: light cards if site is light, else neutral */
-    var isDark = false;
-    try {
-      var bg = getComputedStyle(document.body).backgroundColor || "";
-      isDark = bg.indexOf("rgb(0") === 0 || bg.indexOf("rgb(10") === 0;
-    } catch (e) {}
-    box.style.cssText = isDark
-      ? "display:block;max-width:960px;margin:24px auto;padding:16px 16px 120px;color:inherit"
-      : "display:block;max-width:960px;margin:24px auto;padding:16px 16px 120px;color:#0f172a";
-    var cardBg = isDark ? "rgba(255,255,255,.06)" : "#fff";
-    var border = isDark ? "rgba(255,255,255,.1)" : "#e2e8f0";
-    function row(label, val, hi) {
-      return (
-        "<div style='display:flex;justify-content:space-between;gap:12px;padding:14px 16px;" +
-        "margin:0 0 10px;border-radius:14px;background:" +
-        cardBg +
-        ";border:1px solid " +
-        border +
-        "'><span style='opacity:.75'>" +
-        String(label) +
-        "</span><strong style='" +
-        (hi ? "color:#059669" : "") +
-        "'>" +
-        String(val) +
-        "</strong></div>"
-      );
+
+    function fmt(n) {
+      if (n == null || n === "") return "—";
+      var x = Number(n);
+      if (isNaN(x)) return String(n);
+      if (Math.abs(x) >= 100) return Math.round(x).toLocaleString("en-US");
+      return (Math.round(x * 10) / 10).toLocaleString("en-US");
     }
-    var html = "<div class='section-head' style='margin-bottom:12px'><h2 style='margin:0;font-size:1.4rem'>ROI</h2></div>";
+
+    var rows = [];
     if (fig.missed_calls_per_month != null)
-      html += row("Missed / month", fig.missed_calls_per_month);
+      rows.push(["Missed contacts / month", fmt(fig.missed_calls_per_month), false]);
     if (fig.cost_per_missed_lead != null)
-      html += row("Cost per lead", fig.cost_per_missed_lead);
+      rows.push(["Assumed value per contact", fmt(fig.cost_per_missed_lead), false]);
     if (fig.capture_rate != null)
-      html += row("Capture", Math.round(Number(fig.capture_rate) * 100) + "%");
+      rows.push(["Capture rate", Math.round(Number(fig.capture_rate) * 100) + "%", false]);
     if (fig.recovered_leads_per_month != null)
-      html += row("Recovered leads", fig.recovered_leads_per_month);
+      rows.push(["Recovered / month", fmt(fig.recovered_leads_per_month), false]);
     if (fig.net_monthly_savings != null)
-      html += row("Net monthly savings", fig.net_monthly_savings, true);
-    box.innerHTML = html;
-    box.classList.add("lu-agent-show");
+      rows.push(["Net monthly impact", fmt(fig.net_monthly_savings), true]);
+
+    var body = rows
+      .map(function (r) {
+        return (
+          "<div class='lu-roi-row" +
+          (r[2] ? " lu-roi-hi" : "") +
+          "'><span>" +
+          r[0] +
+          "</span><strong>" +
+          r[1] +
+          "</strong></div>"
+        );
+      })
+      .join("");
+
+    box.innerHTML =
+      "<div class='lu-roi-shell'>" +
+      "<p class='lu-roi-kicker'>Live estimate</p>" +
+      "<h2 class='lu-roi-title'>What you may be leaving on the table</h2>" +
+      "<p class='lu-roi-sub'>Built from what you just said. Adjust any assumption by voice — I will recalculate on screen.</p>" +
+      body +
+      "<p class='lu-roi-note'>Defaults only fill gaps you did not specify. Say your real average deal size and I replace them.</p>" +
+      "</div>";
     box.style.display = "block";
+    box.classList.add("lu-agent-show");
     try {
       window.scrollTo(0, 0);
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
     } catch (e) {}
+    console.info("[LU] ROI canvas");
   }
 
   function focusSection(section, highlight) {
@@ -434,6 +489,14 @@
     if (!el && (key === "contacts" || key === "booking_widget")) {
       el = findSection("contact") || document.getElementById("contact");
     }
+    if (!el && key === "cases") {
+      /* donor may use news/portfolio as proof surface */
+      el =
+        findSection("cases") ||
+        document.getElementById("news") ||
+        document.getElementById("partners") ||
+        findSection("services");
+    }
     if (!el && key === "hero") {
       el = document.querySelector("h1") && document.querySelector("h1").closest("section");
     }
@@ -449,6 +512,9 @@
       console.info("[LU] site section", key, el.id || el.className);
     } else {
       console.warn("[LU] no DOM section", key, Object.keys(state.sectionMap || {}));
+      /* stay on brand: open services rather than blank B&W void */
+      var fallback = document.getElementById("services") || document.getElementById("pricing");
+      if (fallback) showSiteSection(fallback);
     }
 
     try {
