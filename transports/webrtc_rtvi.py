@@ -1308,7 +1308,6 @@ async def run_webrtc_session(
             return
         greeting_done = True
         clog.info("[%s] Triggering initial greeting (bot speaks first) via %s", call_id, trigger_source)
-        await asyncio.sleep(0.3)
         if task is not None and not task.has_finished:
             with contextlib.suppress(Exception):
                 await rtvi.set_bot_ready()
@@ -1325,14 +1324,28 @@ async def run_webrtc_session(
                 LLMRunFrame(),
             ])
 
+    @task.event_handler("on_pipeline_started")
+    async def on_pipeline_started(task_obj, frame):
+        clog.info("[%s] pipeline started & active — kicking off initial greeting", call_id)
+        # Small delay for client audio transceiver to be active
+        await asyncio.sleep(0.3)
+        await _trigger_greeting("on_pipeline_started")
+
     @rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi_proc):
         await _trigger_greeting("on_client_ready")
 
     async def _auto_greet() -> None:
+        """Fallback watchdog: ensures bot speaks first even if on_pipeline_started was missed."""
         try:
-            await asyncio.sleep(0.5)
-            await _trigger_greeting("auto_start")
+            for _ in range(10):
+                await asyncio.sleep(0.5)
+                if greeting_done:
+                    return
+                if getattr(llm, "_session", None) is not None:
+                    await _trigger_greeting("fallback_watchdog")
+                    return
+            await _trigger_greeting("fallback_timeout")
         except asyncio.CancelledError:
             pass
 
@@ -1340,8 +1353,11 @@ async def run_webrtc_session(
     async def _session_soft_warn() -> None:
         """За SOFT_DEADLINE_WARN_BEFORE до конца — карточка + короткая реплика."""
         try:
-            total = max(15, int(max_session_seconds))
-            warn_at = max(5, total - SOFT_DEADLINE_WARN_BEFORE)
+            total = max(20, int(max_session_seconds))
+            if total <= 60:
+                warn_at = max(25, int(total * 0.75))
+            else:
+                warn_at = max(30, total - SOFT_DEADLINE_WARN_BEFORE)
             await asyncio.sleep(warn_at)
             if task is None or abuse_stage == "blocked":
                 return
