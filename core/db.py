@@ -125,7 +125,10 @@ async def get_client_data(client_id: str) -> dict | None:
 
 
 async def get_persona_row(client_id: str) -> dict | None:
-    """Получение сырой строки характера из Redis или Supabase."""
+    """Персона из bot_personas (источник истины в SaaS).
+
+    Раньше ошибочно читали companion_settings — этой таблицы в API нет.
+    """
     cache_key = f"persona:{client_id}"
     if redis_client:
         with contextlib.suppress(Exception):
@@ -134,10 +137,20 @@ async def get_persona_row(client_id: str) -> dict | None:
                 return json.loads(cached)
 
     cols = ",".join(
-        ["system_prompt", "voice_model", "language", "persona_name", "lore",
-         "personality_enabled", *TRAITS]
+        [
+            "system_prompt",
+            "voice_model",
+            "language",
+            "persona_name",
+            "lore",
+            "personality_enabled",
+            *TRAITS,
+        ]
     )
-    rows = await sb_select("companion_settings", {"client_id": f"eq.{client_id}", "select": cols})
+    rows = await sb_select(
+        "bot_personas",
+        {"client_id": f"eq.{client_id}", "select": cols, "limit": "1"},
+    )
     row = rows[0] if rows else None
     if redis_client and row is not None:
         with contextlib.suppress(Exception):
