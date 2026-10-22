@@ -54,7 +54,7 @@ from google.genai import types
 from supabase import Client, create_client
 
 from core import *
-from transports.webrtc_rtvi import router as webrtc_router
+from transports.webrtc_rtvi import router as webrtc_router, _get_ice_servers
 
 try:
     from pipecat.audio.filters.rnnoise_filter import RNNoiseFilter
@@ -2806,6 +2806,7 @@ async def widget_config(response: Response, key: str = Query("")) -> dict:
         "turnstile_site_key": rand.get("turnstile_site_key") or "",
         "voice": bool(rand.get("voice_enabled")) if rand else False,
         "chat": bool(rand.get("chat_enabled")) if rand else False,
+        "ice_servers": [{"urls": s} for s in _get_ice_servers()],
     }
 
 

@@ -30,6 +30,7 @@ import datetime as dt
 import hashlib
 import html
 import logging
+import os
 import re
 import time
 import uuid
@@ -124,6 +125,28 @@ DWELL_MIN_SECONDS = 3.0
 SOFT_DEADLINE_WARN_BEFORE = 30
 # Повторов «списка вопросов» до требования верификации / блока
 ABUSE_REPEAT_THRESHOLD = 3
+
+DEFAULT_ICE_SERVERS = [
+    "stun:stun.l.google.com:19302",
+    "stun:stun1.l.google.com:19302",
+    "stun:stun2.l.google.com:19302",
+    "stun:stun.cloudflare.com:3478",
+]
+
+
+def _get_ice_servers() -> list[str]:
+    raw = os.getenv("WEBRTC_ICE_SERVERS", "").strip()
+    if not raw:
+        return list(DEFAULT_ICE_SERVERS)
+    try:
+        if raw.startswith("[") and raw.endswith("]"):
+            import json
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        return [s.strip() for s in raw.split(",") if s.strip()]
+    except Exception:
+        return list(DEFAULT_ICE_SERVERS)
 
 
 class WebAbuseProbe(FrameProcessor):
@@ -1525,7 +1548,7 @@ async def webrtc_offer(request: Request):
             headers=_cors_headers(request),
         )
 
-    connection = SmallWebRTCConnection()
+    connection = SmallWebRTCConnection(ice_servers=_get_ice_servers())
     await connection.initialize(sdp=offer_sdp, type=offer_type)
 
     transport = SmallWebRTCTransport(
