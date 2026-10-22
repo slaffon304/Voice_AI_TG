@@ -1486,9 +1486,21 @@ async def webrtc_offer(request: Request):
         log.warning("webrtc blocked visitor=%s ip=%s", visitor_id[:12], ip)
         return JSONResponse({"error": "blocked"}, status_code=403, headers=_cors_headers(request))
 
-    if not await propusk_valabil(turnstile_token, ip, str(row.get("turnstile_secret_key") or "")):
-        log.warning("webrtc turnstile failed ip=%s", ip)
-        return JSONResponse({"error": "verification failed"}, status_code=403, headers=_cors_headers(request))
+    secret = str(row.get("turnstile_secret_key") or "")
+    # Empty token is common on mobile if CF script lags; allow bypass only when
+    # WEB_SKIP_TURNSTILE=1 on the voice server (debug / staged rollout).
+    import os as _os
+    skip_ts = (_os.getenv("WEB_SKIP_TURNSTILE") or "").strip().lower() in ("1", "true", "yes")
+    if not await propusk_valabil(turnstile_token, ip, secret):
+        if skip_ts:
+            log.warning("webrtc turnstile failed ip=%s — WEB_SKIP_TURNSTILE, allowing", ip)
+        else:
+            log.warning("webrtc turnstile failed ip=%s token_len=%s", ip, len(turnstile_token))
+            return JSONResponse(
+                {"error": "verification failed"},
+                status_code=403,
+                headers=_cors_headers(request),
+            )
 
     limit_err, session_index, max_session_seconds = await web_session_budget(visitor_id, ip)
     if limit_err:
