@@ -589,65 +589,146 @@
     });
   }
 
+  function cleanupTurnstileHost(host, wid) {
+    try {
+      if (wid != null && window.turnstile) window.turnstile.remove(wid);
+    } catch (e) {}
+    try {
+      if (host && host.parentNode) host.parentNode.removeChild(host);
+    } catch (e) {}
+  }
+
+  /**
+   * Obtain a real Turnstile token. Never resolves with "" when sitekey is set.
+   * 1) invisible + execute (same user-gesture tick as startSession)
+   * 2) if that fails — visible managed widget the user can complete
+   */
   function getTurnstileToken() {
     if (!state.turnstileSiteKey) return Promise.resolve("");
+
     return loadTurnstile().then(function () {
-      return new Promise(function (resolve) {
-        var done = false;
-        function finish(token) {
-          if (done) return;
-          done = true;
-          resolve(token || "");
+      return new Promise(function (resolve, reject) {
+        var settled = false;
+        function ok(token) {
+          if (settled) return;
+          if (!token || token.length < 20) return;
+          settled = true;
+          resolve(token);
         }
-        // Mobile often hangs on invisible Turnstile — never block mic/WebRTC.
-        var timer = setTimeout(function () {
-          console.warn("[LU GenUI] turnstile timeout — continue without token");
-          finish("");
-        }, 8000);
+        function fail(reason) {
+          if (settled) return;
+          settled = true;
+          reject(new Error(reason || "turnstile_failed"));
+        }
+
+        // --- attempt 1: invisible ---
+        var host1 = document.createElement("div");
+        host1.setAttribute("aria-hidden", "true");
+        host1.style.cssText =
+          "position:fixed;left:-9999px;width:1px;height:1px;overflow:hidden";
+        document.body.appendChild(host1);
+        var wid1 = null;
+        var timer1 = setTimeout(function () {
+          cleanupTurnstileHost(host1, wid1);
+          showManagedChallenge(ok, fail);
+        }, 5000);
+
         try {
-          var host = document.createElement("div");
-          host.style.cssText =
-            "position:fixed;left:-9999px;width:1px;height:1px;overflow:hidden";
-          document.body.appendChild(host);
-          var wid = window.turnstile.render(host, {
+          wid1 = window.turnstile.render(host1, {
             sitekey: state.turnstileSiteKey,
             size: "invisible",
+            appearance: "execute",
+            retry: "auto",
+            "retry-interval": 2000,
             callback: function (token) {
-              clearTimeout(timer);
-              try {
-                window.turnstile.remove(wid);
-              } catch (e) {}
-              try {
-                host.remove();
-              } catch (e) {}
-              finish(token || "");
+              clearTimeout(timer1);
+              cleanupTurnstileHost(host1, wid1);
+              ok(token);
             },
             "error-callback": function () {
-              clearTimeout(timer);
-              try {
-                window.turnstile.remove(wid);
-              } catch (e) {}
-              try {
-                host.remove();
-              } catch (e) {}
-              console.warn("[LU GenUI] turnstile error — continue without token");
-              finish("");
+              clearTimeout(timer1);
+              cleanupTurnstileHost(host1, wid1);
+              showManagedChallenge(ok, fail);
+            },
+            "timeout-callback": function () {
+              clearTimeout(timer1);
+              cleanupTurnstileHost(host1, wid1);
+              showManagedChallenge(ok, fail);
+            },
+            "unsupported-callback": function () {
+              clearTimeout(timer1);
+              cleanupTurnstileHost(host1, wid1);
+              showManagedChallenge(ok, fail);
             },
           });
-          try {
-            window.turnstile.execute(wid);
-          } catch (e) {
-            clearTimeout(timer);
-            finish("");
-          }
+          window.turnstile.execute(wid1);
         } catch (e) {
-          clearTimeout(timer);
-          finish("");
+          clearTimeout(timer1);
+          cleanupTurnstileHost(host1, wid1);
+          showManagedChallenge(ok, fail);
         }
       });
-    }).catch(function () {
-      return "";
     });
+  }
+
+  function showManagedChallenge(ok, fail) {
+    if (document.getElementById("lu-turnstile-modal")) return;
+    var wrap = document.createElement("div");
+    wrap.id = "lu-turnstile-modal";
+    wrap.style.cssText =
+      "position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.55);" +
+      "display:flex;align-items:center;justify-content:center;padding:16px";
+    var box = document.createElement("div");
+    box.style.cssText =
+      "background:#fff;color:#111;max-width:340px;width:100%;border-radius:16px;" +
+      "padding:20px;font:14px/1.4 system-ui,sans-serif;text-align:center";
+    box.innerHTML =
+      "<p style='margin:0 0 14px;font-weight:600'>Подтвердите, что вы человек</p>" +
+      "<div id='lu-turnstile-slot' style='display:flex;justify-content:center;min-height:65px'></div>" +
+      "<button type='button' id='lu-turnstile-cancel' style='margin-top:14px;border:0;background:transparent;" +
+      "color:#666;font:13px system-ui;cursor:pointer'>Отмена</button>";
+    wrap.appendChild(box);
+    document.body.appendChild(wrap);
+
+    var closed = false;
+    function close() {
+      if (closed) return;
+      closed = true;
+      try {
+        wrap.remove();
+      } catch (e) {}
+    }
+
+    document.getElementById("lu-turnstile-cancel").onclick = function () {
+      close();
+      fail("turnstile_cancelled");
+    };
+
+    var slot = document.getElementById("lu-turnstile-slot");
+    var wid = null;
+    try {
+      wid = window.turnstile.render(slot, {
+        sitekey: state.turnstileSiteKey,
+        size: "normal",
+        theme: "light",
+        callback: function (token) {
+          close();
+          ok(token);
+        },
+        "error-callback": function () {
+          close();
+          fail("turnstile_widget_error");
+        },
+        "expired-callback": function () {
+          try {
+            if (wid != null) window.turnstile.reset(wid);
+          } catch (e) {}
+        },
+      });
+    } catch (e) {
+      close();
+      fail("turnstile_render_error");
+    }
   }
 
   function stopSession(reason) {
@@ -708,6 +789,16 @@
         token = await getTurnstileToken();
       } catch (e) {
         console.warn("[LU GenUI] turnstile", e);
+        setAgentState("error");
+        stopSession("turnstile");
+        alert("Не удалось пройти проверку безопасности. Обновите страницу и попробуйте снова.");
+        return;
+      }
+      if (state.turnstileSiteKey && (!token || token.length < 20)) {
+        setAgentState("error");
+        stopSession("turnstile_empty");
+        alert("Проверка безопасности не завершена. Попробуйте ещё раз.");
+        return;
       }
 
       state.localStream = await navigator.mediaDevices.getUserMedia({
@@ -837,24 +928,8 @@
     if (!state.voiceEnabled) return;
 
     if (state.turnstileSiteKey) {
-      loadTurnstile()
-        .then(function () {
-          // Pre-warm invisible widget so token is faster on first tap
-          try {
-            if (!document.getElementById("lu-ts-prewarm")) {
-              var host = document.createElement("div");
-              host.id = "lu-ts-prewarm";
-              host.style.cssText =
-                "position:fixed;left:-9999px;width:1px;height:1px;overflow:hidden";
-              document.body.appendChild(host);
-              window.turnstile.render(host, {
-                sitekey: state.turnstileSiteKey,
-                size: "invisible",
-              });
-            }
-          } catch (e) {}
-        })
-        .catch(function () {});
+      // Only load script early; do not render widgets until user gesture
+      loadTurnstile().catch(function () {});
     }
 
     setupDwellObservers();
