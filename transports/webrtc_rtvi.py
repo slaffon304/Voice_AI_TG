@@ -1548,6 +1548,12 @@ async def webrtc_offer(request: Request):
     key = str(body.get("key") or body.get("widget_key") or "").strip()
     visitor_id = str(body.get("visitor_id") or "").strip()
     project_id = str(body.get("project_id") or "").strip()
+    turnstile_token = str(
+        body.get("turnstile_token")
+        or body.get("t")
+        or body.get("cf-turnstile-response")
+        or ""
+    ).strip()
     raw_lang = str(body.get("lang") or body.get("language") or body.get("locale") or "").strip()
     accept_lang = request.headers.get("accept-language") or ""
     device_lang = ""
