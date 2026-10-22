@@ -1,7 +1,7 @@
 /**
- * LabUpgrade GenUI Voice Widget
- * Connects to POST /api/offer (WebRTC + RTVI data channel).
- * Implements docs/FRONTEND_RTVI_CONTRACT.md
+ * LabUpgrade Voice Widget — Series (client sites)
+ * POST /api/offer (WebRTC + RTVI). Auto-maps page sections; optional data-lu-section.
+ * Thinking Orb (thinking-orbs) = site "mouth" — bottom center.
  *
  * Embed:
  *   <div id="labupgrade-voice-widget"
@@ -9,11 +9,8 @@
  *        data-server="voice.labupgrade.in"></div>
  *   <script src="https://voice.labupgrade.in/widget-genui.js" defer></script>
  *
- * Optional: load thinking-orbs for rich agent state
- *   <script type="module">
- *     import { ThinkingOrb } from 'https://esm.sh/thinking-orbs';
- *     window.ThinkingOrb = ThinkingOrb;
- *   </script>
+ * Optional anchors on the page:
+ *   <section data-lu-section="pricing">...</section>
  */
 (function () {
   "use strict";
@@ -91,145 +88,250 @@
     }
   }
 
+  // —— Section map (series): explicit data-lu-section wins, else heuristics ——
+  var SECTION_KEYS = [
+    "hero",
+    "services",
+    "pricing",
+    "cases",
+    "booking_widget",
+    "contacts",
+    "roi_calculator",
+  ];
+
+  var SECTION_HINTS = {
+    hero: ["hero", "banner", "intro", "главн", "bun venit", "welcome"],
+    services: [
+      "services",
+      "servicii",
+      "услуги",
+      "solutions",
+      "soluții",
+      "what we do",
+      "ce facem",
+    ],
+    pricing: [
+      "pricing",
+      "prices",
+      "price",
+      "тариф",
+      "цен",
+      "preț",
+      "pret",
+      "plans",
+      "pachete",
+      "пакет",
+    ],
+    cases: [
+      "cases",
+      "case study",
+      "portfolio",
+      "проекты",
+      "кейсы",
+      "lucrări",
+      "clients",
+      "rezultate",
+    ],
+    booking_widget: [
+      "booking",
+      "book",
+      "schedule",
+      "calendar",
+      "programare",
+      "запис",
+      "appointment",
+    ],
+    contacts: [
+      "contact",
+      "contacts",
+      "контакт",
+      "reach us",
+      "scrie-ne",
+      "get in touch",
+    ],
+    roi_calculator: ["roi", "calculator", "окупаем", "econom", "savings"],
+  };
+
+  state.sectionMap = {};
+
+  function scoreText(hay, hints) {
+    hay = (hay || "").toLowerCase();
+    var s = 0;
+    for (var i = 0; i < hints.length; i++) {
+      if (hay.indexOf(hints[i]) !== -1) s += hints[i].length > 4 ? 3 : 2;
+    }
+    return s;
+  }
+
+  function nearestSectionRoot(el) {
+    var cur = el;
+    for (var i = 0; i < 8 && cur && cur !== document.body; i++) {
+      if (
+        cur.matches &&
+        cur.matches("section,article,[data-section],[data-lu-section],.section,.t-section,main > div")
+      ) {
+        return cur;
+      }
+      cur = cur.parentElement;
+    }
+    return el;
+  }
+
+  function scanPageSections() {
+    var map = {};
+    // Explicit anchors
+    document.querySelectorAll("[data-lu-section]").forEach(function (el) {
+      var key = (el.getAttribute("data-lu-section") || "").trim().toLowerCase();
+      if (SECTION_KEYS.indexOf(key) !== -1) map[key] = el;
+    });
+    document.querySelectorAll("[data-section]").forEach(function (el) {
+      var key = (el.getAttribute("data-section") || "").trim().toLowerCase();
+      if (SECTION_KEYS.indexOf(key) !== -1 && !map[key]) map[key] = el;
+    });
+    SECTION_KEYS.forEach(function (key) {
+      if (map[key]) return;
+      var byId = document.getElementById(key) || document.getElementById("section-" + key);
+      if (byId) map[key] = nearestSectionRoot(byId);
+    });
+
+    // Heuristic via headings
+    var heads = document.querySelectorAll("h1,h2,h3,.t-title,.t-sectiontitle");
+    var best = {};
+    heads.forEach(function (h) {
+      var text = (h.textContent || "").trim();
+      if (text.length < 2 || text.length > 80) return;
+      SECTION_KEYS.forEach(function (key) {
+        if (map[key]) return;
+        var sc = scoreText(text, SECTION_HINTS[key] || []);
+        if (sc <= 0) return;
+        if (!best[key] || sc > best[key].score) {
+          best[key] = { score: sc, el: nearestSectionRoot(h) };
+        }
+      });
+    });
+    Object.keys(best).forEach(function (key) {
+      if (!map[key] && best[key].score >= 2) map[key] = best[key].el;
+    });
+
+    // Forms → booking/contacts
+    if (!map.booking_widget) {
+      var form =
+        document.querySelector("form[data-lu-section='booking_widget']") ||
+        document.querySelector("form input[type='tel']") ||
+        document.querySelector("form input[name*='phone' i]");
+      if (form) map.booking_widget = nearestSectionRoot(form.closest("form") || form);
+    }
+    if (!map.contacts) {
+      var mail = document.querySelector("a[href^='mailto:']");
+      if (mail) map.contacts = nearestSectionRoot(mail);
+    }
+
+    state.sectionMap = map;
+    console.info(
+      "[LU] sections",
+      Object.keys(map).map(function (k) {
+        return k;
+      })
+    );
+    return map;
+  }
+
   function findSection(section) {
     if (!section) return null;
+    var key = String(section).trim().toLowerCase();
+    if (state.sectionMap && state.sectionMap[key]) return state.sectionMap[key];
     return (
-      $(section) ||
-      qs('[data-section="' + section + '"]') ||
-      qs('[data-lu-section="' + section + '"]') ||
-      qs("#section-" + section) ||
-      qs("." + section)
+      document.querySelector('[data-lu-section="' + key + '"]') ||
+      document.querySelector('[data-section="' + key + '"]') ||
+      document.getElementById(key) ||
+      document.getElementById("section-" + key)
     );
   }
 
-  /** Dynamic Viewport: one stage in focus — morph content, do not scroll the page. */
-  function ensureGenuiStage() {
-    var stage = $("lu-genui-stage");
-    if (stage) return stage;
-    stage = document.createElement("div");
-    stage.id = "lu-genui-stage";
-    stage.setAttribute("data-lu-canvas", "1");
-    stage.style.cssText =
-      "position:fixed;inset:0;z-index:99990;display:none;flex-direction:column;" +
-      "background:rgba(8,10,18,.92);backdrop-filter:blur(10px);" +
-      "padding:max(16px, env(safe-area-inset-top)) 16px 100px;overflow:auto;" +
-      "color:#f8fafc;font:16px/1.45 system-ui,sans-serif";
-    var bar = document.createElement("div");
-    bar.style.cssText =
-      "display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:12px";
-    var title = document.createElement("div");
-    title.id = "lu-genui-stage-title";
-    title.style.cssText = "font:700 14px/1.2 system-ui;letter-spacing:.02em;opacity:.9";
-    title.textContent = "Lab Upgrade";
-    var close = document.createElement("button");
-    close.type = "button";
-    close.textContent = "✕";
-    close.setAttribute("aria-label", "Close canvas");
-    close.style.cssText =
-      "border:0;background:rgba(255,255,255,.12);color:#fff;width:36px;height:36px;" +
-      "border-radius:10px;cursor:pointer;font-size:16px";
-    close.onclick = function () {
-      stage.style.display = "none";
-      document.documentElement.classList.remove("lu-canvas-open");
-    };
-    bar.appendChild(title);
-    bar.appendChild(close);
-    var body = document.createElement("div");
-    body.id = "lu-genui-stage-body";
-    body.style.cssText =
-      "flex:1;min-height:0;overflow:auto;border-radius:16px;" +
-      "background:rgba(255,255,255,.04);padding:16px;border:1px solid rgba(255,255,255,.08)";
-    stage.appendChild(bar);
-    stage.appendChild(body);
-    document.body.appendChild(stage);
-    return stage;
-  }
-
-  function morphCanvasToSection(section, highlight, prefill) {
-    var stage = ensureGenuiStage();
-    var body = $("lu-genui-stage-body");
-    var title = $("lu-genui-stage-title");
-    if (title) title.textContent = String(section || "view").replace(/_/g, " ");
-    if (body) body.innerHTML = "";
-
-    var src = findSection(section);
-    if (src) {
-      var clone = src.cloneNode(true);
-      clone.id = (clone.id || section || "block") + "-lu-clone";
-      clone.style.display = "block";
-      clone.style.visibility = "visible";
-      clone.style.opacity = "1";
-      clone.style.position = "static";
-      clone.style.maxWidth = "960px";
-      clone.style.margin = "0 auto";
-      if (body) body.appendChild(clone);
-    } else if (body) {
-      body.innerHTML =
-        "<p style='opacity:.85'>Se încarcă: <b>" +
-        String(section || "").replace(/</g, "") +
-        "</b></p>" +
-        "<p style='opacity:.55;font-size:13px'>Adaugă pe pagină id sau data-section=\"" +
-        String(section || "") +
-        "\" pentru conținut real în canvas.</p>";
-    }
-
-    stage.style.display = "flex";
-    document.documentElement.classList.add("lu-canvas-open");
+  function focusSection(section, highlight) {
+    /* Series: no page scrolling. Pin attention near the orb ("mouth") or highlight in place. */
+    var el = findSection(section);
     document.documentElement.setAttribute("data-lu-active-section", section || "");
 
-    if (highlight && body) {
-      var target =
-        body.querySelector("#" + CSS.escape(highlight)) ||
-        body.querySelector('[data-id="' + highlight + '"]') ||
-        body.querySelector('[data-lu-id="' + highlight + '"]');
-      if (target) flashHighlight(target, 2800);
+    var target = null;
+    if (highlight) {
+      target =
+        findTarget(null, highlight) ||
+        (el &&
+          (el.querySelector("#" + highlight) ||
+            el.querySelector('[data-id="' + highlight + '"]') ||
+            el.querySelector('[data-lu-id="' + highlight + '"]')));
     }
+    if (!target) target = el;
 
-    if (prefill && typeof prefill === "object" && body) {
-      Object.keys(prefill).forEach(function (key) {
-        var val = prefill[key];
-        if (val == null) return;
-        var field =
-          body.querySelector('[name="' + key + '"]') ||
-          body.querySelector("#" + key) ||
-          body.querySelector('[data-field="' + key + '"]');
-        if (field && "value" in field) {
-          field.value = String(val);
-          try {
-            field.dispatchEvent(new Event("input", { bubbles: true }));
-            field.dispatchEvent(new Event("change", { bubbles: true }));
-          } catch (e) {}
-        }
-      });
-    }
+    showSectionDock(section, el, target);
+
+    if (target) flashHighlight(target, 2800);
+    else if (el) flashHighlight(el, 1800);
 
     try {
       window.dispatchEvent(
         new CustomEvent("lu:navigate", {
-          detail: {
-            section: section,
-            highlight: highlight,
-            prefill: prefill,
-            mode: "canvas_morph",
-          },
+          detail: { section: section, highlight: highlight || null, mode: "series_dock" },
         })
       );
     } catch (e) {}
+    return el;
   }
 
-  function findTarget(ref, targetId) {
-    if (targetId) {
-      var byId = $(targetId) || qs('[data-id="' + targetId + '"]');
-      if (byId) return byId;
+  function showSectionDock(section, sourceEl, highlightEl) {
+    var dock = $("lu-section-dock");
+    if (!dock) {
+      dock = document.createElement("div");
+      dock.id = "lu-section-dock";
+      dock.style.cssText =
+        "position:fixed;left:50%;bottom:96px;transform:translateX(-50%);" +
+        "z-index:99997;width:min(440px,calc(100vw - 24px));max-height:42vh;" +
+        "overflow:auto;border-radius:16px;padding:12px 14px;" +
+        "background:#fff;color:#0f172a;box-shadow:0 12px 40px rgba(0,0,0,.22);" +
+        "border:1px solid rgba(15,23,42,.08);display:none;font:14px/1.4 system-ui,sans-serif";
+      document.body.appendChild(dock);
     }
-    if (ref) {
-      return (
-        qs('[data-ref="' + ref + '"]') ||
-        qs('[data-a11y-ref="' + ref + '"]') ||
-        $(ref)
-      );
+    dock.innerHTML = "";
+    var head = document.createElement("div");
+    head.style.cssText =
+      "display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px";
+    var title = document.createElement("div");
+    title.style.cssText = "font:700 13px/1.2 system-ui";
+    title.textContent = String(section || "section").replace(/_/g, " ");
+    var close = document.createElement("button");
+    close.type = "button";
+    close.textContent = "✕";
+    close.style.cssText =
+      "border:0;background:#f1f5f9;width:28px;height:28px;border-radius:8px;cursor:pointer";
+    close.onclick = function () {
+      dock.style.display = "none";
+    };
+    head.appendChild(title);
+    head.appendChild(close);
+    dock.appendChild(head);
+
+    if (sourceEl) {
+      var clone = sourceEl.cloneNode(true);
+      clone.querySelectorAll("script").forEach(function (s) {
+        s.remove();
+      });
+      clone.style.maxHeight = "none";
+      clone.style.overflow = "visible";
+      var body = document.createElement("div");
+      body.style.cssText = "max-height:calc(42vh - 40px);overflow:auto";
+      body.appendChild(clone);
+      dock.appendChild(body);
+    } else {
+      var miss = document.createElement("p");
+      miss.style.opacity = "0.7";
+      miss.textContent =
+        "Section not found on page. Add data-lu-section=\"" +
+        String(section || "") +
+        "\" for a precise match.";
+      dock.appendChild(miss);
     }
-    return null;
+    dock.style.display = "block";
   }
 
   function ensureChrome() {
@@ -257,36 +359,141 @@
       document.body.appendChild(btn);
     }
 
+    // Site "mouth": Thinking Orb — bottom center
     if (!$("lu-voice-orb-wrap")) {
       var wrap = document.createElement("div");
       wrap.id = "lu-voice-orb-wrap";
       wrap.style.cssText =
-        "position:fixed;right:20px;bottom:20px;z-index:99998;" +
+        "position:fixed;left:50%;bottom:max(16px, env(safe-area-inset-bottom));" +
+        "transform:translateX(-50%);z-index:99998;" +
         "display:flex;flex-direction:column;align-items:center;gap:6px;" +
         "pointer-events:none";
       var orbHost = document.createElement("div");
       orbHost.id = "lu-voice-orb";
       orbHost.style.cssText =
-        "width:56px;height:56px;border-radius:50%;" +
-        "background:radial-gradient(circle at 30% 30%,#5eead4,#1e1b4b);" +
-        "box-shadow:0 8px 24px rgba(0,0,0,.35);transition:box-shadow .25s,transform .2s";
+        "width:64px;height:64px;display:flex;align-items:center;justify-content:center;" +
+        "pointer-events:auto;cursor:default";
       var label = document.createElement("div");
       label.id = "lu-voice-orb-label";
       label.style.cssText =
-        "font:600 11px/1.2 system-ui,sans-serif;color:#e2e8f0;" +
-        "text-shadow:0 1px 3px rgba(0,0,0,.6);max-width:120px;text-align:center;" +
-        "opacity:0;transition:opacity .2s";
+        "font:600 11px/1.2 system-ui,sans-serif;color:#0f172a;" +
+        "background:rgba(255,255,255,.88);padding:2px 8px;border-radius:999px;" +
+        "max-width:160px;text-align:center;opacity:0;transition:opacity .2s;" +
+        "box-shadow:0 2px 8px rgba(0,0,0,.12)";
       wrap.appendChild(orbHost);
       wrap.appendChild(label);
       document.body.appendChild(wrap);
-      tryMountThinkingOrb("breathing");
+      loadThinkingOrbs().then(function () {
+        tryMountThinkingOrb(state.agentState || "breathing");
+      });
     }
   }
 
   var _orbReactRoot = null;
+  var _orbsLoading = null;
+
+  function loadScript(src) {
+    return new Promise(function (resolve, reject) {
+      var s = document.createElement("script");
+      s.src = src;
+      s.async = true;
+      s.onload = function () {
+        resolve();
+      };
+      s.onerror = function () {
+        reject(new Error(src));
+      };
+      document.head.appendChild(s);
+    });
+  }
+
+  function loadModule(src) {
+    return new Promise(function (resolve, reject) {
+      var s = document.createElement("script");
+      s.type = "module";
+      s.textContent =
+        'import * as M from "' +
+        src +
+        '"; window.__LU_ORB_MOD = M; window.dispatchEvent(new Event("lu-orb-mod"));';
+      var done = false;
+      function onEvt() {
+        if (done) return;
+        done = true;
+        window.removeEventListener("lu-orb-mod", onEvt);
+        resolve(window.__LU_ORB_MOD);
+      }
+      window.addEventListener("lu-orb-mod", onEvt);
+      s.onerror = function () {
+        if (done) return;
+        done = true;
+        reject(new Error("module " + src));
+      };
+      document.head.appendChild(s);
+      setTimeout(function () {
+        if (!done) {
+          done = true;
+          reject(new Error("module timeout"));
+        }
+      }, 12000);
+    });
+  }
+
+  function loadThinkingOrbs() {
+    if (window.ThinkingOrb && window.React && window.ReactDOM && window.ReactDOM.createRoot) {
+      return Promise.resolve();
+    }
+    if (_orbsLoading) return _orbsLoading;
+    _orbsLoading = new Promise(function (resolve) {
+      var s = document.createElement("script");
+      s.type = "module";
+      s.textContent = [
+        "import React from 'https://esm.sh/react@18.3.1';",
+        "import { createRoot } from 'https://esm.sh/react-dom@18.3.1/client';",
+        "import { ThinkingOrb } from 'https://esm.sh/thinking-orbs@0.3.2?deps=react@18.3.1';",
+        "window.React = React;",
+        "window.ReactDOM = { createRoot: createRoot };",
+        "window.ThinkingOrb = ThinkingOrb;",
+        "window.dispatchEvent(new Event('lu-orbs-ready'));",
+      ].join("\n");
+      var finished = false;
+      function finish() {
+        if (finished) return;
+        finished = true;
+        if (!window.ThinkingOrb) {
+          console.warn("[LU] thinking-orbs not on window after load");
+        } else {
+          console.info("[LU] thinking-orbs ready");
+        }
+        resolve();
+      }
+      window.addEventListener("lu-orbs-ready", finish, { once: true });
+      s.onerror = function () {
+        console.warn("[LU] thinking-orbs module script failed");
+        finish();
+      };
+      document.head.appendChild(s);
+      setTimeout(finish, 15000);
+    });
+    return _orbsLoading;
+  }
+
   function tryMountThinkingOrb(orbState) {
     var host = $("lu-voice-orb");
     if (!host) return;
+    var st = orbState === "idle" ? "breathing" : orbState || "breathing";
+    var allowed = {
+      working: 1,
+      searching: 1,
+      solving: 1,
+      listening: 1,
+      connecting: 1,
+      weaving: 1,
+      composing: 1,
+      breathing: 1,
+      shaping: 1,
+    };
+    if (!allowed[st]) st = "breathing";
+
     if (window.ThinkingOrb && window.React && window.ReactDOM) {
       try {
         if (!_orbReactRoot && window.ReactDOM.createRoot) {
@@ -295,41 +502,49 @@
         if (_orbReactRoot) {
           _orbReactRoot.render(
             window.React.createElement(window.ThinkingOrb, {
-              state: orbState === "idle" ? "breathing" : orbState,
-              size: 56,
+              state: st,
+              size: 64,
               theme: "auto",
             })
           );
           return;
         }
       } catch (e) {
-        console.info("[LU GenUI] ThinkingOrb mount failed, fallback CSS", e);
+        console.info("[LU] ThinkingOrb mount failed", e);
       }
     }
-    applyOrbCss(orbState);
+    applyOrbCss(st);
   }
 
   function applyOrbCss(mode) {
     var orb = $("lu-voice-orb");
     if (!orb) return;
+    orb.innerHTML = "";
+    orb.style.width = "64px";
+    orb.style.height = "64px";
+    orb.style.borderRadius = "50%";
+    orb.style.background =
+      "radial-gradient(circle at 35% 30%,#e2e8f0 0%,#64748b 45%,#0f172a 100%)";
     var shadows = {
-      connecting: "0 0 0 4px rgba(80,200,255,.45),0 8px 24px rgba(0,0,0,.35)",
-      searching: "0 0 0 5px rgba(96,165,250,.5),0 8px 24px rgba(0,0,0,.35)",
-      solving: "0 0 0 5px rgba(167,139,250,.5),0 8px 24px rgba(0,0,0,.35)",
-      composing: "0 0 0 5px rgba(251,191,36,.45),0 8px 24px rgba(0,0,0,.35)",
-      working: "0 0 0 4px rgba(52,211,153,.45),0 8px 24px rgba(0,0,0,.35)",
-      listening: "0 0 0 4px rgba(45,212,191,.5),0 8px 24px rgba(0,0,0,.35)",
-      live: "0 0 0 6px rgba(50,220,120,.45),0 8px 24px rgba(0,0,0,.35)",
-      breathing: "0 0 0 4px rgba(94,234,212,.35),0 8px 24px rgba(0,0,0,.35)",
-      error: "0 0 0 4px rgba(255,80,80,.5),0 8px 24px rgba(0,0,0,.35)",
-      idle: "0 8px 24px rgba(0,0,0,.35)",
+      connecting: "0 0 0 4px rgba(80,200,255,.45),0 8px 24px rgba(0,0,0,.2)",
+      searching: "0 0 0 5px rgba(96,165,250,.45),0 8px 24px rgba(0,0,0,.2)",
+      solving: "0 0 0 5px rgba(167,139,250,.45),0 8px 24px rgba(0,0,0,.2)",
+      composing: "0 0 0 5px rgba(251,191,36,.4),0 8px 24px rgba(0,0,0,.2)",
+      working: "0 0 0 4px rgba(52,211,153,.4),0 8px 24px rgba(0,0,0,.2)",
+      listening: "0 0 0 4px rgba(45,212,191,.45),0 8px 24px rgba(0,0,0,.2)",
+      weaving: "0 0 0 5px rgba(244,114,182,.4),0 8px 24px rgba(0,0,0,.2)",
+      breathing: "0 0 0 3px rgba(148,163,184,.35),0 8px 24px rgba(0,0,0,.15)",
+      error: "0 0 0 4px rgba(255,80,80,.5),0 8px 24px rgba(0,0,0,.2)",
+      idle: "0 8px 24px rgba(0,0,0,.15)",
     };
-    orb.style.boxShadow = shadows[mode] || shadows.idle;
+    orb.style.boxShadow = shadows[mode] || shadows.breathing;
   }
 
   function setAgentState(orbState, labelText) {
-    state.agentState = orbState || "idle";
-    tryMountThinkingOrb(state.agentState);
+    state.agentState = orbState || "breathing";
+    loadThinkingOrbs().then(function () {
+      tryMountThinkingOrb(state.agentState);
+    });
     var label = $("lu-voice-orb-label");
     if (label) {
       if (labelText) {
@@ -362,14 +577,26 @@
     var section = payload.section;
     var highlight = payload.highlight || payload.highlight_element;
     var prefill = payload.prefill || payload.prefill_data || {};
-    // Concept: morph Dynamic Viewport — never mechanical page scroll.
-    morphCanvasToSection(section, highlight, prefill);
-    if (payload.components && payload.components.length) {
-      try {
-        window.dispatchEvent(
-          new CustomEvent("lu:components", { detail: { components: payload.components } })
-        );
-      } catch (e) {}
+    if (!Object.keys(state.sectionMap || {}).length) scanPageSections();
+    focusSection(section, highlight);
+    if (prefill && typeof prefill === "object") {
+      Object.keys(prefill).forEach(function (key) {
+        var val = prefill[key];
+        if (val == null) return;
+        var root = findSection(section) || document;
+        var field =
+          root.querySelector('[name="' + key + '"]') ||
+          root.querySelector("#" + key) ||
+          root.querySelector('[data-field="' + key + '"]') ||
+          document.querySelector('[name="' + key + '"]');
+        if (field && "value" in field) {
+          field.value = String(val);
+          try {
+            field.dispatchEvent(new Event("input", { bubbles: true }));
+            field.dispatchEvent(new Event("change", { bubbles: true }));
+          } catch (e) {}
+        }
+      });
     }
   }
 
@@ -381,14 +608,8 @@
       return;
     }
     if (command === "scroll_to") {
-      // Canvas mode: bring target into stage focus without window scroll-jump
+      /* series: no page scroll — highlight only */
       flashHighlight(el, 2000);
-      var stageBody = $("lu-genui-stage-body");
-      if (stageBody && stageBody.contains(el)) {
-        try {
-          el.scrollIntoView({ behavior: "smooth", block: "nearest" });
-        } catch (e) {}
-      }
     } else if (command === "highlight") {
       flashHighlight(el, payload.duration_ms || 2000);
     } else if (command === "set_input_value") {
@@ -430,7 +651,8 @@
         else el.textContent = String(map[id]);
       }
     });
-    morphCanvasToSection("roi_calculator", null, null);
+    if (!Object.keys(state.sectionMap || {}).length) scanPageSections();
+    focusSection("roi_calculator", null);
   }
 
   function collectPageSummary(focus) {
@@ -1002,6 +1224,9 @@
 
   async function boot() {
     ensureChrome();
+    scanPageSections();
+    setTimeout(scanPageSections, 1500);
+    setTimeout(scanPageSections, 4000);
     var cfg = await loadConfig();
     console.info("[LU GenUI] boot", {
       key: widgetKey.slice(0, 8) + "…",
