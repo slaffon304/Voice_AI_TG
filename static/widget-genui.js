@@ -193,6 +193,15 @@
       var byId = document.getElementById(key) || document.getElementById("section-" + key);
       if (byId) map[key] = nearestSectionRoot(byId);
     });
+    if (!map.contacts && document.getElementById("contact")) {
+      map.contacts = nearestSectionRoot(document.getElementById("contact"));
+    }
+    if (!map.hero && document.getElementById("top")) {
+      map.hero = nearestSectionRoot(document.getElementById("top"));
+    }
+    if (!map.booking_widget && document.getElementById("contactForm")) {
+      map.booking_widget = nearestSectionRoot(document.getElementById("contactForm"));
+    }
 
     // Heuristic via headings
     var heads = document.querySelectorAll("h1,h2,h3,.t-title,.t-sectiontitle");
@@ -239,19 +248,40 @@
   function findSection(section) {
     if (!section) return null;
     var key = String(section).trim().toLowerCase();
-    if (state.sectionMap && state.sectionMap[key]) return state.sectionMap[key];
-    return (
-      document.querySelector('[data-lu-section="' + key + '"]') ||
-      document.querySelector('[data-section="' + key + '"]') ||
-      document.getElementById(key) ||
-      document.getElementById("section-" + key)
-    );
+    var aliases = {
+      contacts: ["contacts", "contact"],
+      contact: ["contact", "contacts"],
+      booking_widget: ["booking_widget", "booking", "contactForm", "contact"],
+      hero: ["hero", "top"],
+      roi_calculator: ["roi_calculator", "pricing"],
+    };
+    var keys = aliases[key] || [key];
+    var i, k, el;
+    for (i = 0; i < keys.length; i++) {
+      k = keys[i];
+      if (state.sectionMap && state.sectionMap[k]) return state.sectionMap[k];
+    }
+    for (i = 0; i < keys.length; i++) {
+      k = keys[i];
+      el =
+        document.querySelector('[data-lu-section="' + k + '"]') ||
+        document.querySelector('[data-section="' + k + '"]') ||
+        document.getElementById(k) ||
+        document.getElementById("section-" + k);
+      if (el) return el;
+    }
+    return null;
   }
 
   function focusSection(section, highlight) {
-    /* Series: no page scrolling. Pin attention near the orb ("mouth") or highlight in place. */
+    section = (section || "").trim();
+    if (!section) {
+      console.warn("[LU] navigate without section");
+      return null;
+    }
+    if (!Object.keys(state.sectionMap || {}).length) scanPageSections();
     var el = findSection(section);
-    document.documentElement.setAttribute("data-lu-active-section", section || "");
+    document.documentElement.setAttribute("data-lu-active-section", section);
 
     var target = null;
     if (highlight) {
@@ -259,79 +289,101 @@
         findTarget(null, highlight) ||
         (el &&
           (el.querySelector("#" + highlight) ||
-            el.querySelector('[data-id="' + highlight + '"]') ||
-            el.querySelector('[data-lu-id="' + highlight + '"]')));
+            el.querySelector('[data-id="' + highlight + '"]')));
     }
-    if (!target) target = el;
 
-    showSectionDock(section, el, target);
-
-    if (target) flashHighlight(target, 2800);
-    else if (el) flashHighlight(el, 1800);
+    showSectionStage(section, el, target || el);
 
     try {
       window.dispatchEvent(
         new CustomEvent("lu:navigate", {
-          detail: { section: section, highlight: highlight || null, mode: "series_dock" },
+          detail: { section: section, highlight: highlight || null, found: !!el },
         })
       );
     } catch (e) {}
     return el;
   }
 
-  function showSectionDock(section, sourceEl, highlightEl) {
-    var dock = $("lu-section-dock");
-    if (!dock) {
-      dock = document.createElement("div");
-      dock.id = "lu-section-dock";
-      dock.style.cssText =
-        "position:fixed;left:50%;bottom:96px;transform:translateX(-50%);" +
-        "z-index:99997;width:min(440px,calc(100vw - 24px));max-height:42vh;" +
-        "overflow:auto;border-radius:16px;padding:12px 14px;" +
-        "background:#fff;color:#0f172a;box-shadow:0 12px 40px rgba(0,0,0,.22);" +
-        "border:1px solid rgba(15,23,42,.08);display:none;font:14px/1.4 system-ui,sans-serif";
-      document.body.appendChild(dock);
+  /** Rebuild the working view around the matched page block (series). No page scroll. */
+  function showSectionStage(section, sourceEl, highlightEl) {
+    var stage = $("lu-section-stage");
+    if (!stage) {
+      stage = document.createElement("div");
+      stage.id = "lu-section-stage";
+      stage.style.cssText =
+        "position:fixed;inset:0;z-index:99990;display:none;flex-direction:column;" +
+        "background:rgba(6,8,12,.94);padding:max(12px,env(safe-area-inset-top)) 12px 100px;" +
+        "color:#f1f5f9;font:15px/1.45 system-ui,sans-serif";
+      var bar = document.createElement("div");
+      bar.style.cssText =
+        "display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:10px";
+      var title = document.createElement("div");
+      title.id = "lu-section-stage-title";
+      title.style.cssText = "font:700 14px/1.2 system-ui";
+      var close = document.createElement("button");
+      close.type = "button";
+      close.textContent = "✕";
+      close.style.cssText =
+        "border:0;background:rgba(255,255,255,.1);color:#fff;width:36px;height:36px;" +
+        "border-radius:10px;cursor:pointer;font-size:16px";
+      close.onclick = function () {
+        stage.style.display = "none";
+        document.documentElement.classList.remove("lu-stage-open");
+      };
+      bar.appendChild(title);
+      bar.appendChild(close);
+      var body = document.createElement("div");
+      body.id = "lu-section-stage-body";
+      body.style.cssText =
+        "flex:1;min-height:0;overflow:auto;border-radius:16px;background:#fff;color:#0f172a;" +
+        "padding:16px;box-shadow:0 8px 32px rgba(0,0,0,.35)";
+      stage.appendChild(bar);
+      stage.appendChild(body);
+      document.body.appendChild(stage);
     }
-    dock.innerHTML = "";
-    var head = document.createElement("div");
-    head.style.cssText =
-      "display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px";
-    var title = document.createElement("div");
-    title.style.cssText = "font:700 13px/1.2 system-ui";
-    title.textContent = String(section || "section").replace(/_/g, " ");
-    var close = document.createElement("button");
-    close.type = "button";
-    close.textContent = "✕";
-    close.style.cssText =
-      "border:0;background:#f1f5f9;width:28px;height:28px;border-radius:8px;cursor:pointer";
-    close.onclick = function () {
-      dock.style.display = "none";
-    };
-    head.appendChild(title);
-    head.appendChild(close);
-    dock.appendChild(head);
+
+    var titleEl = $("lu-section-stage-title");
+    var body = $("lu-section-stage-body");
+    if (titleEl) titleEl.textContent = String(section).replace(/_/g, " ");
+    if (body) body.innerHTML = "";
 
     if (sourceEl) {
       var clone = sourceEl.cloneNode(true);
+      clone.id = (clone.id || section) + "-lu-stage";
       clone.querySelectorAll("script").forEach(function (s) {
         s.remove();
       });
-      clone.style.maxHeight = "none";
-      clone.style.overflow = "visible";
-      var body = document.createElement("div");
-      body.style.cssText = "max-height:calc(42vh - 40px);overflow:auto";
-      body.appendChild(clone);
-      dock.appendChild(body);
+      clone.style.display = "block";
+      clone.style.visibility = "visible";
+      clone.style.opacity = "1";
+      clone.style.position = "static";
+      clone.style.maxWidth = "960px";
+      clone.style.margin = "0 auto";
+      if (body) body.appendChild(clone);
+      if (highlightEl && body) {
+        try {
+          flashHighlight(clone, 2500);
+        } catch (e) {}
+      }
+      console.info("[LU] stage show", section, "from", sourceEl.id || sourceEl.className);
     } else {
-      var miss = document.createElement("p");
-      miss.style.opacity = "0.7";
-      miss.textContent =
-        "Section not found on page. Add data-lu-section=\"" +
-        String(section || "") +
-        "\" for a precise match.";
-      dock.appendChild(miss);
+      if (body) {
+        var safe = String(section).replace(/</g, "");
+        body.innerHTML =
+          "<p style='margin:0 0 8px'><b>" +
+          safe +
+          "</b></p>" +
+          "<p style='opacity:.75;margin:0'>Block not found in page DOM. Add id=\"" +
+          safe +
+          "\" or data-lu-section=\"" +
+          safe +
+          "\" on the client site.</p>";
+      }
+      console.warn("[LU] stage miss", section, "map", Object.keys(state.sectionMap || {}));
     }
-    dock.style.display = "block";
+
+    stage.style.display = "flex";
+    document.documentElement.classList.add("lu-stage-open");
   }
 
   function ensureChrome() {
@@ -773,6 +825,36 @@
     }
   }
 
+  function unwrapRtvi(msg) {
+    /* Pipecat / RTVI often nests: {type, data:{command, payload}} or {data:{payload:{section}}} */
+    if (!msg || typeof msg !== "object") return { command: "", payload: {} };
+    var command =
+      msg.command ||
+      (msg.data && msg.data.command) ||
+      (msg.payload && msg.payload.command) ||
+      "";
+    var payload = {};
+    if (msg.payload && typeof msg.payload === "object" && !msg.payload.command) {
+      payload = msg.payload;
+    } else if (msg.data && msg.data.payload && typeof msg.data.payload === "object") {
+      payload = msg.data.payload;
+      if (!command) command = msg.data.command || "";
+    } else if (msg.data && typeof msg.data === "object") {
+      payload = msg.data;
+      if (!command) command = msg.data.command || msg.type || "";
+    } else {
+      payload = msg;
+    }
+    /* type field is sometimes the command name */
+    if (!command && msg.type && msg.type !== "ui-command" && msg.type !== "server-message") {
+      command = msg.type;
+    }
+    if (msg.type === "ui-command" || msg.type === "ui_command") {
+      command = command || (msg.data && msg.data.command) || "navigate_and_render";
+    }
+    return { command: String(command || ""), payload: payload || {} };
+  }
+
   function onDataMessage(ev) {
     var msg = null;
     try {
@@ -782,12 +864,10 @@
     }
     if (!msg) return;
 
-    var command =
-      msg.command ||
-      (msg.data && msg.data.command) ||
-      msg.type ||
-      (msg.payload && msg.payload.command);
-    var payload = msg.payload || msg.data || msg || {};
+    var u = unwrapRtvi(msg);
+    var command = u.command;
+    var payload = u.payload || {};
+    console.info("[LU] dc msg", command, payload);
 
     if (command === "navigate_and_render") {
       handleNavigateAndRender(payload);
@@ -812,7 +892,15 @@
     } else if (command === "session_ended" || command === "session_blocked") {
       stopSession(command);
     } else {
-      console.info("[LU GenUI] server msg", command, payload);
+      /* try nested once more if unknown */
+      if (msg.data && (msg.data.command || msg.data.payload)) {
+        var u2 = unwrapRtvi(msg.data);
+        if (u2.command === "navigate_and_render") handleNavigateAndRender(u2.payload);
+        else if (u2.command === "set_agent_state") setAgentState(u2.payload.state, u2.payload.label);
+        else console.info("[LU] server msg", command, payload);
+      } else {
+        console.info("[LU] server msg", command, payload);
+      }
     }
   }
 
