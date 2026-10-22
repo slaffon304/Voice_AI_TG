@@ -42,6 +42,7 @@ from pathlib import Path
 from pipecat.frames.frames import (
     CancelFrame,
     Frame,
+    InputTransportMessageFrame,
     LLMMessagesAppendFrame,
     LLMRunFrame,
     TranscriptionFrame,
@@ -147,6 +148,22 @@ def _get_ice_servers() -> list[str]:
         return [s.strip() for s in raw.split(",") if s.strip()]
     except Exception:
         return list(DEFAULT_ICE_SERVERS)
+
+
+class RTVIAdapterProcessor(FrameProcessor):
+    """Оборачивает входящие сообщения из WebRTC Data Channel в формат RTVI."""
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputTransportMessageFrame):
+            msg = frame.message
+            if isinstance(msg, dict) and msg.get("label") != "rtvi-ai":
+                frame.message = {
+                    "label": "rtvi-ai",
+                    "type": "client-message",
+                    "data": msg,
+                }
+        await self.push_frame(frame, direction)
 
 
 class WebAbuseProbe(FrameProcessor):
@@ -586,6 +603,19 @@ async def run_webrtc_session(
     user_catcher = WebUserAudioCatcher(mixer)
     ai_catcher = WebAIAudioCatcher(mixer)
 
+    vad_start = (os.getenv("WEBRTC_VAD_START_SENSITIVITY", "high") or "high").strip().lower()
+    vad_end = (os.getenv("WEBRTC_VAD_END_SENSITIVITY", "high") or "high").strip().lower()
+    start_sens = (
+        StartSensitivity.START_SENSITIVITY_HIGH
+        if vad_start == "high" and StartSensitivity is not None
+        else (StartSensitivity.START_SENSITIVITY_LOW if StartSensitivity is not None else "START_SENSITIVITY_HIGH")
+    )
+    end_sens = (
+        EndSensitivity.END_SENSITIVITY_HIGH
+        if vad_end == "high" and EndSensitivity is not None
+        else (EndSensitivity.END_SENSITIVITY_LOW if EndSensitivity is not None else "END_SENSITIVITY_HIGH")
+    )
+
     llm = GeminiLiveLLMService(
         api_key=GEMINI_API_KEY,
         tools=tools,
@@ -594,20 +624,13 @@ async def run_webrtc_session(
             voice=resolve_voice_name(persona.voice_model),
             system_instruction=system_prompt,
             vad=GeminiVADParams(
-                start_sensitivity=(
-                    StartSensitivity.START_SENSITIVITY_LOW
-                    if StartSensitivity is not None
-                    else "START_SENSITIVITY_LOW"
-                ),
-                end_sensitivity=(
-                    EndSensitivity.END_SENSITIVITY_LOW
-                    if EndSensitivity is not None
-                    else "END_SENSITIVITY_LOW"
-                ),
+                start_sensitivity=start_sens,
+                end_sensitivity=end_sens,
             ),
         ),
     )
 
+    rtvi_adapter = RTVIAdapterProcessor()
     rtvi = RTVIProcessor()
     rtvi_observer = RTVIObserver(
         rtvi,
@@ -1074,9 +1097,12 @@ async def run_webrtc_session(
     async def on_client_message(rtvi_proc, msg):
         nonlocal learned_phone, audit_pending_focus, phone_verified_session, abuse_stage
         msg_type = getattr(msg, "type", None) or (msg.get("type") if isinstance(msg, dict) else None)
+        data = getattr(msg, "data", None) or (msg.get("data") if isinstance(msg, dict) else {}) or {}
+        if isinstance(data, dict) and "type" in data:
+            msg_type = data.get("type")
+            data = data.get("data") or {}
         if msg_type != "ui_user_interaction":
             return
-        data = getattr(msg, "data", None) or (msg.get("data") if isinstance(msg, dict) else {}) or {}
 
         interaction = str(data.get("interaction") or data.get("event") or "click").lower()
         element_id = str(data.get("element_id") or data.get("element") or "").strip()
@@ -1247,6 +1273,7 @@ async def run_webrtc_session(
 
     pipeline = Pipeline([
         transport.input(),
+        rtvi_adapter,
         rtvi,
         user_catcher,
         context_aggregator.user(),
@@ -1273,19 +1300,41 @@ async def run_webrtc_session(
         with contextlib.suppress(Exception):
             await task.queue_frames([CancelFrame()])
 
+    greeting_done = False
+
+    async def _trigger_greeting(trigger_source: str) -> None:
+        nonlocal greeting_done
+        if greeting_done:
+            return
+        greeting_done = True
+        clog.info("[%s] Triggering initial greeting (bot speaks first) via %s", call_id, trigger_source)
+        await asyncio.sleep(0.3)
+        if task is not None and not task.has_finished:
+            with contextlib.suppress(Exception):
+                await rtvi.set_bot_ready()
+            greeting_text = (
+                f"SYSTEM: Client just opened voice on the website. Speak first! "
+                f"Greet briefly in {call_lang} according to your persona and ask how you can help."
+            )
+            context.add_message({"role": "user", "content": greeting_text})
+            await task.queue_frames([
+                LLMMessagesAppendFrame(messages=[{
+                    "role": "user",
+                    "content": greeting_text,
+                }]),
+                LLMRunFrame(),
+            ])
+
     @rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi_proc):
-        await rtvi_proc.set_bot_ready()
-        await task.queue_frames([
-            LLMMessagesAppendFrame(messages=[{
-                "role": "user",
-                "content": (
-                    "SYSTEM: Client just connected to the website. "
-                    "Greet briefly and ask how you can help."
-                ),
-            }]),
-            LLMRunFrame(),
-        ])
+        await _trigger_greeting("on_client_ready")
+
+    async def _auto_greet() -> None:
+        try:
+            await asyncio.sleep(0.5)
+            await _trigger_greeting("auto_start")
+        except asyncio.CancelledError:
+            pass
 
 
     async def _session_soft_warn() -> None:
@@ -1359,6 +1408,7 @@ async def run_webrtc_session(
         except Exception as exc:
             clog.warning("[%s] abuse watchdog error: %s", call_id, exc)
 
+    greet_handle = asyncio.create_task(_auto_greet())
     warn_handle = asyncio.create_task(_session_soft_warn())
     deadline_handle = asyncio.create_task(_session_deadline())
     abuse_watch_handle = asyncio.create_task(_abuse_watchdog())
@@ -1373,6 +1423,8 @@ async def run_webrtc_session(
         duration = int(max(0.0, time.time() - start_ts))
         clog.info("[%s] WebRTC session ended, %ss", call_id, duration)
 
+        with contextlib.suppress(Exception):
+            greet_handle.cancel()
         with contextlib.suppress(Exception):
             deadline_handle.cancel()
         with contextlib.suppress(Exception):
