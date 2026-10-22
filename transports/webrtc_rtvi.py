@@ -59,6 +59,12 @@ from pipecat.processors.frameworks.rtvi import (
     RTVIUISnapshotFrame,
 )
 from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService, GeminiVADParams
+
+try:
+    from google.genai.types import EndSensitivity, StartSensitivity
+except Exception:  # pragma: no cover
+    StartSensitivity = None  # type: ignore
+    EndSensitivity = None  # type: ignore
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.transports.base_transport import TransportParams
@@ -565,8 +571,16 @@ async def run_webrtc_session(
             voice=resolve_voice_name(persona.voice_model),
             system_instruction=system_prompt,
             vad=GeminiVADParams(
-                start_sensitivity="low",
-                end_sensitivity="low",
+                start_sensitivity=(
+                    StartSensitivity.START_SENSITIVITY_LOW
+                    if StartSensitivity is not None
+                    else "START_SENSITIVITY_LOW"
+                ),
+                end_sensitivity=(
+                    EndSensitivity.END_SENSITIVITY_LOW
+                    if EndSensitivity is not None
+                    else "END_SENSITIVITY_LOW"
+                ),
             ),
         ),
     )
@@ -584,7 +598,7 @@ async def run_webrtc_session(
                 "dom_action": RTVIFunctionCallReportLevel.FULL,
                 "set_agent_state": RTVIFunctionCallReportLevel.FULL,
                 "flag_session_abuse": RTVIFunctionCallReportLevel.FULL,
-                "Booking_tool": RTVIFunctionCallReportLevel.ARGUMENTS,
+                "Booking_tool": RTVIFunctionCallReportLevel.FULL,
             }
         ),
     )
