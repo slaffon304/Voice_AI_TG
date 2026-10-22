@@ -1,0 +1,22 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Caches
+.cache/
+*.pyc
+
+# AI Studio runtime and attachments
+public/
+package.json
+node_modules/
+.dev.*
+.aistudio/
+
+# Environments
+.env
+.venv/
+env/
+venv/
