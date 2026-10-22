@@ -163,6 +163,7 @@ class RTVIAdapterProcessor(FrameProcessor):
             msg = frame.message
             if isinstance(msg, dict) and msg.get("label") != "rtvi-ai":
                 frame.message = {
+                    "id": str(uuid.uuid4()),
                     "label": "rtvi-ai",
                     "type": "client-message",
                     "data": msg,
@@ -1315,13 +1316,22 @@ async def run_webrtc_session(
         with contextlib.suppress(Exception):
             await rtvi_proc.set_bot_ready()
 
-    # Стартовое приветствие (Сайт говорит первым) — строго по архитектуре main.py:
+    # Стартовое приветствие (Сайт говорит первым) с WOW-эффектом:
     # Сообщение добавляется в контекст ДО запуска runner, и в очередь кладется LLMRunFrame.
-    # При старте пайплайна context_aggregator передает контекст в Gemini Live, и модель говорит первой.
-    greeting_text = (
-        f"SYSTEM EVENT: Client just connected to the website voice agent. Speak first! "
-        f"Greet briefly in {call_lang} according to your persona and ask how you can help."
-    )
+    if call_lang == "ro":
+        greeting_text = (
+            "SYSTEM EVENT: Client just connected to the website voice agent. Speak first! "
+            "WOW-EFFECT START: Salută scurt și cu energie (maxim 2 fraze scurte). "
+            "Explică-i că nu trebuie să citească site-ul, pentru că îl controlezi în timp real chiar pe ecranul lui. "
+            "Întreabă-l direct ce afacere are și ce provocare vrea să automatizeze."
+        )
+    else:
+        greeting_text = (
+            "SYSTEM EVENT: Client just connected to the website voice agent. Speak first! "
+            "WOW-EFFECT START: Поздоровайся энергично и уверенно (максимум 2 коротких предложения). "
+            "Объясни, что посетителю не нужно читать сайт — ты управляешь им в реальном времени прямо на его экране. "
+            "Спроси, какой у него бизнес и какую задачу он хочет автоматизировать прямо сейчас."
+        )
     context.add_message({"role": "user", "content": greeting_text})
     await task.queue_frames([LLMRunFrame()])
 
@@ -1518,8 +1528,18 @@ async def webrtc_offer(request: Request):
     key = str(body.get("key") or body.get("widget_key") or "").strip()
     visitor_id = str(body.get("visitor_id") or "").strip()
     project_id = str(body.get("project_id") or "").strip()
-    turnstile_token = str(body.get("turnstile_token") or body.get("t") or body.get("cf-turnstile-response") or "").strip()
-    browser_lang = str(body.get("lang") or body.get("language") or body.get("locale") or "").strip()
+    raw_lang = str(body.get("lang") or body.get("language") or body.get("locale") or "").strip()
+    accept_lang = request.headers.get("accept-language") or ""
+    device_lang = ""
+    if accept_lang:
+        primary = accept_lang.split(",")[0].split(";")[0].strip()
+        if "-" in primary:
+            device_lang = primary.split("-")[0].lower()
+        elif "_" in primary:
+            device_lang = primary.split("_")[0].lower()
+        else:
+            device_lang = primary.lower()[:8]
+    browser_lang = device_lang or raw_lang
     landing_url = str(body.get("landing_url") or body.get("url") or body.get("page_url") or "").strip()[:500]
     referrer = str(body.get("referrer") or body.get("ref") or "").strip()[:500]
 
