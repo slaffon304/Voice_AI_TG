@@ -603,7 +603,7 @@
         var timer = setTimeout(function () {
           console.warn("[LU GenUI] turnstile timeout — continue without token");
           finish("");
-        }, 2500);
+        }, 8000);
         try {
           var host = document.createElement("div");
           host.style.cssText =
@@ -837,7 +837,24 @@
     if (!state.voiceEnabled) return;
 
     if (state.turnstileSiteKey) {
-      loadTurnstile().catch(function () {});
+      loadTurnstile()
+        .then(function () {
+          // Pre-warm invisible widget so token is faster on first tap
+          try {
+            if (!document.getElementById("lu-ts-prewarm")) {
+              var host = document.createElement("div");
+              host.id = "lu-ts-prewarm";
+              host.style.cssText =
+                "position:fixed;left:-9999px;width:1px;height:1px;overflow:hidden";
+              document.body.appendChild(host);
+              window.turnstile.render(host, {
+                sitekey: state.turnstileSiteKey,
+                size: "invisible",
+              });
+            }
+          } catch (e) {}
+        })
+        .catch(function () {});
     }
 
     setupDwellObservers();
