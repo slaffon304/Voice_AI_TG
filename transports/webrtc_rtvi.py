@@ -51,7 +51,11 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.turns.user_turn_strategies import ExternalUserTurnStrategies
 from pipecat.processors.frameworks.rtvi import (
     RTVIFunctionCallReportLevel,
     RTVIObserver,
@@ -650,7 +654,13 @@ async def run_webrtc_session(
     )
 
     context = LLMContext(messages=[])
-    context_aggregator = LLMContextAggregatorPair(context)
+    context_aggregator = LLMContextAggregatorPair(
+        context=context,
+        realtime_service_mode=True,
+        user_params=LLMUserAggregatorParams(
+            user_turn_strategies=ExternalUserTurnStrategies()
+        ),
+    )
     task: Optional[PipelineTask] = None
 
     # ----- Tool handlers -----
@@ -1300,54 +1310,20 @@ async def run_webrtc_session(
         with contextlib.suppress(Exception):
             await task.queue_frames([CancelFrame()])
 
-    greeting_done = False
-
-    async def _trigger_greeting(trigger_source: str) -> None:
-        nonlocal greeting_done
-        if greeting_done:
-            return
-        greeting_done = True
-        clog.info("[%s] Triggering initial greeting (bot speaks first) via %s", call_id, trigger_source)
-        if task is not None and not task.has_finished:
-            with contextlib.suppress(Exception):
-                await rtvi.set_bot_ready()
-            greeting_text = (
-                f"SYSTEM: Client just opened voice on the website. Speak first! "
-                f"Greet briefly in {call_lang} according to your persona and ask how you can help."
-            )
-            context.add_message({"role": "user", "content": greeting_text})
-            await task.queue_frames([
-                LLMMessagesAppendFrame(messages=[{
-                    "role": "user",
-                    "content": greeting_text,
-                }]),
-                LLMRunFrame(),
-            ])
-
-    @task.event_handler("on_pipeline_started")
-    async def on_pipeline_started(task_obj, frame):
-        clog.info("[%s] pipeline started & active — kicking off initial greeting", call_id)
-        # Small delay for client audio transceiver to be active
-        await asyncio.sleep(0.3)
-        await _trigger_greeting("on_pipeline_started")
-
     @rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi_proc):
-        await _trigger_greeting("on_client_ready")
+        with contextlib.suppress(Exception):
+            await rtvi_proc.set_bot_ready()
 
-    async def _auto_greet() -> None:
-        """Fallback watchdog: ensures bot speaks first even if on_pipeline_started was missed."""
-        try:
-            for _ in range(10):
-                await asyncio.sleep(0.5)
-                if greeting_done:
-                    return
-                if getattr(llm, "_session", None) is not None:
-                    await _trigger_greeting("fallback_watchdog")
-                    return
-            await _trigger_greeting("fallback_timeout")
-        except asyncio.CancelledError:
-            pass
+    # Стартовое приветствие (Сайт говорит первым) — строго по архитектуре main.py:
+    # Сообщение добавляется в контекст ДО запуска runner, и в очередь кладется LLMRunFrame.
+    # При старте пайплайна context_aggregator передает контекст в Gemini Live, и модель говорит первой.
+    greeting_text = (
+        f"SYSTEM EVENT: Client just connected to the website voice agent. Speak first! "
+        f"Greet briefly in {call_lang} according to your persona and ask how you can help."
+    )
+    context.add_message({"role": "user", "content": greeting_text})
+    await task.queue_frames([LLMRunFrame()])
 
 
     async def _session_soft_warn() -> None:
@@ -1424,7 +1400,6 @@ async def run_webrtc_session(
         except Exception as exc:
             clog.warning("[%s] abuse watchdog error: %s", call_id, exc)
 
-    greet_handle = asyncio.create_task(_auto_greet())
     warn_handle = asyncio.create_task(_session_soft_warn())
     deadline_handle = asyncio.create_task(_session_deadline())
     abuse_watch_handle = asyncio.create_task(_abuse_watchdog())
@@ -1439,8 +1414,6 @@ async def run_webrtc_session(
         duration = int(max(0.0, time.time() - start_ts))
         clog.info("[%s] WebRTC session ended, %ss", call_id, duration)
 
-        with contextlib.suppress(Exception):
-            greet_handle.cancel()
         with contextlib.suppress(Exception):
             deadline_handle.cancel()
         with contextlib.suppress(Exception):
