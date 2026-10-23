@@ -1527,7 +1527,12 @@ async def webrtc_offer(request: Request):
     browser_lang = device_lang or raw_lang
     landing_url = str(body.get("landing_url") or body.get("url") or body.get("page_url") or "").strip()[:500]
     referrer = str(body.get("referrer") or body.get("ref") or "").strip()[:500]
-
+    turnstile_token = str(
+        body.get("turnstile_token")
+        or body.get("t")
+        or body.get("cf-turnstile-response")
+        or ""
+    ).strip()
     if not offer_sdp or not key:
         return JSONResponse({"error": "sdp and key required"}, status_code=400, headers=_cors_headers(request))
 
