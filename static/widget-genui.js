@@ -280,46 +280,54 @@
   }
 
   // —— 1. Host Theme Extraction ——
+  function _rgbLum(rgb) {
+    try {
+      var m = String(rgb || "").match(/(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
+      if (!m) return 0.5;
+      var r = +m[1] / 255, g = +m[2] / 255, b = +m[3] / 255;
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    } catch (e) {
+      return 0.5;
+    }
+  }
+
   function extractHostTheme() {
     try {
       var bodyStyle = window.getComputedStyle(document.body);
       if (bodyStyle && bodyStyle.fontFamily) {
         state.theme.fontSans = bodyStyle.fontFamily;
       }
-      if (bodyStyle && bodyStyle.color) {
-        state.theme.text = bodyStyle.color;
-      }
-      var h1 = qs("h1, h2");
-      if (h1) {
-        var h1Style = window.getComputedStyle(h1);
-        if (h1Style && h1Style.fontFamily) {
-          state.theme.fontDisplay = h1Style.fontFamily;
-        }
-        if (h1Style && h1Style.color) {
-          state.theme.heading = h1Style.color;
-        }
-      }
-      /* Sample a real surface from the page (hero/card) — never invent a palette */
-      var sample =
-        qs("section.hero, .hero, main, .service-card, .pricing-card, section") ||
+      /* Prefer readable body/section text — not hero H1 (often white on gradient) */
+      var textSrc =
+        qs("#services p, #pricing p, section.section-pad p, main p") ||
         document.body;
-      var ss = window.getComputedStyle(sample);
-      if (ss) {
-        if (ss.backgroundColor && ss.backgroundColor !== "rgba(0, 0, 0, 0)" && ss.backgroundColor !== "transparent") {
-          state.theme.surface = ss.backgroundColor;
-        }
-        if (ss.color) state.theme.text = state.theme.text || ss.color;
+      var ts = window.getComputedStyle(textSrc);
+      if (ts && ts.color) state.theme.text = ts.color;
+      var headSrc = qs("#services h2, #pricing h2, section.section-pad h2, h2") || qs("h1");
+      if (headSrc) {
+        var hs = window.getComputedStyle(headSrc);
+        if (hs.fontFamily) state.theme.fontDisplay = hs.fontFamily;
+        if (hs.color) state.theme.heading = hs.color;
       }
-      var cta = qs(
-        "a.pill, a.btn, a.button, button[type='submit'], [class*='cta']"
-      );
+      if (!state.theme.heading) state.theme.heading = state.theme.text;
+      var surfaceSrc = qs("#services, section.section-pad, main") || document.body;
+      var ss = window.getComputedStyle(surfaceSrc);
+      if (ss && ss.backgroundColor && ss.backgroundColor !== "rgba(0, 0, 0, 0)" && ss.backgroundColor !== "transparent") {
+        state.theme.surface = ss.backgroundColor;
+      }
+      /* If text still too light (hero leak), force readable dark/light by luminance */
+      var lum = _rgbLum(state.theme.text);
+      if (lum > 0.72) {
+        state.theme.text = "rgb(15, 23, 42)";
+        state.theme.heading = "rgb(15, 23, 42)";
+      } else if (lum < 0.18 && _rgbLum(state.theme.surface || "rgb(255,255,255)") > 0.7) {
+        state.theme.text = "rgb(15, 23, 42)";
+        state.theme.heading = "rgb(15, 23, 42)";
+      }
+      var cta = qs("a.pill, a.btn, a.button, button[type='submit'], [class*='cta']");
       if (cta) {
         var bg = window.getComputedStyle(cta).backgroundColor;
-        if (
-          bg &&
-          bg !== "rgba(0, 0, 0, 0)" &&
-          bg !== "transparent"
-        ) {
+        if (bg && bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent") {
           state.theme.accent = bg;
         }
       }
@@ -816,7 +824,7 @@
       ":host { all: initial; }",
       ".lu-backdrop {",
       "  position: fixed; inset: 0; z-index: 99990;",
-      "  background: transparent;",
+      "  background: color-mix(in srgb, " + (state.theme.surface || "rgb(255,255,255)") + " 88%, transparent);",
       "  display: none; flex-direction: column;",
       "  box-sizing: border-box;",
       "  font-family: " + font + ";",
