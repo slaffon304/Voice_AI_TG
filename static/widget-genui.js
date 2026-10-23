@@ -123,6 +123,29 @@
       selectItem: "Обсудить этот вариант",
       recommended: "Рекомендуем под вашу задачу",
       checkTitle: "Проверка безопасности",
+      verifyText: "Из-за недобросовестных посетителей мы подтверждаем номер. Это займёт несколько секунд.",
+      verifyPhoneLabel: "Ваш номер телефона",
+      verifyGetCode: "Получить код по SMS",
+      verifyCodeLabel: "Код из SMS",
+      verifyConfirm: "Подтвердить",
+      verifyChange: "Изменить номер",
+      verifyResend: "Отправить код ещё раз",
+      vs_code_sent: "Код отправлен на {phone}",
+      vs_bad_phone: "Нужен молдавский номер: +373 …",
+      vs_bad_code: "Неверный код. Осталось попыток: {n}",
+      vs_expired: "Код устарел — запросите новый",
+      vs_limit: "Лимит SMS на сегодня исчерпан",
+      vs_sms_failed: "SMS не отправилось, попробуйте ещё раз",
+      vs_wait: "Повторно можно через {sec} с",
+      vs_verified: "Номер подтверждён",
+      bookCheckTitle: "Проверьте запись",
+      bookCheckSub: "Если всё верно — подтвердите на экране или скажите «да».",
+      bookPhoneRo: "Телефон",
+      bookTime: "Дата и время",
+      bookNote: "Задача",
+      bookAskTime: "Назовите голосом удобные день и время — я проверю календарь.",
+      bookConfirmBtn: "Подтвердить запись",
+      bookConfirmed: "Отправлено, подтверждаю запись…",
       cancel: "Отмена",
     },
     ro: {
@@ -167,6 +190,29 @@
       selectItem: "Discută această opțiune",
       recommended: "Recomandat pentru dvs.",
       checkTitle: "Verificare",
+      verifyText: "Din cauza vizitatorilor rău intenționați confirmăm numărul. Durează câteva secunde.",
+      verifyPhoneLabel: "Numărul dvs. de telefon",
+      verifyGetCode: "Primește codul prin SMS",
+      verifyCodeLabel: "Codul din SMS",
+      verifyConfirm: "Confirmă",
+      verifyChange: "Schimbă numărul",
+      verifyResend: "Retrimite codul",
+      vs_code_sent: "Codul a fost trimis la {phone}",
+      vs_bad_phone: "Este nevoie de un număr din Moldova: +373 …",
+      vs_bad_code: "Cod greșit. Încercări rămase: {n}",
+      vs_expired: "Codul a expirat — cereți unul nou",
+      vs_limit: "Limita de SMS pentru azi a fost atinsă",
+      vs_sms_failed: "SMS-ul nu a plecat, încercați din nou",
+      vs_wait: "Puteți retrimite peste {sec} s",
+      vs_verified: "Număr confirmat",
+      bookCheckTitle: "Verificați programarea",
+      bookCheckSub: "Dacă totul este corect — confirmați pe ecran sau spuneți «da».",
+      bookPhoneRo: "Telefon",
+      bookTime: "Data și ora",
+      bookNote: "Detalii",
+      bookAskTime: "Spuneți cu voce ziua și ora dorite — verific calendarul.",
+      bookConfirmBtn: "Confirmă programarea",
+      bookConfirmed: "Trimis, confirm programarea…",
       cancel: "Anulează",
     },
     en: {
@@ -211,6 +257,29 @@
       selectItem: "Select this option",
       recommended: "Recommended for you",
       checkTitle: "Check",
+      verifyText: "Because of bad-faith visitors we confirm the phone number. It takes a few seconds.",
+      verifyPhoneLabel: "Your phone number",
+      verifyGetCode: "Get SMS code",
+      verifyCodeLabel: "Code from SMS",
+      verifyConfirm: "Confirm",
+      verifyChange: "Change number",
+      verifyResend: "Send the code again",
+      vs_code_sent: "Code sent to {phone}",
+      vs_bad_phone: "A Moldovan number is required: +373 …",
+      vs_bad_code: "Wrong code. Attempts left: {n}",
+      vs_expired: "The code expired — request a new one",
+      vs_limit: "SMS limit for today reached",
+      vs_sms_failed: "SMS was not sent, please try again",
+      vs_wait: "You can resend in {sec}s",
+      vs_verified: "Number confirmed",
+      bookCheckTitle: "Check your booking",
+      bookCheckSub: "If everything is right — confirm on screen or say “yes”.",
+      bookPhoneRo: "Phone",
+      bookTime: "Date and time",
+      bookNote: "Details",
+      bookAskTime: "Say the day and time that suit you — I will check the calendar.",
+      bookConfirmBtn: "Confirm booking",
+      bookConfirmed: "Sent, confirming your booking…",
       cancel: "Cancel",
     },
   };
@@ -861,6 +930,13 @@
         "font:650 15px/1 " + font + ";cursor:pointer;background:" + ink + ";color:#fff}",
         "#lu-ws-backdrop .lu-sub{color:" + muted + ";margin:0 0 12px;font-size:15px;line-height:1.5}",
         "#lu-ws-backdrop .lu-title{margin:0 0 8px;font:500 1.4rem/1.15 " + font + ";letter-spacing:-.03em}",
+        "#lu-ws-backdrop .lu-field{display:flex;flex-direction:column;gap:6px}",
+        "#lu-ws-backdrop .lu-field label{font:600 13px/1.2 " + font + ";color:" + muted + "}",
+        "#lu-ws-backdrop .lu-book-row{display:flex;justify-content:space-between;gap:12px;padding:14px 16px;",
+        "border:1px solid " + line + ";border-radius:16px;background:#fff;font:500 15px/1.4 " + font + "}",
+        "#lu-ws-backdrop .lu-book-row span{color:" + muted + "}",
+        "#lu-ws-backdrop .lu-book-row strong{text-align:right}",
+        "#lu-ws-backdrop .lu-primary:disabled{opacity:.5;cursor:default}",
       ].join("");
       document.head.appendChild(style);
     }
@@ -1129,59 +1205,81 @@
     );
   }
 
+  function formatPhone(raw) {
+    var d = String(raw || "").replace(/\D/g, "");
+    if (d.length === 11 && d.indexOf("373") === 0) {
+      return "+373 " + d.slice(3, 5) + " " + d.slice(5, 8) + " " + d.slice(8);
+    }
+    return raw ? String(raw) : "";
+  }
+
+  function formatSlot(iso) {
+    if (!iso) return "";
+    try {
+      var dte = new Date(iso);
+      if (isNaN(dte.getTime())) return String(iso);
+      var loc = pageLocale();
+      var tag = loc === "ro" ? "ro-RO" : loc === "ru" ? "ru-RU" : "en-GB";
+      return dte.toLocaleString(tag, {
+        weekday: "long",
+        day: "numeric",
+        month: "long",
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    } catch (e) {
+      return String(iso);
+    }
+  }
+
+  /* Booking card: name, verified phone, slot chosen by voice. Visitor confirms on screen or says "yes". */
   function renderBookingHtml(prefill) {
     prefill = prefill || {};
     var nameVal = prefill.client_name || prefill.name || "";
-    var phoneVal = prefill.phone || prefill.client_phone || "";
-    var slotVal =
-      prefill.start_time ||
-      prefill.slot ||
-      prefill.request_summary ||
-      "";
+    var phoneVal = formatPhone(prefill.phone || prefill.client_phone || "");
+    var startVal = prefill.start_time || "";
+    var noteVal = prefill.request_summary || "";
+    var slotText = formatSlot(startVal);
     return (
       "<div>" +
-      "<p class='lu-kicker'>" +
-      escapeHtml(t("bookKicker")) +
-      "</p>" +
       "<h2 class='lu-title'>" +
-      escapeHtml(t("bookTitle")) +
+      escapeHtml(t("bookCheckTitle")) +
       "</h2>" +
       "<p class='lu-sub'>" +
-      escapeHtml(t("bookSub")) +
+      escapeHtml(startVal ? t("bookCheckSub") : t("bookAskTime")) +
       "</p>" +
       "<form class='lu-form' id='lu-ws-book-form'>" +
       "  <div class='lu-field'>" +
-      "    <label>" +
+      "    <label for='lu-book-name'>" +
       escapeHtml(t("bookName")) +
       "</label>" +
-      "    <input type='text' name='client_name' id='lu-book-name' placeholder='" +
+      "    <input type='text' name='client_name' id='lu-book-name' autocomplete='name' placeholder='" +
       escapeHtml(t("bookNamePh")) +
       "' value='" +
       escapeHtml(nameVal) +
       "'/>" +
       "  </div>" +
-      "  <div class='lu-field'>" +
-      "    <label>" +
-      escapeHtml(t("bookPhone")) +
-      "</label>" +
-      "    <input type='tel' name='phone' id='lu-book-phone' required placeholder='" +
-      escapeHtml(t("bookPhonePh")) +
-      "' value='" +
-      escapeHtml(phoneVal) +
-      "'/>" +
-      "  </div>" +
-      "  <div class='lu-field'>" +
-      "    <label>" +
-      escapeHtml(t("bookSlot")) +
-      "</label>" +
-      "    <input type='text' name='request_summary' id='lu-book-slot' placeholder='" +
-      escapeHtml(t("bookSlotPh")) +
-      "' value='" +
-      escapeHtml(slotVal) +
-      "'/>" +
-      "  </div>" +
-      "  <button type='submit' class='lu-cta-btn' id='lu-book-submit'>" +
-      escapeHtml(t("bookSubmit")) +
+      "  <div class='lu-book-row'><span>" +
+      escapeHtml(t("bookPhoneRo")) +
+      "</span><strong id='lu-book-phone-ro'>" +
+      escapeHtml(phoneVal || "—") +
+      "</strong></div>" +
+      "  <div class='lu-book-row'><span>" +
+      escapeHtml(t("bookTime")) +
+      "</span><strong id='lu-book-time'>" +
+      escapeHtml(slotText || "—") +
+      "</strong></div>" +
+      (noteVal
+        ? "  <div class='lu-book-row'><span>" +
+          escapeHtml(t("bookNote")) +
+          "</span><strong>" +
+          escapeHtml(noteVal) +
+          "</strong></div>"
+        : "") +
+      "  <button type='submit' class='lu-primary' id='lu-book-submit'" +
+      (startVal && phoneVal ? "" : " disabled") +
+      ">" +
+      escapeHtml(t("bookConfirmBtn")) +
       "</button>" +
       "</form>" +
       "</div>"
@@ -1313,41 +1411,27 @@
 
     if (sectionKey === "booking_widget") {
       var form = _wsRoot.getElementById("lu-ws-book-form");
-      var phoneInput = _wsRoot.getElementById("lu-book-phone");
-      if (phoneInput) {
-        setTimeout(function () {
-          try {
-            phoneInput.focus();
-          } catch (e) {}
-        }, 120);
-      }
       if (form) {
         form.addEventListener("submit", function (ev) {
           ev.preventDefault();
+          var pf = state.activePrefill || {};
+          if (!pf.start_time) return;
           var nameVal = (_wsRoot.getElementById("lu-book-name").value || "").trim();
-          var phoneVal = (_wsRoot.getElementById("lu-book-phone").value || "").trim();
-          var slotVal = (_wsRoot.getElementById("lu-book-slot").value || "").trim();
-          if (!phoneVal || phoneVal.replace(/\D/g, "").length < 8) {
-            phoneInput.style.outline = "2px solid #f87171";
-            return;
-          }
           var btn = _wsRoot.getElementById("lu-book-submit");
           if (btn) {
             btn.disabled = true;
-            btn.textContent = t("bookSent");
+            btn.textContent = t("bookConfirmed");
           }
+          state.activePrefill.client_name = nameVal;
           sendClientMessage({
             type: "ui_user_interaction",
             data: {
-              interaction: "phone_verified",
-              phone: phoneVal,
+              interaction: "booking_confirmed",
               client_name: nameVal,
-              request_summary: slotVal,
-              description:
-                "Visitor submitted booking form on screen: phone=" +
-                phoneVal +
-                (nameVal ? ", name=" + nameVal : "") +
-                (slotVal ? ", note=" + slotVal : ""),
+              start_time: pf.start_time || "",
+              end_time: pf.end_time || "",
+              request_summary: pf.request_summary || "",
+              description: "Visitor confirmed the booking card on screen",
             },
           });
         });
@@ -1782,6 +1866,69 @@
     });
   }
 
+  /* SMS phone verification: number via phone autofill, code via SMS autofill. Server decides. */
+  var _otpAbort = null;
+
+  function closeVerifyModal() {
+    try {
+      if (_otpAbort) _otpAbort.abort();
+    } catch (e) {}
+    _otpAbort = null;
+    var m = $("lu-verify-modal");
+    if (m) m.remove();
+  }
+
+  function verifyStatus(text, isError) {
+    var el = $("lu-verify-status");
+    if (!el) return;
+    el.textContent = text || "";
+    el.style.color = isError ? "#fca5a5" : "#86efac";
+  }
+
+  function verifyStage(stage) {
+    var ph = $("lu-verify-step-phone");
+    var cd = $("lu-verify-step-code");
+    if (ph) ph.style.display = stage === "phone" ? "block" : "none";
+    if (cd) cd.style.display = stage === "code" ? "block" : "none";
+    var focusEl = stage === "code" ? $("lu-verify-code") : $("lu-verify-phone");
+    if (focusEl) {
+      setTimeout(function () {
+        try {
+          focusEl.focus();
+        } catch (e) {}
+      }, 80);
+    }
+  }
+
+  function submitVerifyCode() {
+    var code = (($("lu-verify-code") || {}).value || "").replace(/\D/g, "");
+    if (code.length < 4) return;
+    var btn = $("lu-verify-code-btn");
+    if (btn) btn.disabled = true;
+    sendClientMessage({
+      type: "ui_user_interaction",
+      data: { interaction: "verify_submit_code", code: code },
+    });
+  }
+
+  function listenSmsCode() {
+    /* Android Chrome: reads the code from the SMS by itself (needs the "@domain #code" line) */
+    if (!("OTPCredential" in window) || !navigator.credentials) return;
+    try {
+      if (_otpAbort) _otpAbort.abort();
+      _otpAbort = new AbortController();
+      navigator.credentials
+        .get({ otp: { transport: ["sms"] }, signal: _otpAbort.signal })
+        .then(function (otp) {
+          if (!otp || !otp.code) return;
+          var inp = $("lu-verify-code");
+          if (inp) inp.value = otp.code;
+          submitVerifyCode();
+        })
+        .catch(function () {});
+    } catch (e) {}
+  }
+
   function showVerifyModal(payload) {
     if ($("lu-verify-modal")) return;
     var wrap = document.createElement("div");
@@ -1793,31 +1940,134 @@
     box.style.cssText =
       "background:#0f172a;color:#f8fafc;max-width:360px;width:100%;border-radius:18px;" +
       "padding:22px;font:14px/1.45 system-ui,sans-serif;border:1px solid rgba(255,255,255,.15)";
-    var msg = (payload && payload.message) || t("verifyDefault");
+    var inputCss =
+      "width:100%;padding:12px;border:1px solid rgba(255,255,255,.2);background:#1e293b;color:#fff;" +
+      "border-radius:10px;box-sizing:border-box;font:16px system-ui,sans-serif";
+    var btnCss =
+      "margin-top:12px;width:100%;padding:12px;border:0;border-radius:10px;background:#10b981;" +
+      "color:#fff;font-weight:600;font-size:15px;cursor:pointer";
+    var linkCss =
+      "margin-top:10px;border:0;background:transparent;color:#94a3b8;font:13px system-ui,sans-serif;" +
+      "cursor:pointer;padding:4px 0";
     box.innerHTML =
       "<h3 style='margin:0 0 8px;font-size:16px'>" +
       escapeHtml(t("verifyTitle")) +
       "</h3>" +
       "<p style='margin:0 0 14px;color:#cbd5e1;font-size:13px'>" +
-      escapeHtml(msg) +
+      escapeHtml(t("verifyText")) +
       "</p>" +
-      "<input id='lu-verify-phone' type='tel' placeholder='+373...' " +
-      "style='width:100%;padding:11px;border:1px solid rgba(255,255,255,.2);background:#1e293b;color:#fff;border-radius:10px;box-sizing:border-box'/>" +
-      "<button id='lu-verify-ok' type='button' style='margin-top:12px;width:100%;padding:11px;" +
-      "border:0;border-radius:10px;background:#10b981;color:#fff;font-weight:600;cursor:pointer'>" +
-      escapeHtml(t("verifyBtn")) +
-      "</button>";
+      "<form id='lu-verify-step-phone' autocomplete='on'>" +
+      "<label for='lu-verify-phone' style='display:block;margin-bottom:6px;color:#cbd5e1;font-size:12px'>" +
+      escapeHtml(t("verifyPhoneLabel")) +
+      "</label>" +
+      "<input id='lu-verify-phone' name='tel' type='tel' inputmode='tel' autocomplete='tel' " +
+      "placeholder='+373 …' style='" + inputCss + "'/>" +
+      "<button id='lu-verify-phone-btn' type='submit' style='" + btnCss + "'>" +
+      escapeHtml(t("verifyGetCode")) +
+      "</button>" +
+      "</form>" +
+      "<form id='lu-verify-step-code' style='display:none' autocomplete='on'>" +
+      "<label for='lu-verify-code' style='display:block;margin-bottom:6px;color:#cbd5e1;font-size:12px'>" +
+      escapeHtml(t("verifyCodeLabel")) +
+      "</label>" +
+      "<input id='lu-verify-code' name='one-time-code' type='text' inputmode='numeric' " +
+      "autocomplete='one-time-code' maxlength='6' pattern='[0-9]*' style='" + inputCss +
+      ";letter-spacing:.3em;text-align:center'/>" +
+      "<button id='lu-verify-code-btn' type='submit' style='" + btnCss + "'>" +
+      escapeHtml(t("verifyConfirm")) +
+      "</button>" +
+      "<div style='display:flex;justify-content:space-between;gap:8px'>" +
+      "<button id='lu-verify-change' type='button' style='" + linkCss + "'>" +
+      escapeHtml(t("verifyChange")) +
+      "</button>" +
+      "<button id='lu-verify-resend' type='button' style='" + linkCss + "'>" +
+      escapeHtml(t("verifyResend")) +
+      "</button>" +
+      "</div>" +
+      "</form>" +
+      "<p id='lu-verify-status' style='margin:12px 0 0;min-height:18px;font-size:13px'></p>";
     wrap.appendChild(box);
     document.body.appendChild(wrap);
-    $("lu-verify-ok").onclick = function () {
-      var phone = ($("lu-verify-phone").value || "").trim();
-      if (phone.replace(/\D/g, "").length < 8) return;
+
+    function requestCode() {
+      var phone = (($("lu-verify-phone") || {}).value || "").trim();
+      if (phone.replace(/\D/g, "").length < 8) {
+        verifyStatus(t("vs_bad_phone"), true);
+        return;
+      }
+      var btn = $("lu-verify-phone-btn");
+      if (btn) btn.disabled = true;
+      verifyStatus("", false);
       sendClientMessage({
         type: "ui_user_interaction",
-        data: { interaction: "phone_verified", phone: phone },
+        data: { interaction: "verify_request_code", phone: phone },
       });
-      wrap.remove();
-    };
+    }
+
+    $("lu-verify-step-phone").addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      requestCode();
+    });
+    $("lu-verify-step-code").addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      submitVerifyCode();
+    });
+    $("lu-verify-code").addEventListener("input", function () {
+      var v = ($("lu-verify-code").value || "").replace(/\D/g, "");
+      if (v.length === 6) submitVerifyCode();
+    });
+    $("lu-verify-change").addEventListener("click", function () {
+      verifyStatus("", false);
+      var b1 = $("lu-verify-phone-btn");
+      if (b1) b1.disabled = false;
+      verifyStage("phone");
+    });
+    $("lu-verify-resend").addEventListener("click", function () {
+      requestCode();
+    });
+    verifyStage("phone");
+  }
+
+  function handleVerifyState(payload) {
+    payload = payload || {};
+    var st = String(payload.state || "");
+    if (!$("lu-verify-modal")) {
+      if (st === "verified") return;
+      showVerifyModal({});
+    }
+    var b1 = $("lu-verify-phone-btn");
+    var b2 = $("lu-verify-code-btn");
+    if (b1) b1.disabled = false;
+    if (b2) b2.disabled = false;
+    if (st === "code_sent") {
+      verifyStage("code");
+      var ci = $("lu-verify-code");
+      if (ci) ci.value = "";
+      verifyStatus(t("vs_code_sent").replace("{phone}", formatPhone(payload.phone || "")), false);
+      listenSmsCode();
+    } else if (st === "verified") {
+      verifyStatus(t("vs_verified"), false);
+      setTimeout(closeVerifyModal, 700);
+    } else if (st === "bad_code") {
+      verifyStatus(t("vs_bad_code").replace("{n}", String(payload.attempts_left != null ? payload.attempts_left : "")), true);
+      var ci2 = $("lu-verify-code");
+      if (ci2) {
+        ci2.value = "";
+        try { ci2.focus(); } catch (e) {}
+      }
+    } else if (st === "expired") {
+      verifyStatus(t("vs_expired"), true);
+    } else if (st === "bad_phone") {
+      verifyStage("phone");
+      verifyStatus(t("vs_bad_phone"), true);
+    } else if (st === "limit") {
+      verifyStatus(t("vs_limit"), true);
+    } else if (st === "wait") {
+      verifyStatus(t("vs_wait").replace("{sec}", String(payload.seconds || 30)), true);
+    } else if (st === "sms_failed") {
+      verifyStage("phone");
+      verifyStatus(t("vs_sms_failed"), true);
+    }
   }
 
   function showEndingSoon(payload) {
@@ -1921,6 +2171,8 @@
       handleDomCommand(command, payload);
     } else if (command === "require_phone_verification") {
       showVerifyModal(payload);
+    } else if (command === "verify_state") {
+      handleVerifyState(payload);
     } else if (command === "session_ending_soon") {
       showEndingSoon(payload);
     } else if (command === "session_ended" || command === "session_blocked") {
@@ -2208,6 +2460,7 @@
     }
     var warn = $("lu-session-warn");
     if (warn) warn.style.display = "none";
+    closeVerifyModal();
   }
 
   function waitIceComplete(pc) {
