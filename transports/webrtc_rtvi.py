@@ -668,10 +668,6 @@ async def run_webrtc_session(
                     command="navigate_and_render",
                     payload=payload,
                 ),
-                RTVIUICommandFrame(
-                    command="set_agent_state",
-                    payload={"state": "breathing"},
-                ),
             ])
         await params.result_callback({
             "status": "ui_updated",
@@ -696,19 +692,7 @@ async def run_webrtc_session(
                 ),
                 RTVIUICommandFrame(command="update_roi", payload=result),
             ])
-
-            async def _reset_orb_after_roi():
-                await asyncio.sleep(1.8)
-                if task is not None:
-                    with contextlib.suppress(Exception):
-                        await task.queue_frames([
-                            RTVIUICommandFrame(
-                                command="set_agent_state",
-                                payload={"state": "breathing"},
-                            )
-                        ])
-
-            asyncio.create_task(_reset_orb_after_roi())
+        # Orb state stays under model control (set_agent_state) — no auto-breathing wipe.
 
         await params.result_callback({
             "status": "roi_updated",
@@ -830,10 +814,6 @@ async def run_webrtc_session(
         if task is not None:
             await task.queue_frames([
                 RTVIUICommandFrame(command=action, payload=payload),
-                RTVIUICommandFrame(
-                    command="set_agent_state",
-                    payload={"state": "breathing"},
-                ),
             ])
 
         await params.result_callback({
