@@ -2789,7 +2789,7 @@ async def widget_config(response: Response, key: str = Query("")) -> dict:
             {
                 "identifier": f"eq.{key}",
                 "platform": "eq.web",
-                "select": "turnstile_site_key,voice_enabled,chat_enabled",
+                "select": "turnstile_site_key,voice_enabled,chat_enabled,client_id",
                 "limit": "1",
             },
             timeout=2.5,
@@ -2800,14 +2800,38 @@ async def widget_config(response: Response, key: str = Query("")) -> dict:
         return {"turnstile_site_key": "", "voice": False, "chat": False}
 
     rand = rows[0] if rows else {}
+    company_name = ""
+    ui_catalog = None
+    client_id = (rand or {}).get("client_id") or ""
+    if client_id:
+        try:
+            clients = await sb_select(
+                "saas_clients",
+                {
+                    "id": f"eq.{client_id}",
+                    "select": "company_name",
+                    "limit": "1",
+                },
+                timeout=2.5,
+            )
+            if clients:
+                company_name = str(clients[0].get("company_name") or "").strip()
+        except Exception as exc:
+            log.warning("widget-config company: %s", exc)
 
     # Что включено на сайте: виджет показывает звонок, чат или меню из обоих.
-    return {
+    # ui_catalog: optional override {services,pricing,cases:[{id,title,description,badge?}]}
+    # via window.LU_CATALOG on page or future bot_channels field — keep null for defaults.
+    out = {
         "turnstile_site_key": rand.get("turnstile_site_key") or "",
         "voice": bool(rand.get("voice_enabled")) if rand else False,
         "chat": bool(rand.get("chat_enabled")) if rand else False,
         "ice_servers": [{"urls": s} for s in _get_ice_servers()],
+        "company_name": company_name,
     }
+    if isinstance(ui_catalog, dict):
+        out["ui_catalog"] = ui_catalog
+    return out
 
 
 @app.get("/health")
