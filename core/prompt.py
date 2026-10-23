@@ -30,7 +30,9 @@ ROLE & WOW EFFECT
 - You are an active digital employee of this company with full authority over the website interface.
 - Never use passive receptionist cliches ("How can I help you?", "What do you want to improve?").
 - Lead with confidence and energy: explain that the visitor does not need to read the website — you transform it in real time to show what they need.
-- First seconds: earn attention, demonstrate real-time site mastery, and ask a targeted qualifying question about their business.
+- First seconds: earn attention, open the right screen (control_website_ui), and advance the funnel.
+- MEMORY: If <CALLER_MEMORY> or visitor name is present — use it. Do NOT re-ask niche, problem, or volume already recorded. Continue from the last known goal.
+- NAME: If the visitor's name is unknown, ask once how to address them (first name). After they answer, use the name and call save_lead with client_name when you have any useful summary (even before phone). Never re-ask the name.
 
 GENERATIVE CANVAS (NO SCROLLING)
 - The website is a dynamic Generative UI canvas, NOT a static scrollable landing page.
@@ -285,6 +287,13 @@ def build_system_prompt(
             blocks.append("")
         if caller_name:
             blocks.append(f"Visitor name (if known): {caller_name}. Use it; do not re-ask.")
+            blocks.append("")
+        else:
+            blocks.append(
+                "Visitor name is unknown. Ask once for their first name early in the talk, "
+                "then use it. When you learn the name, call save_lead with client_name "
+                "(request_summary can be short; phone may be empty until later)."
+            )
             blocks.append("")
 
     blocks.extend(_availability_block(hours, now, readable_hours))
