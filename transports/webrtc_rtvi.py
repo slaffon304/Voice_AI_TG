@@ -20,6 +20,8 @@ Legacy GSM и /ws НЕ затрагиваются.
 Защита /api/offer: origin, blacklist, Turnstile, суточные лимиты.
   Soft deadline (warn → close).
   Mid-session abuse: verify → block (как legacy).
+  Проверка номера кодом из SMS сразу после первых реплик (только +373);
+  номер берётся только из подтверждения, запись — карточка с подтверждением.
 """
 
 from __future__ import annotations
@@ -28,10 +30,12 @@ import asyncio
 import contextlib
 import datetime as dt
 import hashlib
+import hmac
 import html
 import logging
 import os
 import re
+import secrets
 import time
 import uuid
 from typing import Any, Optional
@@ -104,6 +108,7 @@ from core import (
     origin_permis,
     parse_working_hours,
     peste_limita,
+    redis_client,
     web_session_budget,
     propusk_valabil,
     resolve_voice_name,
@@ -130,6 +135,79 @@ DWELL_MIN_SECONDS = 3.0
 SOFT_DEADLINE_WARN_BEFORE = 30
 # Повторов «списка вопросов» до требования верификации / блока
 ABUSE_REPEAT_THRESHOLD = 3
+
+
+def _env_int_local(name: str, default: int) -> int:
+    try:
+        return int((os.getenv(name) or "").strip() or default)
+    except ValueError:
+        return default
+
+
+# Проверка номера кодом из SMS: когда начинать и сколько ждать
+VERIFY_AFTER_TURNS = _env_int_local("WEB_VERIFY_AFTER_TURNS", 2)
+VERIFY_AFTER_SECONDS = _env_int_local("WEB_VERIFY_AFTER_SECONDS", 40)
+VERIFY_TIMEOUT_SECONDS = _env_int_local("WEB_VERIFY_TIMEOUT_SECONDS", 60)
+SMS_CODE_TTL_SECONDS = 300
+SMS_CODE_ATTEMPTS = 3
+SMS_MAX_PER_SESSION = 3
+SMS_RESEND_SECONDS = 30
+SMS_MAX_PER_PHONE_DAY = _env_int_local("WEB_SMS_PER_PHONE_DAY", 3)
+SMS_MAX_PER_IP_DAY = _env_int_local("WEB_SMS_PER_IP_DAY", 5)
+# Только для теста, пока не готов SMS-шлюз: код пишется в лог вместо отправки
+WEB_SMS_DEBUG = (os.getenv("WEB_SMS_DEBUG") or "").strip().lower() in ("1", "true", "yes")
+
+SMS_CODE_TEXT = {
+    "ru": "Код подтверждения {company}: {code}",
+    "ro": "Codul de confirmare {company}: {code}",
+    "en": "{company} verification code: {code}",
+}
+
+
+def normalize_md_phone(raw: Any) -> str:
+    """Молдавский номер → 373XXXXXXXX (11 цифр). Любой другой → пустая строка."""
+    d = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    if d.startswith("00373"):
+        d = d[2:]
+    if len(d) == 9 and d.startswith("0"):
+        d = "373" + d[1:]
+    elif len(d) == 8:
+        d = "373" + d
+    if len(d) == 11 and d.startswith("373"):
+        return d
+    return ""
+
+
+def _host_of(url: str) -> str:
+    try:
+        return (url or "").split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0].lower()
+    except Exception:
+        return ""
+
+
+async def _sms_quota_ok(phone: str, ip: str) -> bool:
+    """Суточные лимиты SMS: на номер и на адрес. Считает только реальную отправку."""
+    if not redis_client:
+        log.warning("sms quota: redis недоступен — лимиты не проверены")
+        return True
+    day = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d")
+    try:
+        pkey = f"web_sms:p:{day}:{phone}"
+        n = int(await redis_client.incr(pkey))
+        if n == 1:
+            await redis_client.expire(pkey, 26 * 3600)
+        if n > SMS_MAX_PER_PHONE_DAY:
+            return False
+        if ip:
+            ikey = f"web_sms:i:{day}:{ip}"
+            m = int(await redis_client.incr(ikey))
+            if m == 1:
+                await redis_client.expire(ikey, 26 * 3600)
+            if m > SMS_MAX_PER_IP_DAY:
+                return False
+    except Exception as exc:
+        log.warning("sms quota redis: %s", exc)
+    return True
 
 DEFAULT_ICE_SERVERS = [
     "stun:stun.l.google.com:19302",
@@ -508,12 +586,23 @@ async def run_webrtc_session(
     abuse_stage = "none"  # none | verify_required | verified | blocked
     phone_verified_session = False
     abuse_probe = WebAbuseProbe()
+    # Проверка номера кодом из SMS
+    verify_stage = "none"  # none | pending | verified
+    verify_code = ""
+    verify_phone = ""
+    verify_expires = 0.0
+    verify_attempts = 0
+    verify_sends = 0
+    verify_last_send = 0.0
+    verify_timeout_handle = None
+    verify_watch_handle = None
 
     # Память / карточка по visitor_id (RPC → person_memory через end_client)
     contact, visitor_memory, time_ctx = await get_web_visitor_context(client_id, visitor_id)
     if contact.get("phone") and telefon_valid(contact["phone"]):
         learned_phone = "".join(filter(str.isdigit, str(contact["phone"])))
         phone_verified_session = True
+        verify_stage = "verified"  # вернувшийся посетитель с номером в карточке
     visitor_name = (contact.get("name") or "").strip()
     if contact.get("event_id"):
         zapis_id = str(contact["event_id"])
@@ -648,6 +737,15 @@ async def run_webrtc_session(
             orb_reset_handle.cancel()
         orb_reset_handle = asyncio.create_task(_later())
 
+    def _booking_prefill(extra: dict | None) -> dict:
+        """Карточка записи: имя и подтверждённый номер подставляет сервер, не модель."""
+        out = dict(extra or {})
+        if not out.get("client_name") and visitor_name:
+            out["client_name"] = visitor_name
+        if learned_phone:
+            out["phone"] = "+" + learned_phone
+        return out
+
     # ----- Tool handlers -----
 
     async def process_control_website_ui(params: FunctionCallParams):
@@ -655,6 +753,20 @@ async def run_webrtc_session(
         highlight = params.arguments.get("highlight_element")
         prefill = params.arguments.get("prefill_data") or {}
         components = params.arguments.get("components")  # CONCEPT mode (optional)
+
+        if section in ("booking_widget", "contacts"):
+            if not phone_verified_session:
+                await _start_verification("booking")
+                await params.result_callback({
+                    "status": "verify_first",
+                    "instruction": (
+                        "The visitor's phone is not verified yet. Phone verification is now on screen. "
+                        "Wait for SYSTEM UI EVENT that the phone is verified, then show booking_widget again."
+                    ),
+                })
+                return
+            section = "booking_widget"
+            prefill = _booking_prefill(prefill)
 
         payload: dict[str, Any] = {
             "section": section,
@@ -752,6 +864,14 @@ async def run_webrtc_session(
             return
         sentiment_fired.add(signal)
 
+        morph_prefill: dict[str, Any] = {"sentiment_signal": signal}
+        if section in ("booking_widget", "contacts"):
+            if not phone_verified_session:
+                section = "cases"
+            else:
+                section = "booking_widget"
+                morph_prefill = _booking_prefill(morph_prefill)
+
         await _orb("shaping", "screen")
         if task is not None:
             frames = [
@@ -760,7 +880,7 @@ async def run_webrtc_session(
                     payload={
                         "section": section,
                         "highlight": highlight,
-                        "prefill": {"sentiment_signal": signal},
+                        "prefill": morph_prefill,
                     },
                 )
             ]
@@ -842,27 +962,13 @@ async def run_webrtc_session(
         normalizeaza_timp(params.arguments, tz_name)
 
         if action == "book" and not telefon_valid(phone_arg):
-            if task is not None:
-                await task.queue_frames([
-                    RTVIUICommandFrame(
-                        command="navigate_and_render",
-                        payload={
-                            "section": "booking_widget",
-                            "highlight": "phone",
-                            "prefill": {
-                                "start_time": params.arguments.get("start_time"),
-                                "end_time": params.arguments.get("end_time"),
-                                "client_name": params.arguments.get("client_name"),
-                                "request_summary": params.arguments.get("request_summary"),
-                            },
-                        },
-                    )
-                ])
+            await _start_verification("booking")
             await params.result_callback({
-                "status": "need_phone_via_form",
+                "status": "verify_first",
                 "message": (
-                    "Forma de pe ecran este deschisă. Nu cere numărul pe voice. "
-                    "Așteaptă SYSTEM UI EVENT cu numărul, apoi Booking_tool action=book."
+                    "Numărul nu este confirmat. Pe ecran este verificarea prin SMS. "
+                    "Nu cere numărul pe voce. Așteaptă SYSTEM UI EVENT că numărul e confirmat, "
+                    "apoi arată cardul booking_widget și cere confirmarea."
                 ),
             })
             return
@@ -947,35 +1053,199 @@ async def run_webrtc_session(
 
     # Register tools
 
+    # ----- Проверка номера кодом из SMS -----
+
+    async def _verify_timeout() -> None:
+        """Номер не подтверждён за отведённое время — голос вежливо завершается."""
+        try:
+            await asyncio.sleep(VERIFY_TIMEOUT_SECONDS)
+            if verify_stage == "verified" or task is None:
+                return
+            clog.info("[%s] verification timeout — ending voice", call_id)
+            await task.queue_frames([
+                RTVIUICommandFrame(
+                    command="session_ended",
+                    payload={"reason": "verify_timeout", "session_index": session_index},
+                ),
+                CancelFrame(),
+            ])
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            clog.warning("[%s] verify timeout error: %s", call_id, exc)
+
+    def _restart_verify_timeout() -> None:
+        nonlocal verify_timeout_handle
+        if verify_timeout_handle is not None and not verify_timeout_handle.done():
+            verify_timeout_handle.cancel()
+        verify_timeout_handle = asyncio.create_task(_verify_timeout())
+
+    async def _start_verification(reason: str) -> None:
+        nonlocal verify_stage
+        if verify_stage != "none" or phone_verified_session or abuse_stage == "blocked":
+            return
+        verify_stage = "pending"
+        clog.info("[%s] phone verification started reason=%s", call_id, reason)
+        if task is None:
+            return
+        await task.queue_frames([
+            RTVIUICommandFrame(
+                command="require_phone_verification",
+                payload={"reason": reason},
+            )
+        ])
+        context.add_message({
+            "role": "user",
+            "content": (
+                "SYSTEM: Phone verification starts now. If the visitor just asked something, "
+                "answer it in one short sentence first. Then say honestly and briefly: because of "
+                "bad-faith visitors and competitors we confirm the phone number; the field is on "
+                "screen, the phone suggests the number by itself and the SMS code arrives in seconds. "
+                "Never ask to dictate the number. Do not continue the consultation until "
+                "SYSTEM UI EVENT says the phone is verified. If the visitor refuses, say goodbye "
+                "politely. No 'demo' wording."
+            ),
+        })
+        await task.queue_frames([LLMRunFrame()])
+        _restart_verify_timeout()
+
+    async def _verify_watch() -> None:
+        """Проверка начинается после N реплик посетителя или через N секунд."""
+        try:
+            while True:
+                await asyncio.sleep(1.0)
+                if verify_stage != "none" or phone_verified_session:
+                    return
+                elapsed = time.time() - start_ts
+                turns = 0
+                with contextlib.suppress(Exception):
+                    _t, turns = build_transcript(list(getattr(context, "messages", None) or []))
+                if turns >= VERIFY_AFTER_TURNS or elapsed >= VERIFY_AFTER_SECONDS:
+                    await _start_verification(f"early_gate turns={turns} t={int(elapsed)}")
+                    return
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            clog.warning("[%s] verify watch error: %s", call_id, exc)
+
+    async def _verify_state(state: str, **extra: Any) -> None:
+        if task is None:
+            return
+        await task.queue_frames([
+            RTVIUICommandFrame(command="verify_state", payload={"state": state, **extra})
+        ])
+
+    async def _verify_request_code(raw_phone: str) -> None:
+        nonlocal verify_code, verify_phone, verify_expires, verify_attempts
+        nonlocal verify_sends, verify_last_send, verify_stage
+        if phone_verified_session:
+            await _verify_state("verified")
+            return
+        phone = normalize_md_phone(raw_phone)
+        if not phone:
+            await _verify_state("bad_phone")
+            return
+        now_ts = time.time()
+        if verify_last_send and now_ts - verify_last_send < SMS_RESEND_SECONDS:
+            await _verify_state("wait", seconds=int(SMS_RESEND_SECONDS - (now_ts - verify_last_send)) + 1)
+            return
+        if verify_sends >= SMS_MAX_PER_SESSION or not await _sms_quota_ok(phone, visitor_ip):
+            clog.warning("[%s] sms limit phone=%s***", call_id, phone[:6])
+            await _verify_state("limit")
+            return
+        code = f"{secrets.randbelow(1_000_000):06d}"
+        lang_key = call_lang if call_lang in SMS_CODE_TEXT else "en"
+        text = SMS_CODE_TEXT[lang_key].format(company=company, code=code)
+        host = _host_of(landing_url)
+        if host:
+            text += f"\n\n@{host} #{code}"
+        if WEB_SMS_DEBUG:
+            clog.warning("[%s] WEB_SMS_DEBUG code=%s phone=%s", call_id, code, phone)
+        else:
+            try:
+                await _orb("working", "sms")
+                result = await call_n8n(
+                    "send_sms",
+                    {"client_id": client_id},
+                    {"phone": "+" + phone, "text": text, "purpose": "web_verify"},
+                    10.0,
+                )
+                await _orb_rest()
+                if isinstance(result, dict) and str(result.get("status") or "").lower() == "error":
+                    raise RuntimeError(str(result.get("message") or "sms error"))
+            except Exception as exc:
+                await _orb_rest()
+                clog.warning("[%s] verification sms failed: %s", call_id, exc)
+                await _verify_state("sms_failed")
+                return
+        verify_stage = "pending"
+        verify_code = code
+        verify_phone = phone
+        verify_expires = now_ts + SMS_CODE_TTL_SECONDS
+        verify_attempts = 0
+        verify_sends += 1
+        verify_last_send = now_ts
+        clog.info("[%s] verification code sent phone=%s*** send=%s", call_id, phone[:6], verify_sends)
+        await _verify_state("code_sent", phone="+" + phone)
+        _restart_verify_timeout()
+
+    async def _verify_submit_code(raw_code: str) -> None:
+        nonlocal verify_code, verify_attempts, verify_stage, learned_phone
+        nonlocal phone_verified_session, abuse_stage, deadline_handle, warn_handle
+        if phone_verified_session:
+            await _verify_state("verified")
+            return
+        code = "".join(ch for ch in str(raw_code or "") if ch.isdigit())
+        if not verify_code or time.time() > verify_expires:
+            verify_code = ""
+            await _verify_state("expired")
+            return
+        verify_attempts += 1
+        if not hmac.compare_digest(code, verify_code):
+            left = SMS_CODE_ATTEMPTS - verify_attempts
+            if left <= 0:
+                verify_code = ""
+                await _verify_state("expired")
+            else:
+                await _verify_state("bad_code", attempts_left=left)
+            return
+        # Номер подтверждён
+        verify_code = ""
+        verify_stage = "verified"
+        learned_phone = verify_phone
+        phone_verified_session = True
+        if abuse_stage == "verify_required":
+            abuse_stage = "verified"
+        if verify_timeout_handle is not None and not verify_timeout_handle.done():
+            verify_timeout_handle.cancel()
+        clog.info("[%s] phone verified by SMS code phone=%s***", call_id, learned_phone[:6])
+        await _verify_state("verified", phone="+" + learned_phone)
+        # Время разговора считается заново с момента подтверждения
+        with contextlib.suppress(Exception):
+            deadline_handle.cancel()
+        with contextlib.suppress(Exception):
+            warn_handle.cancel()
+        warn_handle = asyncio.create_task(_session_soft_warn())
+        deadline_handle = asyncio.create_task(_session_deadline())
+        context.add_message({
+            "role": "user",
+            "content": (
+                "SYSTEM UI EVENT: the visitor's phone is verified by SMS code. Thank them in a few "
+                "words and continue the consultation from where you stopped. Never ask for the "
+                "phone again — it is known and will be used for booking and the lead."
+            ),
+        })
+        if task is not None:
+            await task.queue_frames([LLMRunFrame()])
+
     async def _require_verify(reason: str) -> None:
+        """Подозрительное поведение до подтверждения номера → проверка номера."""
         nonlocal abuse_stage
         if abuse_stage in ("verify_required", "blocked"):
             return
         abuse_stage = "verify_required"
         clog.warning("[%s] abuse verify required: %s", call_id, reason)
-        if task is not None:
-            await task.queue_frames([
-                RTVIUICommandFrame(
-                    command="require_phone_verification",
-                    payload={
-                        "reason": "abuse_protection",
-                        "message": (
-                            "Open voice access is limited because of competitors "
-                            "and bad-faith visitors. Confirm your phone on screen to continue."
-                        ),
-                    },
-                )
-            ])
-            context.add_message({
-                "role": "user",
-                "content": (
-                    "SYSTEM: Identity verification required due to suspicious activity. "
-                    "Tell the visitor honestly (no 'demo' wording) that we limit open access "
-                    "because of competitors/abuse, and ask them to confirm the phone on screen. "
-                    "Do not continue deep product detail until SYSTEM UI EVENT phone_verified."
-                ),
-            })
-            await task.queue_frames([LLMRunFrame()])
+        await _start_verification(f"abuse:{reason}")
 
     async def _block_abuse(reason: str) -> None:
         nonlocal abuse_stage
@@ -1023,7 +1293,7 @@ async def run_webrtc_session(
 
     @rtvi.event_handler("on_client_message")
     async def on_client_message(rtvi_proc, msg):
-        nonlocal learned_phone, audit_pending_focus, phone_verified_session, abuse_stage, visitor_name
+        nonlocal audit_pending_focus, visitor_name
         msg_type = getattr(msg, "type", None) or (msg.get("type") if isinstance(msg, dict) else None)
         data = getattr(msg, "data", None) or (msg.get("data") if isinstance(msg, dict) else {}) or {}
         if isinstance(data, dict) and "type" in data:
@@ -1052,31 +1322,42 @@ async def run_webrtc_session(
                 await task.queue_frames([CancelFrame()])
             return
 
-        # ----- Phone verified via widget form / SMS -----
+        # ----- Проверка номера кодом из SMS -----
+        if interaction == "verify_request_code":
+            await _verify_request_code(str(data.get("phone") or ""))
+            return
+        if interaction == "verify_submit_code":
+            await _verify_submit_code(str(data.get("code") or ""))
+            return
         if interaction in ("phone_verified", "verify_phone"):
-            phone_raw = str(data.get("phone") or data.get("value") or "").strip()
-            if phone_raw and telefon_valid(phone_raw):
-                learned_phone = "".join(filter(str.isdigit, phone_raw))
-                phone_verified_session = True
-                if abuse_stage == "verify_required":
-                    abuse_stage = "verified"
-                pv_name = str(data.get("client_name") or data.get("name") or "").strip()[:80]
-                pv_note = str(data.get("request_summary") or data.get("slot") or "").strip()[:300]
-                if pv_name:
-                    visitor_name = pv_name
-                clog.info("[%s] phone verified via UI stage=%s name=%s", call_id, abuse_stage, pv_name or "-")
-                context.add_message({
-                    "role": "user",
-                    "content": (
-                        "SYSTEM UI EVENT: visitor verified phone on screen. "
-                        "Use this number for booking/lead; do not ask them to dictate it. "
-                        + (f"Visitor name from the form: {pv_name}. Use it; do not re-ask. " if pv_name else "")
-                        + (f"Visitor note from the form (time / task): {pv_note}. " if pv_note else "")
-                        + "You may continue the conversation."
-                    ),
-                })
-                if task is not None:
-                    await task.queue_frames([LLMRunFrame()])
+            # Номер без кода больше не принимается как подтверждённый
+            clog.info("[%s] ignored unverified phone from UI", call_id)
+            return
+
+        # ----- Карточка записи подтверждена на экране -----
+        if interaction == "booking_confirmed":
+            bc_name = str(data.get("client_name") or "").strip()[:80]
+            bc_start = str(data.get("start_time") or "").strip()[:40]
+            bc_end = str(data.get("end_time") or "").strip()[:40]
+            bc_note = str(data.get("request_summary") or "").strip()[:300]
+            if bc_name:
+                visitor_name = bc_name
+            if not phone_verified_session:
+                await _start_verification("booking")
+                return
+            context.add_message({
+                "role": "user",
+                "content": (
+                    "SYSTEM UI EVENT: the visitor confirmed the booking card on screen: "
+                    f"client_name={bc_name or visitor_name or '-'}, start_time={bc_start or '-'}"
+                    + (f", end_time={bc_end}" if bc_end else "")
+                    + (f", request_summary={bc_note}" if bc_note else "")
+                    + ". Call Booking_tool action='book' now with exactly these details "
+                    "(the verified phone is filled in automatically), then confirm briefly aloud."
+                ),
+            })
+            if task is not None:
+                await task.queue_frames([LLMRunFrame()])
             return
 
         # ----- Screen audit result from client -----
@@ -1129,31 +1410,10 @@ async def run_webrtc_session(
 
         # ----- Form / generic UI -----
         description = data.get("description", str(data))
-        form_phone = str(data.get("phone") or data.get("client_phone") or "").strip()
         form_name = str(data.get("client_name") or data.get("name") or "").strip()
-        form_slot = str(data.get("start_time") or data.get("slot") or "").strip()
         if form_name:
-            visitor_name = form_name
-        if telefon_valid(form_phone):
-            learned_phone = "".join(filter(str.isdigit, form_phone))
-            phone_verified_session = True
-            if abuse_stage == "verify_required":
-                abuse_stage = "verified"
-            context.add_message({
-                "role": "user",
-                "content": (
-                    f"SYSTEM UI EVENT: Visitor submitted the on-screen form. "
-                    f"phone={form_phone}"
-                    + (f", client_name={form_name}" if form_name else "")
-                    + (f", requested_slot={form_slot}" if form_slot else "")
-                    + ". Do NOT ask them to dictate the phone again. "
-                    "Immediately call save_lead (or Booking_tool action='book' if a slot was discussed) "
-                    "and confirm briefly aloud."
-                ),
-            })
-            if task is not None:
-                await task.queue_frames([LLMRunFrame()])
-            return
+            visitor_name = form_name[:80]
+        # Номер из произвольной формы не принимается: только через проверку кодом из SMS
 
         context.add_message({
             "role": "user",
@@ -1374,6 +1634,8 @@ async def run_webrtc_session(
     warn_handle = asyncio.create_task(_session_soft_warn())
     deadline_handle = asyncio.create_task(_session_deadline())
     abuse_watch_handle = asyncio.create_task(_abuse_watchdog())
+    if not phone_verified_session:
+        verify_watch_handle = asyncio.create_task(_verify_watch())
 
     runner = PipelineRunner()
 
@@ -1394,6 +1656,12 @@ async def run_webrtc_session(
         with contextlib.suppress(Exception):
             if orb_reset_handle is not None:
                 orb_reset_handle.cancel()
+        with contextlib.suppress(Exception):
+            if verify_watch_handle is not None:
+                verify_watch_handle.cancel()
+        with contextlib.suppress(Exception):
+            if verify_timeout_handle is not None:
+                verify_timeout_handle.cancel()
         with contextlib.suppress(Exception):
             mixer.close()
 
