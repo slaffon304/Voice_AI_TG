@@ -1384,6 +1384,15 @@
     if (key === "hero" || key === "contacts") {
       key = key === "contacts" ? "booking_widget" : "services";
     }
+    /* Empty catalog section: do not open an empty workspace, keep current view */
+    var hasComponents = Array.isArray(components) && components.length > 0;
+    if (!hasComponents && (key === "services" || key === "pricing" || key === "cases")) {
+      var catCheck = buildCatalog();
+      if (!catCheck[key] || !catCheck[key].length) {
+        console.info("[LU] section has no catalog items, workspace not opened:", key);
+        return;
+      }
+    }
     state.activeSection = key;
     state.activeHighlight = highlight || null;
     if (prefill && typeof prefill === "object") {
@@ -2348,13 +2357,7 @@
     setTimeout(scanPageSections, 1200);
 
     var cfg = await loadConfig();
-    /* Workspace on load — first catalog item expanded, site design stays behind */
-    var firstId = null;
-    try {
-      var svc = (state.catalog && state.catalog.services) || [];
-      if (svc.length) firstId = svc[0].id;
-    } catch (e) {}
-    focusSection("services", firstId);
+    /* Site stays untouched on load. Workspace opens only when the agent shows the first scene. */
 
     if (!state.voiceEnabled) return;
 
