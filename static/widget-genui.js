@@ -804,149 +804,107 @@
   var _wsHost = null;
 
   function ensureWorkspace() {
-    if (_wsRoot) return _wsRoot;
+    if (_wsRoot && document.getElementById("lu-ws-backdrop")) return _wsRoot;
     extractHostTheme();
-    _wsHost = document.getElementById("lu-workspace-host");
-    if (!_wsHost) {
-      _wsHost = document.createElement("div");
-      _wsHost.id = "lu-workspace-host";
-      document.body.appendChild(_wsHost);
-    }
-    _wsRoot = _wsHost.shadowRoot || _wsHost.attachShadow({ mode: "open" });
-    var style = document.createElement("style");
-    var accent = state.theme.accent || "currentColor";
-    var text = state.theme.text || "inherit";
-    var heading = state.theme.heading || text;
-    var font = state.theme.fontSans || "inherit";
-    var fontDisplay = state.theme.fontDisplay || font;
-    /* No hardcoded page background — site remains visible. No framed panel. */
-    style.textContent = [
-      ":host { all: initial; }",
-      ".lu-backdrop {",
-      "  position: fixed; inset: 0; z-index: 99990;",
-      "  background: color-mix(in srgb, " + (state.theme.surface || "rgb(255,255,255)") + " 88%, transparent);",
-      "  display: none; flex-direction: column;",
-      "  box-sizing: border-box;",
-      "  font-family: " + font + ";",
-      "  color: " + text + ";",
-      "  opacity: 0; transition: opacity 0.25s ease;",
-      "}",
-      ".lu-backdrop.open { display: flex; opacity: 1; }",
-      ".lu-stage {",
-      "  flex: 1; min-height: 0; width: 100%; max-width: 720px;",
-      "  margin: 0 auto; padding: max(56px, env(safe-area-inset-top)) 18px 110px;",
-      "  overflow-y: auto; -webkit-overflow-scrolling: touch;",
-      "  box-sizing: border-box;",
-      "  background: transparent; border: 0; box-shadow: none; border-radius: 0;",
-      "}",
-      ".lu-top {",
-      "  display: flex; align-items: flex-start; justify-content: space-between;",
-      "  gap: 12px; margin-bottom: 18px;",
-      "}",
-      ".lu-kicker {",
-      "  margin: 0 0 6px; font: 600 11px/1.2 inherit; letter-spacing: 0.12em;",
-      "  text-transform: uppercase; color: " + accent + "; opacity: 0.9;",
-      "}",
-      ".lu-scene-title {",
-      "  margin: 0; font: 650 clamp(1.4rem, 4.2vw, 1.85rem)/1.15 " + fontDisplay + ";",
-      "  letter-spacing: -0.03em; color: " + heading + ";",
-      "}",
-      ".lu-min-btn {",
-      "  flex-shrink: 0; border: 0; background: transparent; color: " + text + ";",
-      "  font: 600 12px/1.2 inherit; opacity: 0.55; cursor: pointer; padding: 6px 0;",
-      "  text-decoration: underline; text-underline-offset: 3px;",
-      "}",
-      ".lu-tabs { display: none !important; }",
-      ".lu-body { display: flex; flex-direction: column; gap: 10px; }",
-      /* Accordion: one expanded, rest collapsed */
-      ".lu-acc { display: flex; flex-direction: column; gap: 8px; }",
-      ".lu-acc-item {",
-      "  border: 0; background: transparent; padding: 0; margin: 0;",
-      "}",
-      ".lu-acc-head {",
-      "  display: flex; align-items: center; gap: 10px; width: 100%;",
-      "  padding: 12px 0; border: 0; border-bottom: 1px solid color-mix(in srgb, " + text + " 14%, transparent);",
-      "  background: transparent; color: inherit; font: inherit; text-align: left;",
-      "  cursor: pointer;",
-      "}",
-      ".lu-acc-item.is-open .lu-acc-head { border-bottom-color: transparent; }",
-      ".lu-acc-badge {",
-      "  flex-shrink: 0; font: 600 10px/1.2 inherit; letter-spacing: 0.06em;",
-      "  text-transform: uppercase; padding: 4px 8px; border-radius: 999px;",
-      "  color: " + accent + ";",
-      "  border: 1px solid color-mix(in srgb, " + accent + " 45%, transparent);",
-      "  background: transparent;",
-      "}",
-      ".lu-acc-title {",
-      "  flex: 1; margin: 0; font: 650 1.05rem/1.25 " + fontDisplay + ";",
-      "  color: " + heading + "; letter-spacing: -0.02em;",
-      "}",
-      ".lu-acc-body {",
-      "  display: none; padding: 0 0 16px;",
-      "  font: 400 0.98rem/1.5 inherit; color: " + text + "; opacity: 0.88;",
-      "}",
-      ".lu-acc-item.is-open .lu-acc-body { display: block; }",
-      ".lu-acc-item:not(.is-open) .lu-acc-title { font-size: 0.95rem; opacity: 0.72; }",
-      /* ROI / booking keep simple layout without a frame */
-      ".lu-roi-grid, .lu-form { display: grid; gap: 12px; }",
-      ".lu-control-group, .lu-roi-out, .lu-form label {",
-      "  display: block; padding: 10px 0; border-bottom: 1px solid color-mix(in srgb, " + text + " 12%, transparent);",
-      "}",
-      ".lu-control-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 6px; }",
-      "input[type='range'] { width: 100%; }",
-      "input[type='text'], input[type='tel'] {",
-      "  width: 100%; box-sizing: border-box; padding: 10px 12px;",
-      "  border: 1px solid color-mix(in srgb, " + text + " 22%, transparent);",
-      "  border-radius: 10px; background: transparent; color: inherit; font: inherit;",
-      "}",
-      ".lu-primary {",
-      "  margin-top: 8px; border: 0; border-radius: 999px; padding: 12px 18px;",
-      "  font: 600 14px/1.2 inherit; cursor: pointer;",
-      "  background: " + accent + "; color: #fff;",
-      "}",
-      ".lu-sub { opacity: 0.75; margin: 0 0 12px; }",
-      ".lu-title { margin: 0 0 8px; font: 650 1.35rem/1.2 " + fontDisplay + "; color: " + heading + "; }",
-    ].join("\\n");
-    _wsRoot.appendChild(style);
 
-    var backdrop = document.createElement("div");
-    backdrop.id = "lu-ws-backdrop";
-    backdrop.className = "lu-backdrop";
-    backdrop.innerHTML =
-      "<div class='lu-stage'>" +
-      "  <div class='lu-top'>" +
-      "    <div>" +
-      "      <p class='lu-kicker' id='lu-ws-kicker'></p>" +
-      "      <h2 class='lu-scene-title' id='lu-ws-title'></h2>" +
-      "    </div>" +
-      "    <button type='button' class='lu-min-btn' id='lu-ws-min'>" +
-      escapeHtml(t("minimize")) +
-      "</button>" +
-      "  </div>" +
-      "  <div class='lu-tabs' id='lu-ws-tabs' hidden></div>" +
-      "  <div class='lu-body' id='lu-ws-body'></div>" +
-      "</div>";
-    _wsRoot.appendChild(backdrop);
-    _wsRoot.getElementById("lu-ws-min").addEventListener("click", function () {
-      closeWorkspace();
-    });
+    var text = state.theme.text || "rgb(15, 23, 42)";
+    var heading = state.theme.heading || text;
+    var accent = state.theme.accent || "rgb(16, 185, 129)";
+    var font = state.theme.fontSans || "system-ui, -apple-system, sans-serif";
+    var fontDisplay = state.theme.fontDisplay || font;
+    var surface = state.theme.surface || "rgb(248, 250, 252)";
+
+    if (!$("lu-ws-css")) {
+      var style = document.createElement("style");
+      style.id = "lu-ws-css";
+      style.textContent = [
+        "#lu-ws-backdrop{position:fixed;inset:0;z-index:99990;display:none;flex-direction:column;",
+        "background:" + surface + ";font-family:" + font + ";color:" + text + ";box-sizing:border-box}",
+        "#lu-ws-backdrop.lu-open{display:flex}",
+        "#lu-ws-backdrop .lu-stage{flex:1;min-height:0;width:100%;max-width:720px;margin:0 auto;",
+        "padding:max(56px,env(safe-area-inset-top)) 18px 120px;overflow-y:auto;-webkit-overflow-scrolling:touch;",
+        "box-sizing:border-box;background:transparent;border:0;box-shadow:none}",
+        "#lu-ws-backdrop .lu-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:18px}",
+        "#lu-ws-backdrop .lu-kicker{margin:0 0 6px;font:600 11px/1.2 inherit;letter-spacing:.12em;text-transform:uppercase;color:" + accent + "}",
+        "#lu-ws-backdrop .lu-scene-title{margin:0;font:650 clamp(1.4rem,4.2vw,1.85rem)/1.15 " + fontDisplay + ";letter-spacing:-.03em;color:" + heading + "}",
+        "#lu-ws-backdrop .lu-min-btn{flex-shrink:0;border:0;background:transparent;color:" + text + ";font:600 12px/1.2 inherit;opacity:.55;cursor:pointer;padding:6px 0;text-decoration:underline;text-underline-offset:3px}",
+        "#lu-ws-backdrop .lu-tabs{display:none!important}",
+        "#lu-ws-backdrop .lu-body{display:flex;flex-direction:column;gap:10px}",
+        "#lu-ws-backdrop .lu-acc{display:flex;flex-direction:column;gap:4px}",
+        "#lu-ws-backdrop .lu-acc-head{display:flex;align-items:center;gap:10px;width:100%;padding:14px 0;border:0;",
+        "border-bottom:1px solid rgba(15,23,42,.12);background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}",
+        "#lu-ws-backdrop .lu-acc-item.is-open .lu-acc-head{border-bottom-color:transparent}",
+        "#lu-ws-backdrop .lu-acc-badge{flex-shrink:0;font:600 10px/1.2 inherit;letter-spacing:.06em;text-transform:uppercase;",
+        "padding:4px 8px;border-radius:999px;color:" + accent + ";border:1px solid rgba(16,185,129,.35);background:transparent}",
+        "#lu-ws-backdrop .lu-acc-title{flex:1;margin:0;font:650 1.05rem/1.25 " + fontDisplay + ";color:" + heading + "}",
+        "#lu-ws-backdrop .lu-acc-item:not(.is-open) .lu-acc-title{opacity:.7;font-size:.95rem}",
+        "#lu-ws-backdrop .lu-acc-body{display:none;padding:0 0 16px;font:400 .98rem/1.5 inherit;opacity:.9}",
+        "#lu-ws-backdrop .lu-acc-item.is-open .lu-acc-body{display:block}",
+        "#lu-ws-backdrop .lu-roi-grid,#lu-ws-backdrop .lu-form{display:grid;gap:12px}",
+        "#lu-ws-backdrop .lu-control-group,#lu-ws-backdrop .lu-roi-out,#lu-ws-backdrop .lu-form label{display:block;padding:10px 0;border-bottom:1px solid rgba(15,23,42,.1)}",
+        "#lu-ws-backdrop .lu-control-head{display:flex;justify-content:space-between;gap:8px;margin-bottom:6px}",
+        "#lu-ws-backdrop input[type=range]{width:100%}",
+        "#lu-ws-backdrop input[type=text],#lu-ws-backdrop input[type=tel]{width:100%;box-sizing:border-box;padding:10px 12px;",
+        "border:1px solid rgba(15,23,42,.18);border-radius:10px;background:#fff;color:" + text + ";font:inherit}",
+        "#lu-ws-backdrop .lu-primary{margin-top:8px;border:0;border-radius:999px;padding:12px 18px;font:600 14px/1.2 inherit;cursor:pointer;background:" + accent + ";color:#fff}",
+        "#lu-ws-backdrop .lu-sub{opacity:.75;margin:0 0 12px}",
+        "#lu-ws-backdrop .lu-title{margin:0 0 8px;font:650 1.35rem/1.2 " + fontDisplay + ";color:" + heading + "}",
+      ].join("");
+      document.head.appendChild(style);
+    }
+
+    if (!$("lu-ws-backdrop")) {
+      var backdrop = document.createElement("div");
+      backdrop.id = "lu-ws-backdrop";
+      backdrop.innerHTML =
+        "<div class='lu-stage'>" +
+        "  <div class='lu-top'>" +
+        "    <div>" +
+        "      <p class='lu-kicker' id='lu-ws-kicker'></p>" +
+        "      <h2 class='lu-scene-title' id='lu-ws-title'></h2>" +
+        "    </div>" +
+        "    <button type='button' class='lu-min-btn' id='lu-ws-min'>" +
+        escapeHtml(t("minimize")) +
+        "</button>" +
+        "  </div>" +
+        "  <div class='lu-tabs' id='lu-ws-tabs' hidden></div>" +
+        "  <div class='lu-body' id='lu-ws-body'></div>" +
+        "</div>";
+      document.body.appendChild(backdrop);
+      document.getElementById("lu-ws-min").addEventListener("click", function () {
+        closeWorkspace();
+      });
+    }
+
+    _wsRoot = {
+      getElementById: function (id) { return document.getElementById(id); },
+      querySelector: function (sel) {
+        var root = document.getElementById("lu-ws-backdrop");
+        return root ? root.querySelector(sel) : null;
+      },
+      querySelectorAll: function (sel) {
+        var root = document.getElementById("lu-ws-backdrop");
+        return root ? root.querySelectorAll(sel) : [];
+      },
+    };
+    _wsHost = document.getElementById("lu-ws-backdrop");
     return _wsRoot;
   }
 
   function openWorkspace() {
     ensureWorkspace();
     state.workspaceOpen = true;
-    var bd = _wsRoot.getElementById("lu-ws-backdrop");
-    if (bd) bd.classList.add("open");
+    var bd = document.getElementById("lu-ws-backdrop");
+    if (bd) bd.classList.add("lu-open");
     var reopenBtn = $("lu-reopen-ws");
     if (reopenBtn) reopenBtn.style.display = "none";
+    console.info("[LU] workspace open", state.activeSection);
   }
 
   function closeWorkspace() {
-    if (!_wsRoot) return;
     state.workspaceOpen = false;
-    var bd = _wsRoot.getElementById("lu-ws-backdrop");
-    if (bd) bd.classList.remove("open");
+    var bd = document.getElementById("lu-ws-backdrop");
+    if (bd) bd.classList.remove("lu-open");
     if (state.connected && !state.escaped) {
       ensureReopenPill();
     }
@@ -2111,24 +2069,20 @@
 
   function showManagedChallenge(ok, fail) {
     if (document.getElementById("lu-turnstile-modal")) return;
-    var L = pageLocale();
     var wrap = document.createElement("div");
     wrap.id = "lu-turnstile-modal";
     wrap.style.cssText =
-      "position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.45);" +
-      "display:flex;align-items:flex-end;justify-content:center;padding:16px 16px 100px";
+      "position:fixed;inset:0;z-index:100001;background:rgba(0,0,0,.35);" +
+      "display:flex;align-items:center;justify-content:center;padding:16px";
+    /* Only the CF widget strip — no black top/bottom chrome */
     var box = document.createElement("div");
     box.style.cssText =
-      "background:#0b0f14;color:#e5e7eb;max-width:300px;width:100%;border-radius:14px;" +
-      "padding:12px;font:13px/1.35 system-ui,sans-serif;text-align:center;" +
-      "border:1px solid rgba(255,255,255,.1);box-shadow:0 12px 40px rgba(0,0,0,.4)";
+      "background:#f3f4f6;max-width:320px;width:100%;border-radius:8px;" +
+      "padding:10px;box-shadow:0 8px 28px rgba(0,0,0,.18)";
     box.innerHTML =
-      "<p style='margin:0 0 10px;font-weight:600'>" +
-      escapeHtml(t("checkTitle")) +
-      "</p>" +
       "<div id='lu-turnstile-slot' style='display:flex;justify-content:center;min-height:65px'></div>" +
-      "<button type='button' id='lu-turnstile-cancel' style='margin-top:8px;border:0;background:transparent;" +
-      "color:#94a3b8;font:12px system-ui;cursor:pointer'>" +
+      "<button type='button' id='lu-turnstile-cancel' style='display:block;margin:8px auto 0;border:0;" +
+      "background:transparent;color:#64748b;font:12px system-ui;cursor:pointer'>" +
       escapeHtml(t("cancel")) +
       "</button>";
     wrap.appendChild(box);
@@ -2138,9 +2092,7 @@
     function close() {
       if (closed) return;
       closed = true;
-      try {
-        wrap.remove();
-      } catch (e) {}
+      try { wrap.remove(); } catch (e) {}
     }
     document.getElementById("lu-turnstile-cancel").onclick = function () {
       close();
@@ -2152,8 +2104,8 @@
       wid = window.turnstile.render(slot, {
         sitekey: state.turnstileSiteKey,
         size: "normal",
-        theme: "dark",
-        language: L,
+        theme: "light",
+        language: pageLocale(),
         callback: function (token) {
           close();
           ok(token);
@@ -2173,6 +2125,7 @@
       fail("turnstile_render_error");
     }
   }
+
 
   // —— 8. WebRTC Session Lifecycle ——
   function stopSession(reason) {
