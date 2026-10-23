@@ -775,121 +775,109 @@
     }
     _wsRoot = _wsHost.shadowRoot || _wsHost.attachShadow({ mode: "open" });
     var style = document.createElement("style");
+    var accent = state.theme.accent || "#10b981";
     style.textContent = [
       ":host { all: initial; }",
       ".lu-backdrop {",
       "  position: fixed; inset: 0; z-index: 99990;",
-      "  background: rgba(8, 12, 20, 0.72);",
-      "  backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);",
-      "  display: none; align-items: center; justify-content: center;",
-      "  padding: 64px 16px 104px; box-sizing: border-box;",
+      "  background: rgba(2, 6, 14, 0.42);",
+      "  backdrop-filter: blur(14px) saturate(1.15);",
+      "  -webkit-backdrop-filter: blur(14px) saturate(1.15);",
+      "  display: none; align-items: flex-end; justify-content: center;",
+      "  padding: 0; box-sizing: border-box;",
       "  font-family: " + state.theme.fontSans + ";",
-      "  color: #f8fafc; opacity: 0; transition: opacity 0.24s ease;",
+      "  color: #f8fafc;",
+      "  opacity: 0; transition: opacity 0.32s ease;",
       "}",
       ".lu-backdrop.open { display: flex; opacity: 1; }",
       ".lu-stage {",
-      "  width: 100%; max-width: 880px; max-height: calc(100vh - 176px);",
-      "  overflow-y: auto; border-radius: 24px;",
-      "  background: linear-gradient(155deg, rgba(15, 23, 42, 0.94), rgba(9, 14, 26, 0.97));",
-      "  border: 1px solid rgba(255, 255, 255, 0.14);",
-      "  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.55);",
-      "  padding: 24px 28px 28px; box-sizing: border-box;",
+      "  width: 100%; max-width: 720px;",
+      "  max-height: min(78vh, 820px);",
+      "  overflow-y: auto; -webkit-overflow-scrolling: touch;",
+      "  margin: 0 12px 96px; border-radius: 28px 28px 22px 22px;",
+      "  background: linear-gradient(165deg, rgba(12,18,32,0.92), rgba(8,12,22,0.96));",
+      "  border: 1px solid rgba(255,255,255,0.12);",
+      "  box-shadow: 0 -8px 40px rgba(0,0,0,0.35), 0 24px 80px rgba(0,0,0,0.45);",
+      "  padding: 22px 22px 28px; box-sizing: border-box;",
+      "  transform: translateY(28px) scale(0.98);",
+      "  opacity: 0;",
+      "  transition: transform 0.38s cubic-bezier(0.22,1,0.36,1), opacity 0.32s ease;",
       "}",
+      ".lu-backdrop.open .lu-stage { transform: translateY(0) scale(1); opacity: 1; }",
       ".lu-top {",
-      "  display: flex; align-items: center; justify-content: space-between;",
-      "  gap: 12px; padding-bottom: 16px; margin-bottom: 20px;",
-      "  border-bottom: 1px solid rgba(255, 255, 255, 0.1);",
-      "  flex-wrap: wrap;",
+      "  display: flex; align-items: flex-start; justify-content: space-between;",
+      "  gap: 12px; margin-bottom: 8px;",
       "}",
-      ".lu-tabs { display: flex; gap: 6px; flex-wrap: wrap; }",
-      ".lu-tab {",
-      "  padding: 7px 13px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.12);",
-      "  background: rgba(255,255,255,0.04); color: #cbd5e1;",
-      "  font: 600 12px/1.2 inherit; cursor: pointer; transition: all .18s;",
-      "}",
-      ".lu-tab:hover { background: rgba(255,255,255,0.1); color: #fff; }",
-      ".lu-tab.active {",
-      "  background: " + state.theme.accent + "; color: #fff; border-color: transparent;",
-      "}",
-      ".lu-min-btn {",
-      "  padding: 7px 12px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.16);",
-      "  background: transparent; color: #94a3b8; font: 500 12px/1.2 inherit; cursor: pointer;",
-      "}",
-      ".lu-min-btn:hover { color: #fff; border-color: rgba(255,255,255,0.35); }",
       ".lu-kicker {",
-      "  font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase;",
-      "  color: #38bdf8; margin: 0 0 6px; font-weight: 700;",
+      "  margin: 0 0 4px; font: 600 11px/1.2 inherit; letter-spacing: 0.14em;",
+      "  text-transform: uppercase; color: " + accent + "; opacity: 0.95;",
       "}",
-      ".lu-title {",
-      "  font-family: " + state.theme.fontDisplay + ";",
-      "  font-size: clamp(1.35rem, 2.6vw, 1.8rem); font-weight: 700;",
-      "  margin: 0 0 6px; color: #fff; letter-spacing: -0.02em;",
+      ".lu-scene-title {",
+      "  margin: 0; font: 650 clamp(1.35rem, 4.2vw, 1.75rem)/1.2 " + (state.theme.fontDisplay || state.theme.fontSans) + ";",
+      "  letter-spacing: -0.03em; color: #fff;",
       "}",
-      ".lu-sub { font-size: 0.94rem; color: #94a3b8; margin: 0 0 20px; line-height: 1.45; }",
-      ".lu-grid {",
-      "  display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));",
-      "  gap: 14px;",
+      ".lu-tabs { display: none !important; }",
+      ".lu-min-btn {",
+      "  flex-shrink: 0; margin-top: 2px;",
+      "  padding: 8px 12px; border-radius: 999px;",
+      "  border: 1px solid rgba(255,255,255,0.14);",
+      "  background: rgba(255,255,255,0.04); color: #94a3b8;",
+      "  font: 600 12px/1 inherit; cursor: pointer;",
       "}",
+      ".lu-min-btn:active { transform: scale(0.98); }",
+      ".lu-body { margin-top: 18px; }",
       ".lu-card {",
-      "  padding: 18px; border-radius: 18px;",
-      "  background: rgba(255, 255, 255, 0.04);",
-      "  border: 1px solid rgba(255, 255, 255, 0.1);",
-      "  display: flex; flex-direction: column; justify-content: space-between;",
-      "  gap: 12px; transition: transform 0.2s, border-color 0.2s, box-shadow 0.2s;",
+      "  padding: 18px 18px 16px; margin-bottom: 12px; border-radius: 18px;",
+      "  background: rgba(255,255,255,0.04);",
+      "  border: 1px solid rgba(255,255,255,0.08);",
+      "  transition: border-color 0.2s, background 0.2s, transform 0.2s;",
       "}",
-      ".lu-card:hover { transform: translateY(-2px); border-color: rgba(255,255,255,0.24); }",
       ".lu-card.highlight {",
-      "  border-color: #22d3ee; background: rgba(34, 211, 238, 0.08);",
-      "  box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.35);",
+      "  border-color: " + accent + ";",
+      "  background: linear-gradient(135deg, rgba(255,255,255,0.07), rgba(16,185,129,0.08));",
+      "  box-shadow: 0 0 0 1px " + accent + "33, 0 12px 40px rgba(0,0,0,0.25);",
+      "  transform: translateY(-1px);",
       "}",
+      ".lu-card h3 { margin: 0 0 8px; font: 650 1.05rem/1.25 inherit; color: #fff; }",
+      ".lu-card p { margin: 0 0 14px; font: 400 0.92rem/1.45 inherit; color: #94a3b8; }",
       ".lu-badge {",
-      "  display: inline-block; align-self: flex-start; padding: 3px 9px;",
-      "  border-radius: 999px; font-size: 11px; font-weight: 600;",
-      "  background: rgba(56, 189, 248, 0.16); color: #7dd3fc;",
+      "  display: inline-block; margin-bottom: 8px; padding: 3px 8px; border-radius: 6px;",
+      "  font: 600 10px/1.2 inherit; letter-spacing: 0.04em; text-transform: uppercase;",
+      "  background: " + accent + "22; color: " + accent + ";",
       "}",
-      ".lu-card h3 { margin: 4px 0 6px; font-size: 1.05rem; color: #fff; }",
-      ".lu-card p { margin: 0; font-size: 0.88rem; color: #cbd5e1; line-height: 1.45; }",
       ".lu-card-btn {",
-      "  margin-top: 6px; padding: 9px 12px; border-radius: 10px;",
-      "  border: 1px solid rgba(255,255,255,0.16); background: rgba(255,255,255,0.06);",
-      "  color: #fff; font: 600 12px/1.2 inherit; cursor: pointer; text-align: center;",
-      "}",
-      ".lu-card-btn:hover { background: " + state.theme.accent + "; border-color: transparent; }",
-      ".lu-roi-grid {",
-      "  display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));",
-      "  gap: 18px; align-items: stretch;",
-      "}",
-      ".lu-roi-controls, .lu-roi-summary {",
-      "  padding: 18px; border-radius: 18px; background: rgba(255,255,255,0.04);",
-      "  border: 1px solid rgba(255,255,255,0.1);",
-      "}",
-      ".lu-control-group { margin-bottom: 14px; }",
-      ".lu-control-group:last-child { margin-bottom: 0; }",
-      ".lu-control-head { display: flex; justify-content: space-between; font-size: 0.86rem; margin-bottom: 6px; color: #cbd5e1; }",
-      ".lu-control-head strong { color: #fff; font-size: 0.95rem; }",
-      ".lu-range { width: 100%; accent-color: #22d3ee; cursor: pointer; }",
-      ".lu-roi-row {",
-      "  display: flex; justify-content: space-between; align-items: baseline;",
-      "  padding: 11px 0; border-bottom: 1px solid rgba(255,255,255,0.08); font-size: 0.9rem;",
-      "}",
-      ".lu-roi-row:last-of-type { border-bottom: 0; }",
-      ".lu-roi-row.hi strong { color: #34d399; font-size: 1.35rem; font-weight: 700; }",
-      ".lu-form { display: grid; gap: 14px; max-width: 480px; }",
-      ".lu-field label { display: block; font-size: 0.84rem; color: #cbd5e1; margin-bottom: 6px; }",
-      ".lu-field input {",
       "  width: 100%; padding: 11px 14px; border-radius: 12px;",
-      "  border: 1px solid rgba(255,255,255,0.18); background: rgba(15, 23, 42, 0.85);",
-      "  color: #fff; font: 500 14px/1.3 inherit; box-sizing: border-box;",
+      "  border: 1px solid rgba(255,255,255,0.12);",
+      "  background: rgba(255,255,255,0.05); color: #e2e8f0;",
+      "  font: 600 13px/1.2 inherit; cursor: pointer;",
       "}",
-      ".lu-field input:focus { outline: 2px solid #22d3ee; border-color: transparent; }",
-      ".lu-cta-btn {",
-      "  padding: 12px 18px; border-radius: 12px; border: 0;",
-      "  background: " + state.theme.accent + "; color: #fff;",
-      "  font: 600 14px/1.3 inherit; cursor: pointer; margin-top: 6px;",
+      ".lu-card.highlight .lu-card-btn {",
+      "  background: " + accent + "; border-color: transparent; color: #041016;",
       "}",
-      "@media (max-width: 640px) {",
-      "  .lu-backdrop { padding: 54px 10px 92px; }",
-      "  .lu-stage { padding: 18px 16px 22px; border-radius: 20px; }",
+      ".lu-roi-row {",
+      "  display: flex; justify-content: space-between; gap: 12px;",
+      "  padding: 12px 0; border-bottom: 1px solid rgba(255,255,255,0.08);",
+      "  font: 400 0.95rem/1.3 inherit;",
+      "}",
+      ".lu-roi-row:last-child { border-bottom: 0; }",
+      ".lu-roi-row span { color: #94a3b8; }",
+      ".lu-roi-row strong { color: #f8fafc; font-weight: 650; }",
+      ".lu-roi-row.hi strong { color: " + accent + "; font-size: 1.2rem; }",
+      ".lu-field { margin-bottom: 12px; }",
+      ".lu-field label { display: block; margin-bottom: 6px; font: 600 12px/1.2 inherit; color: #94a3b8; }",
+      ".lu-field input, .lu-field textarea {",
+      "  width: 100%; box-sizing: border-box; padding: 12px 14px; border-radius: 12px;",
+      "  border: 1px solid rgba(255,255,255,0.14); background: rgba(0,0,0,0.25);",
+      "  color: #fff; font: 400 15px/1.3 inherit; outline: none;",
+      "}",
+      ".lu-field input:focus, .lu-field textarea:focus { border-color: " + accent + "; }",
+      ".lu-submit {",
+      "  width: 100%; margin-top: 8px; padding: 14px; border-radius: 14px; border: 0;",
+      "  background: " + accent + "; color: #041016; font: 700 15px/1.2 inherit; cursor: pointer;",
+      "}",
+      "@media (min-width: 720px) {",
+      "  .lu-backdrop { align-items: center; }",
+      "  .lu-stage { margin: 0 16px 24px; border-radius: 28px; max-height: min(72vh, 760px); }",
       "}",
     ].join("\n");
 
@@ -899,12 +887,16 @@
     backdrop.innerHTML =
       "<div class='lu-stage'>" +
       "  <div class='lu-top'>" +
-      "    <div class='lu-tabs' id='lu-ws-tabs'></div>" +
+      "    <div>" +
+      "      <p class='lu-kicker' id='lu-ws-kicker'></p>" +
+      "      <h2 class='lu-scene-title' id='lu-ws-title'></h2>" +
+      "    </div>" +
       "    <button type='button' class='lu-min-btn' id='lu-ws-min'>" +
       escapeHtml(t("minimize")) +
       "</button>" +
       "  </div>" +
-      "  <div id='lu-ws-body'></div>" +
+      "  <div class='lu-tabs' id='lu-ws-tabs' hidden></div>" +
+      "  <div class='lu-body' id='lu-ws-body'></div>" +
       "</div>";
 
     _wsRoot.appendChild(style);
@@ -1045,17 +1037,7 @@
       })
       .join("");
 
-    return (
-      "<div>" +
-      "<p class='lu-kicker'>LabUpgrade AI</p>" +
-      "<h2 class='lu-title'>" +
-      escapeHtml(t(titleKey)) +
-      "</h2>" +
-      "<div class='lu-grid'>" +
-      cardsHtml +
-      "</div>" +
-      "</div>"
-    );
+    return "<div class='lu-grid'>" + cardsHtml + "</div>";
   }
 
   function renderRoiHtml(fig) {
@@ -1376,6 +1358,10 @@
     }
 
     renderTabs(key);
+    var titleEl = _wsRoot.getElementById("lu-ws-title");
+    var kickEl = _wsRoot.getElementById("lu-ws-kicker");
+    if (titleEl) titleEl.textContent = t("section_" + key) || key;
+    if (kickEl) kickEl.textContent = "Lab Upgrade";
     var body = _wsRoot.getElementById("lu-ws-body");
     var cat = buildCatalog();
 
@@ -2146,16 +2132,10 @@
   function stopSession(reason) {
     state.connected = false;
     state.connecting = false;
-    if (
-      reason === "escape" ||
-      reason === "pagehide" ||
-      reason === "session_ended" ||
-      reason === "session_blocked"
-    ) {
-      closeWorkspace();
-      var reopen = $("lu-reopen-ws");
-      if (reopen) reopen.style.display = "none";
-    }
+    /* Always restore the page: any end reason, not only escape */
+    closeWorkspace();
+    var reopen = $("lu-reopen-ws");
+    if (reopen) reopen.style.display = "none";
     setAgentState("idle");
     try {
       if (state.dc) state.dc.close();
