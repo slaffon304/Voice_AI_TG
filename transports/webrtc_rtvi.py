@@ -213,12 +213,9 @@ ROI_DEFAULTS = {
 UI_NAVIGATION_TOOL = {
     "name": "control_website_ui",
     "description": (
-        "Controls the website interface in real time. "
-        "SERIES mode (default for clients): open a prepared section "
-        "(hero, services, pricing, cases, booking_widget, contacts, roi_calculator) "
-        "and optionally highlight an element or prefill a form. "
-        "CONCEPT mode (labupgrade.ai): you may also pass a 'components' list to "
-        "assemble the view from design-system primitives. Prefer 'section' when in doubt."
+        "Controls the website interface in real time (Adaptive Workspace & site sections). "
+        "Open a prepared view (hero, services, pricing, cases, booking_widget, contacts, roi_calculator) "
+        "and optionally highlight an item or prefill form fields."
     ),
     "parameters": {
         "type": "object",
@@ -234,30 +231,15 @@ UI_NAVIGATION_TOOL = {
                     "contacts",
                     "roi_calculator",
                 ],
-                "description": "Prepared section to show (series mode). Always provide when possible.",
+                "description": "Prepared section or workspace view to display.",
             },
             "highlight_element": {
                 "type": "string",
-                "description": "Element id or plan id to visually emphasize",
+                "description": "Optional element id, plan id, or card key to visually emphasize",
             },
             "prefill_data": {
                 "type": "object",
-                "description": "Data to pre-fill into the visible form (name, phone, slot, etc.)",
-            },
-            "components": {
-                "type": "array",
-                "description": (
-                    "Optional. CONCEPT mode only: list of design-system components "
-                    "to compose the view. Each item: {type, props}. "
-                    "Series clients ignore this field."
-                ),
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "type": {"type": "string"},
-                        "props": {"type": "object"},
-                    },
-                },
+                "description": "Optional data to pre-fill into the visible form (client_name, phone, start_time, request_summary)",
             },
         },
         "required": ["section"],
@@ -710,18 +692,24 @@ async def run_webrtc_session(
             await task.queue_frames([
                 RTVIUICommandFrame(
                     command="set_agent_state",
-                    payload={"state": "solving", "label": "Calculating savings"},
-                ),
-                RTVIUICommandFrame(
-                    command="navigate_and_render",
-                    payload={"section": "roi_calculator", "highlight": None, "prefill": result},
+                    payload={"state": "solving", "label": "Calculating ROI"},
                 ),
                 RTVIUICommandFrame(command="update_roi", payload=result),
-                RTVIUICommandFrame(
-                    command="set_agent_state",
-                    payload={"state": "breathing"},
-                ),
             ])
+
+            async def _reset_orb_after_roi():
+                await asyncio.sleep(1.8)
+                if task is not None:
+                    with contextlib.suppress(Exception):
+                        await task.queue_frames([
+                            RTVIUICommandFrame(
+                                command="set_agent_state",
+                                payload={"state": "breathing"},
+                            )
+                        ])
+
+            asyncio.create_task(_reset_orb_after_roi())
+
         await params.result_callback({
             "status": "roi_updated",
             "figures": result,
@@ -1214,12 +1202,29 @@ async def run_webrtc_session(
         description = data.get("description", str(data))
         form_phone = str(data.get("phone") or data.get("client_phone") or "").strip()
         form_name = str(data.get("client_name") or data.get("name") or "").strip()
+        form_slot = str(data.get("start_time") or data.get("slot") or "").strip()
+        if form_name:
+            visitor_name = form_name
         if telefon_valid(form_phone):
-            learned_phone = form_phone
-            description = (
-                f"{description}; phone_from_form={form_phone}"
-                + (f"; name_from_form={form_name}" if form_name else "")
-            )
+            learned_phone = "".join(filter(str.isdigit, form_phone))
+            phone_verified_session = True
+            if abuse_stage == "verify_required":
+                abuse_stage = "verified"
+            context.add_message({
+                "role": "user",
+                "content": (
+                    f"SYSTEM UI EVENT: Visitor submitted the on-screen form. "
+                    f"phone={form_phone}"
+                    + (f", client_name={form_name}" if form_name else "")
+                    + (f", requested_slot={form_slot}" if form_slot else "")
+                    + ". Do NOT ask them to dictate the phone again. "
+                    "Immediately call save_lead (or Booking_tool action='book' if a slot was discussed) "
+                    "and confirm briefly aloud."
+                ),
+            })
+            if task is not None:
+                await task.queue_frames([LLMRunFrame()])
+            return
 
         context.add_message({
             "role": "user",
