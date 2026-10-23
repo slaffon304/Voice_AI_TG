@@ -2819,9 +2819,28 @@ async def widget_config(response: Response, key: str = Query("")) -> dict:
         except Exception as exc:
             log.warning("widget-config company: %s", exc)
 
+        try:
+            personas = await sb_select(
+                "bot_personas",
+                {
+                    "client_id": f"eq.{client_id}",
+                    "select": "flow_config",
+                    "limit": "1",
+                },
+                timeout=2.5,
+            )
+            if personas and personas[0].get("flow_config"):
+                raw_cfg = personas[0]["flow_config"]
+                if isinstance(raw_cfg, str):
+                    with contextlib.suppress(Exception):
+                        raw_cfg = json.loads(raw_cfg)
+                if isinstance(raw_cfg, dict) and isinstance(raw_cfg.get("ui_catalog"), dict):
+                    ui_catalog = raw_cfg["ui_catalog"]
+        except Exception as exc:
+            log.warning("widget-config ui_catalog: %s", exc)
+
     # Что включено на сайте: виджет показывает звонок, чат или меню из обоих.
-    # ui_catalog: optional override {services,pricing,cases:[{id,title,description,badge?}]}
-    # via window.LU_CATALOG on page or future bot_channels field — keep null for defaults.
+    # ui_catalog: структурированный каталог карточек из bot_personas.flow_config
     out = {
         "turnstile_site_key": rand.get("turnstile_site_key") or "",
         "voice": bool(rand.get("voice_enabled")) if rand else False,

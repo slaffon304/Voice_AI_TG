@@ -1303,39 +1303,19 @@ async def run_webrtc_session(
 
     # Стартовое приветствие (Сайт говорит первым) с WOW-эффектом:
     # Сообщение добавляется в контекст ДО запуска runner, и в очередь кладется LLMRunFrame.
-    # First turn: tools first (morph canvas), then short WOW line — not a passive receptionist.
     if call_lang == "ro":
         greeting_text = (
-            "SYSTEM EVENT: Visitor just connected. You speak first. "
-            "ORDER (mandatory): "
-            "(1) call set_agent_state with state=weaving; "
-            "(2) call control_website_ui with section=services to morph the main canvas (never scroll); "
-            "(3) then speak at most 2 short sentences in Romanian: you are the digital employee; "
-            "they do not need to read the site — you reshape it live on screen; "
-            "ask their niche and what they are losing now (calls, leads, or manual work). "
-            "Forbidden: passive lines like «Ce anume te interesează?», long menus, invented prices."
-        )
-    elif call_lang.startswith("ru"):
-        greeting_text = (
-            "SYSTEM EVENT: Visitor just connected. You speak first. "
-            "ORDER (mandatory): "
-            "(1) call set_agent_state with state=weaving; "
-            "(2) call control_website_ui with section=services to morph the main canvas (never scroll); "
-            "(3) then speak at most 2 short sentences in Russian: you are the digital employee; "
-            "they do not need to read the site — you reshape it live on screen; "
-            "ask their niche and what they lose now (missed calls, leads, or manual work). "
-            "Forbidden: «Чем могу помочь?», long menus, invented prices."
+            "SYSTEM EVENT: Client just connected to the website voice agent. Speak first! "
+            "WOW-EFFECT START: Salută scurt și cu energie (maxim 2 fraze scurte). "
+            "Explică-i că nu trebuie să citească site-ul, pentru că îl controlezi în timp real chiar pe ecranul lui. "
+            "Întreabă-l direct ce afacere are și ce provocare vrea să automatizeze."
         )
     else:
         greeting_text = (
-            "SYSTEM EVENT: Visitor just connected. You speak first. "
-            "ORDER (mandatory): "
-            "(1) call set_agent_state with state=weaving; "
-            "(2) call control_website_ui with section=services to morph the main canvas (never scroll); "
-            "(3) then speak at most 2 short sentences in the session language: you are the digital employee; "
-            "they do not need to read the site — you reshape it live on screen; "
-            "ask their niche and what they are losing now. "
-            "Forbidden: passive «How can I help?», long menus, invented prices."
+            "SYSTEM EVENT: Client just connected to the website voice agent. Speak first! "
+            "WOW-EFFECT START: Поздоровайся энергично и уверенно (максимум 2 коротких предложения). "
+            "Объясни, что посетителю не нужно читать сайт — ты управляешь им в реальном времени прямо на его экране. "
+            "Спроси, какой у него бизнес и какую задачу он хочет автоматизировать прямо сейчас."
         )
     context.add_message({"role": "user", "content": greeting_text})
     await task.queue_frames([LLMRunFrame()])
@@ -1533,12 +1513,6 @@ async def webrtc_offer(request: Request):
     key = str(body.get("key") or body.get("widget_key") or "").strip()
     visitor_id = str(body.get("visitor_id") or "").strip()
     project_id = str(body.get("project_id") or "").strip()
-    turnstile_token = str(
-        body.get("turnstile_token")
-        or body.get("t")
-        or body.get("cf-turnstile-response")
-        or ""
-    ).strip()
     raw_lang = str(body.get("lang") or body.get("language") or body.get("locale") or "").strip()
     accept_lang = request.headers.get("accept-language") or ""
     device_lang = ""
