@@ -138,6 +138,7 @@
       vs_sms_failed: "SMS не отправилось, попробуйте ещё раз",
       vs_wait: "Повторно можно через {sec} с",
       vs_verified: "Номер подтверждён",
+      micPaused: "Микрофон на паузе — подтвердите номер",
       bookCheckTitle: "Проверьте запись",
       bookCheckSub: "Если всё верно — подтвердите на экране или скажите «да».",
       bookPhoneRo: "Телефон",
@@ -205,6 +206,7 @@
       vs_sms_failed: "SMS-ul nu a plecat, încercați din nou",
       vs_wait: "Puteți retrimite peste {sec} s",
       vs_verified: "Număr confirmat",
+      micPaused: "Microfonul e în pauză — confirmați numărul",
       bookCheckTitle: "Verificați programarea",
       bookCheckSub: "Dacă totul este corect — confirmați pe ecran sau spuneți «da».",
       bookPhoneRo: "Telefon",
@@ -272,6 +274,7 @@
       vs_sms_failed: "SMS was not sent, please try again",
       vs_wait: "You can resend in {sec}s",
       vs_verified: "Number confirmed",
+      micPaused: "Microphone paused — confirm your number",
       bookCheckTitle: "Check your booking",
       bookCheckSub: "If everything is right — confirm on screen or say “yes”.",
       bookPhoneRo: "Phone",
@@ -1869,6 +1872,16 @@
   /* SMS phone verification: number via phone autofill, code via SMS autofill. Server decides. */
   var _otpAbort = null;
 
+  function setMicEnabled(on) {
+    try {
+      if (state.localStream) {
+        state.localStream.getAudioTracks().forEach(function (tr) {
+          tr.enabled = !!on;
+        });
+      }
+    } catch (e) {}
+  }
+
   function closeVerifyModal() {
     try {
       if (_otpAbort) _otpAbort.abort();
@@ -1931,6 +1944,9 @@
 
   function showVerifyModal(payload) {
     if ($("lu-verify-modal")) return;
+    /* Microphone paused while the number is confirmed (the server also stops audio to the model) */
+    setMicEnabled(false);
+    setAgentState("breathing", t("micPaused"));
     var wrap = document.createElement("div");
     wrap.id = "lu-verify-modal";
     wrap.style.cssText =
@@ -2047,6 +2063,8 @@
       listenSmsCode();
     } else if (st === "verified") {
       verifyStatus(t("vs_verified"), false);
+      setMicEnabled(true);
+      setAgentState("breathing");
       setTimeout(closeVerifyModal, 700);
     } else if (st === "bad_code") {
       verifyStatus(t("vs_bad_code").replace("{n}", String(payload.attempts_left != null ? payload.attempts_left : "")), true);
