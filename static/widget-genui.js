@@ -469,7 +469,7 @@
   }
 
   function extractCardsFromSection(rootEl, fallbackItems) {
-    if (!rootEl) return fallbackItems;
+    if (!rootEl) return fallbackItems || [];
     var items = [];
     var seen = {};
     var headings = rootEl.querySelectorAll("h3, h4, .card-title, [class*='title']");
@@ -495,7 +495,7 @@
         });
       }
     });
-    return items.length >= 2 ? items : fallbackItems;
+    return items.length >= 2 ? items : (fallbackItems || []);
   }
 
   function getDefaultCatalog() {
@@ -505,61 +505,63 @@
         services: [
           {
             id: "voice-ai",
-            title: "Agenți Vocali AI 24/7 (GSM & WebRTC)",
-            description: "Preluarea apelurilor și consultarea vizitatorilor pe site în timp real, fără timp de așteptare.",
-            badge: "Live S2S",
+            title: "Agenți vocali AI 24/7",
+            description:
+              "Preluare apeluri GSM și consultare pe site în timp real — fără coadă, cu rezumat după fiecare conversație.",
+            badge: "Live",
           },
           {
-            id: "crm-sync",
-            title: "Integrare CRM & Google Calendar",
-            description: "Calificarea lead-urilor, programări automate în calendar și rezumat după fiecare apel.",
-            badge: "End-to-End",
-          },
-          {
-            id: "omnichannel",
-            title: "Automatizare Messengers & Chat",
-            description: "Răspunsuri instantanee pe Telegram, WhatsApp, Instagram și site cu memorie unică a clientului.",
+            id: "chat-omni",
+            title: "Chat & Call Center AI",
+            description:
+              "Vânzări, suport și programări pe site, Telegram, WhatsApp — memorie unică a clientului.",
             badge: "Omnichannel",
+          },
+          {
+            id: "crm-suite",
+            title: "CRM / ERP / MIS unificat",
+            description:
+              "Un sistem inteligent care adună vânzările, contabilitatea și managementul într-un singur flux.",
+            badge: "Platformă",
           },
         ],
         pricing: [
           {
-            id: "starter",
-            title: "Start / Pilot",
-            description: "Agent vocal sau chat pe un canal, calificare lead-uri și notificări în Telegram/CRM.",
-            badge: "Lansare rapidă",
+            id: "pilot",
+            title: "Pilot rapid",
+            description:
+              "Un canal (voce sau chat), calificare lead-uri, notificări în Telegram — lansare în zile, nu luni.",
+            badge: "Start",
           },
           {
-            id: "business",
-            title: "Business System",
-            description: "Telefonie GSM + Web GenUI + integrare completă cu CRM, Calendar și baza de cunoștințe.",
-            badge: "Cel mai ales",
+            id: "growth",
+            title: "Growth",
+            description:
+              "Voce + chat, calendar, CRM, înregistrare și sumarizare — flux complet de vânzări.",
+            badge: "Recomandat",
           },
           {
             id: "enterprise",
-            title: "Custom / Enterprise",
-            description: "Arhitectură dedicată, ERP/MIS custom și automatizarea proceselor interne complexe.",
-            badge: "La cheie",
+            title: "Enterprise",
+            description:
+              "Omnichannel, integrări personalizate, SLA și agent digital sub brandul companiei.",
+            badge: "Scale",
           },
         ],
         cases: [
           {
-            id: "case-b2b",
-            title: "Producție & B2B: 0 apeluri pierdute",
-            description: "Preluarea a 100% din solicitările din afara orelor de program și creșterea conversiei în întâlniri cu +35%.",
-            badge: "+35% conversie",
+            id: "missed-calls",
+            title: "0 apeluri ratate",
+            description:
+              "Producție și servicii: agentul preia lead-urile noaptea și în weekend, managerul primește rezumatul dimineața.",
+            badge: "Impact",
           },
           {
-            id: "case-clinic",
-            title: "Clinici & Servicii: Programare automată",
-            description: "Agentul verifică sloturile libere în Google Calendar și confirmă programarea în 40 de secunde.",
-            badge: "24/7 Booking",
-          },
-          {
-            id: "case-auto",
-            title: "Auto & Imobiliare: Calificare instantanee",
-            description: "Filtrarea solicitărilor, calculul bugetului și transferul doar al clienților calificați către manageri.",
-            badge: "ROI < 14 zile",
+            id: "speed-to-lead",
+            title: "Răspuns în secunde",
+            description:
+              "Mesajele din social și de pe site nu mai stau în coadă — calificare și programare pe loc.",
+            badge: "Conversie",
           },
         ],
       };
@@ -569,61 +571,63 @@
         services: [
           {
             id: "voice-ai",
-            title: "Голосовые ИИ-агенты 24/7 (GSM и Сайт)",
-            description: "Живое общение по телефону и на сайте с мгновенной реакцией экрана, записью и суммаризацией.",
-            badge: "Live Voice",
+            title: "Голосовые AI-агенты 24/7",
+            description:
+              "GSM и сайт: приём звонков и консультация посетителя в реальном времени, с записью и саммари для менеджера.",
+            badge: "Live",
           },
           {
-            id: "crm-sync",
-            title: "Интеграция с CRM и Календарём",
-            description: "Автоматическая квалификация лида, проверка свободных окон и бронь встреч без участия менеджера.",
-            badge: "Авто-воронка",
+            id: "chat-omni",
+            title: "Чат и AI Call Center",
+            description:
+              "Продажи, поддержка и запись на услуги на сайте и в мессенджерах — одна память о клиенте.",
+            badge: "Omnichannel",
           },
           {
-            id: "omnichannel",
-            title: "Омниканальные ИИ-сотрудники",
-            description: "Единая память клиента между телефонией, сайтом, Telegram, WhatsApp и вашей CRM-системой.",
-            badge: "360° Память",
+            id: "crm-suite",
+            title: "CRM / ERP / MIS",
+            description:
+              "Единая система: продажи, учёт и процессы без разрозненных таблиц и потерянных заявок.",
+            badge: "Платформа",
           },
         ],
         pricing: [
           {
-            id: "starter",
-            title: "Старт / Пилот",
-            description: "Запуск голосового или текстового агента, сбор квалифицированных заявок и передача в CRM / Telegram.",
-            badge: "Быстрый старт",
+            id: "pilot",
+            title: "Пилот",
+            description:
+              "Один канал (голос или чат), квалификация лидов, уведомления в Telegram — запуск за дни.",
+            badge: "Старт",
           },
           {
-            id: "business",
-            title: "Бизнес-система",
-            description: "Связка GSM-телефонии + интерактивного сайта + двусторонняя интеграция с CRM и Google Calendar.",
-            badge: "Оптимальный",
+            id: "growth",
+            title: "Growth",
+            description:
+              "Голос + чат, календарь, CRM, запись и суммаризация — полный цикл до встречи с менеджером.",
+            badge: "Рекомендуем",
           },
           {
             id: "enterprise",
-            title: "Корпоративный / Custom",
-            description: "Кастомная архитектура, собственные CRM/ERP-модули и глубокая автоматизация отделов продаж.",
-            badge: "Под ключ",
+            title: "Enterprise",
+            description:
+              "Omnichannel, свои интеграции, SLA и цифровой сотрудник под брендом компании.",
+            badge: "Масштаб",
           },
         ],
         cases: [
           {
-            id: "case-b2b",
-            title: "Производство и B2B: возврат упущенных заявок",
-            description: "Мгновенная обработка 100% звонков и обращений в нерабочее время, рост конверсии в целевой созвон на 35%.",
-            badge: "+35% к лидам",
+            id: "missed-calls",
+            title: "Ноль упущенных обращений",
+            description:
+              "Производство и сервис: агент забирает лиды ночью и в выходные, утром у менеджера уже саммари.",
+            badge: "Эффект",
           },
           {
-            id: "case-clinic",
-            title: "Клиники и сервис: запись без администратора",
-            description: "Агент сам сверяет слоты в календаре, записывает клиента и отправляет SMS-подтверждение за 45 секунд.",
-            badge: "24/7 Запись",
-          },
-          {
-            id: "case-auto",
-            title: "Недвижимость и Авто: квалификация до отдела продаж",
-            description: "ИИ выявляет бюджет, сроки и задачу клиента, передавая менеджерам уже готовых к сделке покупателей.",
-            badge: "Окупаемость < 14 дн.",
+            id: "speed-to-lead",
+            title: "Ответ за секунды",
+            description:
+              "Заявки с сайта и из соцсетей не копятся в очереди — квалификация и слот в календаре сразу.",
+            badge: "Конверсия",
           },
         ],
       };
@@ -632,76 +636,88 @@
       services: [
         {
           id: "voice-ai",
-          title: "24/7 Voice AI Agents (GSM & Web)",
-          description: "Real-time voice consultation on phone lines and your website with live screen orchestration.",
-          badge: "Live S2S",
+          title: "Voice AI agents 24/7",
+          description:
+            "GSM and website: live calls and on-site consults with recording and manager summaries.",
+          badge: "Live",
         },
         {
-          id: "crm-sync",
-          title: "CRM & Calendar Automation",
-          description: "Automated lead qualification, real-time slot checking, and instant appointment booking.",
-          badge: "End-to-End",
+          id: "chat-omni",
+          title: "Chat & AI call center",
+          description:
+            "Sales, support and booking on the site and messengers — one memory per visitor.",
+          badge: "Omnichannel",
         },
         {
-          id: "omnichannel",
-          title: "Omnichannel Customer Memory",
-          description: "Unified customer context across phone calls, web sessions, messengers, and your CRM.",
-          badge: "360° Context",
+          id: "crm-suite",
+          title: "CRM / ERP / MIS",
+          description:
+            "One system for sales, ops and follow-up — fewer lost leads and spreadsheets.",
+          badge: "Platform",
         },
       ],
       pricing: [
         {
-          id: "starter",
-          title: "Starter / Pilot",
-          description: "Single-channel AI agent with lead qualification and instant CRM/Telegram notifications.",
-          badge: "Fast launch",
+          id: "pilot",
+          title: "Pilot",
+          description:
+            "One channel (voice or chat), lead qualification, Telegram alerts — live in days.",
+          badge: "Start",
         },
         {
-          id: "business",
-          title: "Business Suite",
-          description: "Full GSM + Web GenUI agent with live Google Calendar booking and CRM pipeline sync.",
-          badge: "Most popular",
+          id: "growth",
+          title: "Growth",
+          description:
+            "Voice + chat, calendar, CRM, recording and summaries — full path to a booked meeting.",
+          badge: "Recommended",
         },
         {
           id: "enterprise",
-          title: "Enterprise Custom",
-          description: "Bespoke multi-agent workflows, ERP/CRM integrations, and custom business logic.",
-          badge: "Turnkey",
+          title: "Enterprise",
+          description:
+            "Omnichannel, custom integrations, SLA and a digital employee under your brand.",
+          badge: "Scale",
         },
       ],
       cases: [
         {
-          id: "case-b2b",
-          title: "Manufacturing & B2B: Zero Missed Demand",
-          description: "Captured 100% of after-hours inquiries and increased qualified pipeline conversion by 35%.",
-          badge: "+35% conversion",
+          id: "missed-calls",
+          title: "Zero missed inquiries",
+          description:
+            "After-hours and weekend demand captured; managers get a clean summary in the morning.",
+          badge: "Impact",
         },
         {
-          id: "case-clinic",
-          title: "Healthcare & Services: Automated Booking",
-          description: "Real-time calendar slot verification and booking completed in under 45 seconds.",
-          badge: "24/7 Booking",
-        },
-        {
-          id: "case-auto",
-          title: "Real Estate & Auto: Instant Qualification",
-          description: "Pre-qualifies budget and timeline by voice before handing over warm buyers to sales.",
-          badge: "Payback < 14d",
+          id: "speed-to-lead",
+          title: "Reply in seconds",
+          description:
+            "Site and social leads qualified and booked without a human in the first response.",
+          badge: "Conversion",
         },
       ],
     };
   }
 
+
   function buildCatalog() {
     var def = getDefaultCatalog();
-    var custom = window.LU_CATALOG || (state.catalog && state.catalog) || {};
+    var custom =
+      (window.LU_CATALOG && typeof window.LU_CATALOG === "object"
+        ? window.LU_CATALOG
+        : null) ||
+      (state.catalog && typeof state.catalog === "object" ? state.catalog : {}) ||
+      {};
     var map = state.sectionMap || {};
+    function pick(key) {
+      if (Array.isArray(custom[key]) && custom[key].length) return custom[key];
+      var fromDom = extractCardsFromSection(map[key], null);
+      if (fromDom && fromDom.length) return fromDom;
+      return def[key] || [];
+    }
     return {
-      services:
-        custom.services || extractCardsFromSection(map.services, def.services),
-      pricing:
-        custom.pricing || extractCardsFromSection(map.pricing, def.pricing),
-      cases: custom.cases || extractCardsFromSection(map.cases, def.cases),
+      services: pick("services"),
+      pricing: pick("pricing"),
+      cases: pick("cases"),
     };
   }
 
@@ -1361,7 +1377,8 @@
     var titleEl = _wsRoot.getElementById("lu-ws-title");
     var kickEl = _wsRoot.getElementById("lu-ws-kicker");
     if (titleEl) titleEl.textContent = t("section_" + key) || key;
-    if (kickEl) kickEl.textContent = "Lab Upgrade";
+    if (kickEl)
+      kickEl.textContent = state.companyName || "Lab Upgrade";
     var body = _wsRoot.getElementById("lu-ws-body");
     var cat = buildCatalog();
 
@@ -1960,6 +1977,9 @@
         }
         if (d.ui_catalog && typeof d.ui_catalog === "object") {
           state.catalog = d.ui_catalog;
+        }
+        if (d.company_name) {
+          state.companyName = String(d.company_name);
         }
         if (d.voice_enabled === false || d.voice === false)
           state.voiceEnabled = false;
