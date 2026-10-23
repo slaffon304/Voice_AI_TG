@@ -286,24 +286,39 @@
       if (bodyStyle && bodyStyle.fontFamily) {
         state.theme.fontSans = bodyStyle.fontFamily;
       }
+      if (bodyStyle && bodyStyle.color) {
+        state.theme.text = bodyStyle.color;
+      }
       var h1 = qs("h1, h2");
       if (h1) {
         var h1Style = window.getComputedStyle(h1);
         if (h1Style && h1Style.fontFamily) {
           state.theme.fontDisplay = h1Style.fontFamily;
         }
+        if (h1Style && h1Style.color) {
+          state.theme.heading = h1Style.color;
+        }
+      }
+      /* Sample a real surface from the page (hero/card) — never invent a palette */
+      var sample =
+        qs("section.hero, .hero, main, .service-card, .pricing-card, section") ||
+        document.body;
+      var ss = window.getComputedStyle(sample);
+      if (ss) {
+        if (ss.backgroundColor && ss.backgroundColor !== "rgba(0, 0, 0, 0)" && ss.backgroundColor !== "transparent") {
+          state.theme.surface = ss.backgroundColor;
+        }
+        if (ss.color) state.theme.text = state.theme.text || ss.color;
       }
       var cta = qs(
-        "a.btn, a.button, button[type='submit'], [class*='cta'], header a[href*='#contact']"
+        "a.pill, a.btn, a.button, button[type='submit'], [class*='cta']"
       );
       if (cta) {
         var bg = window.getComputedStyle(cta).backgroundColor;
         if (
           bg &&
           bg !== "rgba(0, 0, 0, 0)" &&
-          bg !== "transparent" &&
-          bg !== "rgb(255, 255, 255)" &&
-          bg !== "rgb(0, 0, 0)"
+          bg !== "transparent"
         ) {
           state.theme.accent = bg;
         }
@@ -791,115 +806,104 @@
     }
     _wsRoot = _wsHost.shadowRoot || _wsHost.attachShadow({ mode: "open" });
     var style = document.createElement("style");
-    var accent = state.theme.accent || "#10b981";
+    var accent = state.theme.accent || "currentColor";
+    var text = state.theme.text || "inherit";
+    var heading = state.theme.heading || text;
+    var font = state.theme.fontSans || "inherit";
+    var fontDisplay = state.theme.fontDisplay || font;
+    /* No hardcoded page background — site remains visible. No framed panel. */
     style.textContent = [
       ":host { all: initial; }",
       ".lu-backdrop {",
       "  position: fixed; inset: 0; z-index: 99990;",
-      "  background: rgba(2, 6, 14, 0.42);",
-      "  backdrop-filter: blur(14px) saturate(1.15);",
-      "  -webkit-backdrop-filter: blur(14px) saturate(1.15);",
-      "  display: none; align-items: flex-end; justify-content: center;",
-      "  padding: 0; box-sizing: border-box;",
-      "  font-family: " + state.theme.fontSans + ";",
-      "  color: #f8fafc;",
-      "  opacity: 0; transition: opacity 0.32s ease;",
+      "  background: transparent;",
+      "  display: none; flex-direction: column;",
+      "  box-sizing: border-box;",
+      "  font-family: " + font + ";",
+      "  color: " + text + ";",
+      "  opacity: 0; transition: opacity 0.25s ease;",
       "}",
       ".lu-backdrop.open { display: flex; opacity: 1; }",
       ".lu-stage {",
-      "  width: 100%; max-width: 720px;",
-      "  max-height: min(78vh, 820px);",
+      "  flex: 1; min-height: 0; width: 100%; max-width: 720px;",
+      "  margin: 0 auto; padding: max(56px, env(safe-area-inset-top)) 18px 110px;",
       "  overflow-y: auto; -webkit-overflow-scrolling: touch;",
-      "  margin: 0 12px 96px; border-radius: 28px 28px 22px 22px;",
-      "  background: linear-gradient(165deg, rgba(12,18,32,0.92), rgba(8,12,22,0.96));",
-      "  border: 1px solid rgba(255,255,255,0.12);",
-      "  box-shadow: 0 -8px 40px rgba(0,0,0,0.35), 0 24px 80px rgba(0,0,0,0.45);",
-      "  padding: 22px 22px 28px; box-sizing: border-box;",
-      "  transform: translateY(28px) scale(0.98);",
-      "  opacity: 0;",
-      "  transition: transform 0.38s cubic-bezier(0.22,1,0.36,1), opacity 0.32s ease;",
+      "  box-sizing: border-box;",
+      "  background: transparent; border: 0; box-shadow: none; border-radius: 0;",
       "}",
-      ".lu-backdrop.open .lu-stage { transform: translateY(0) scale(1); opacity: 1; }",
       ".lu-top {",
       "  display: flex; align-items: flex-start; justify-content: space-between;",
-      "  gap: 12px; margin-bottom: 8px;",
+      "  gap: 12px; margin-bottom: 18px;",
       "}",
       ".lu-kicker {",
-      "  margin: 0 0 4px; font: 600 11px/1.2 inherit; letter-spacing: 0.14em;",
-      "  text-transform: uppercase; color: " + accent + "; opacity: 0.95;",
+      "  margin: 0 0 6px; font: 600 11px/1.2 inherit; letter-spacing: 0.12em;",
+      "  text-transform: uppercase; color: " + accent + "; opacity: 0.9;",
       "}",
       ".lu-scene-title {",
-      "  margin: 0; font: 650 clamp(1.35rem, 4.2vw, 1.75rem)/1.2 " + (state.theme.fontDisplay || state.theme.fontSans) + ";",
-      "  letter-spacing: -0.03em; color: #fff;",
+      "  margin: 0; font: 650 clamp(1.4rem, 4.2vw, 1.85rem)/1.15 " + fontDisplay + ";",
+      "  letter-spacing: -0.03em; color: " + heading + ";",
+      "}",
+      ".lu-min-btn {",
+      "  flex-shrink: 0; border: 0; background: transparent; color: " + text + ";",
+      "  font: 600 12px/1.2 inherit; opacity: 0.55; cursor: pointer; padding: 6px 0;",
+      "  text-decoration: underline; text-underline-offset: 3px;",
       "}",
       ".lu-tabs { display: none !important; }",
-      ".lu-min-btn {",
-      "  flex-shrink: 0; margin-top: 2px;",
-      "  padding: 8px 12px; border-radius: 999px;",
-      "  border: 1px solid rgba(255,255,255,0.14);",
-      "  background: rgba(255,255,255,0.04); color: #94a3b8;",
-      "  font: 600 12px/1 inherit; cursor: pointer;",
+      ".lu-body { display: flex; flex-direction: column; gap: 10px; }",
+      /* Accordion: one expanded, rest collapsed */
+      ".lu-acc { display: flex; flex-direction: column; gap: 8px; }",
+      ".lu-acc-item {",
+      "  border: 0; background: transparent; padding: 0; margin: 0;",
       "}",
-      ".lu-min-btn:active { transform: scale(0.98); }",
-      ".lu-body { margin-top: 18px; }",
-      ".lu-card {",
-      "  padding: 18px 18px 16px; margin-bottom: 12px; border-radius: 18px;",
-      "  background: rgba(255,255,255,0.04);",
-      "  border: 1px solid rgba(255,255,255,0.08);",
-      "  transition: border-color 0.2s, background 0.2s, transform 0.2s;",
+      ".lu-acc-head {",
+      "  display: flex; align-items: center; gap: 10px; width: 100%;",
+      "  padding: 12px 0; border: 0; border-bottom: 1px solid color-mix(in srgb, " + text + " 14%, transparent);",
+      "  background: transparent; color: inherit; font: inherit; text-align: left;",
+      "  cursor: pointer;",
       "}",
-      ".lu-card.highlight {",
-      "  border-color: " + accent + ";",
-      "  background: linear-gradient(135deg, rgba(255,255,255,0.07), rgba(16,185,129,0.08));",
-      "  box-shadow: 0 0 0 1px " + accent + "33, 0 12px 40px rgba(0,0,0,0.25);",
-      "  transform: translateY(-1px);",
+      ".lu-acc-item.is-open .lu-acc-head { border-bottom-color: transparent; }",
+      ".lu-acc-badge {",
+      "  flex-shrink: 0; font: 600 10px/1.2 inherit; letter-spacing: 0.06em;",
+      "  text-transform: uppercase; padding: 4px 8px; border-radius: 999px;",
+      "  color: " + accent + ";",
+      "  border: 1px solid color-mix(in srgb, " + accent + " 45%, transparent);",
+      "  background: transparent;",
       "}",
-      ".lu-card h3 { margin: 0 0 8px; font: 650 1.05rem/1.25 inherit; color: #fff; }",
-      ".lu-card p { margin: 0 0 14px; font: 400 0.92rem/1.45 inherit; color: #94a3b8; }",
-      ".lu-badge {",
-      "  display: inline-block; margin-bottom: 8px; padding: 3px 8px; border-radius: 6px;",
-      "  font: 600 10px/1.2 inherit; letter-spacing: 0.04em; text-transform: uppercase;",
-      "  background: " + accent + "22; color: " + accent + ";",
+      ".lu-acc-title {",
+      "  flex: 1; margin: 0; font: 650 1.05rem/1.25 " + fontDisplay + ";",
+      "  color: " + heading + "; letter-spacing: -0.02em;",
       "}",
-      ".lu-card-btn {",
-      "  width: 100%; padding: 11px 14px; border-radius: 12px;",
-      "  border: 1px solid rgba(255,255,255,0.12);",
-      "  background: rgba(255,255,255,0.05); color: #e2e8f0;",
-      "  font: 600 13px/1.2 inherit; cursor: pointer;",
+      ".lu-acc-body {",
+      "  display: none; padding: 0 0 16px;",
+      "  font: 400 0.98rem/1.5 inherit; color: " + text + "; opacity: 0.88;",
       "}",
-      ".lu-card.highlight .lu-card-btn {",
-      "  background: " + accent + "; border-color: transparent; color: #041016;",
+      ".lu-acc-item.is-open .lu-acc-body { display: block; }",
+      ".lu-acc-item:not(.is-open) .lu-acc-title { font-size: 0.95rem; opacity: 0.72; }",
+      /* ROI / booking keep simple layout without a frame */
+      ".lu-roi-grid, .lu-form { display: grid; gap: 12px; }",
+      ".lu-control-group, .lu-roi-out, .lu-form label {",
+      "  display: block; padding: 10px 0; border-bottom: 1px solid color-mix(in srgb, " + text + " 12%, transparent);",
       "}",
-      ".lu-roi-row {",
-      "  display: flex; justify-content: space-between; gap: 12px;",
-      "  padding: 12px 0; border-bottom: 1px solid rgba(255,255,255,0.08);",
-      "  font: 400 0.95rem/1.3 inherit;",
+      ".lu-control-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 6px; }",
+      "input[type='range'] { width: 100%; }",
+      "input[type='text'], input[type='tel'] {",
+      "  width: 100%; box-sizing: border-box; padding: 10px 12px;",
+      "  border: 1px solid color-mix(in srgb, " + text + " 22%, transparent);",
+      "  border-radius: 10px; background: transparent; color: inherit; font: inherit;",
       "}",
-      ".lu-roi-row:last-child { border-bottom: 0; }",
-      ".lu-roi-row span { color: #94a3b8; }",
-      ".lu-roi-row strong { color: #f8fafc; font-weight: 650; }",
-      ".lu-roi-row.hi strong { color: " + accent + "; font-size: 1.2rem; }",
-      ".lu-field { margin-bottom: 12px; }",
-      ".lu-field label { display: block; margin-bottom: 6px; font: 600 12px/1.2 inherit; color: #94a3b8; }",
-      ".lu-field input, .lu-field textarea {",
-      "  width: 100%; box-sizing: border-box; padding: 12px 14px; border-radius: 12px;",
-      "  border: 1px solid rgba(255,255,255,0.14); background: rgba(0,0,0,0.25);",
-      "  color: #fff; font: 400 15px/1.3 inherit; outline: none;",
+      ".lu-primary {",
+      "  margin-top: 8px; border: 0; border-radius: 999px; padding: 12px 18px;",
+      "  font: 600 14px/1.2 inherit; cursor: pointer;",
+      "  background: " + accent + "; color: #fff;",
       "}",
-      ".lu-field input:focus, .lu-field textarea:focus { border-color: " + accent + "; }",
-      ".lu-submit {",
-      "  width: 100%; margin-top: 8px; padding: 14px; border-radius: 14px; border: 0;",
-      "  background: " + accent + "; color: #041016; font: 700 15px/1.2 inherit; cursor: pointer;",
-      "}",
-      "@media (min-width: 720px) {",
-      "  .lu-backdrop { align-items: center; }",
-      "  .lu-stage { margin: 0 16px 24px; border-radius: 28px; max-height: min(72vh, 760px); }",
-      "}",
-    ].join("\n");
+      ".lu-sub { opacity: 0.75; margin: 0 0 12px; }",
+      ".lu-title { margin: 0 0 8px; font: 650 1.35rem/1.2 " + fontDisplay + "; color: " + heading + "; }",
+    ].join("\\n");
+    _wsRoot.appendChild(style);
 
     var backdrop = document.createElement("div");
-    backdrop.className = "lu-backdrop";
     backdrop.id = "lu-ws-backdrop";
+    backdrop.className = "lu-backdrop";
     backdrop.innerHTML =
       "<div class='lu-stage'>" +
       "  <div class='lu-top'>" +
@@ -914,14 +918,10 @@
       "  <div class='lu-tabs' id='lu-ws-tabs' hidden></div>" +
       "  <div class='lu-body' id='lu-ws-body'></div>" +
       "</div>";
-
-    _wsRoot.appendChild(style);
     _wsRoot.appendChild(backdrop);
-
     _wsRoot.getElementById("lu-ws-min").addEventListener("click", function () {
       closeWorkspace();
     });
-
     return _wsRoot;
   }
 
@@ -1013,47 +1013,55 @@
   }
 
   function renderCardDeckHtml(sectionKey, items, highlightId) {
-    var titleKey = "section_" + sectionKey;
-    var hi = (highlightId || "").toLowerCase();
-    var cardsHtml = (items || [])
-      .map(function (item, idx) {
-        var isHi =
-          (hi &&
-            (String(item.id).toLowerCase().indexOf(hi) !== -1 ||
-              String(item.title).toLowerCase().indexOf(hi) !== -1)) ||
-          (!hi && sectionKey === "pricing" && idx === 1);
+    items = items || [];
+    var hi = (highlightId || state.activeHighlight || "").toLowerCase();
+    var openId = null;
+    if (hi) {
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        if (
+          String(it.id).toLowerCase() === hi ||
+          String(it.id).toLowerCase().indexOf(hi) !== -1 ||
+          String(it.title).toLowerCase().indexOf(hi) !== -1
+        ) {
+          openId = it.id;
+          break;
+        }
+      }
+    }
+    if (!openId && items.length) openId = items[0].id;
+    state.activeHighlight = openId;
+
+    var html = items
+      .map(function (item) {
+        var isOpen = String(item.id) === String(openId);
         return (
-          "<div class='lu-card" +
-          (isHi ? " highlight" : "") +
+          "<div class='lu-acc-item" +
+          (isOpen ? " is-open" : "") +
           "' data-card-id='" +
           escapeHtml(item.id) +
           "'>" +
-          "<div>" +
-          (item.badge
-            ? "<span class='lu-badge'>" +
-              escapeHtml(isHi ? t("recommended") + " · " + item.badge : item.badge) +
-              "</span>"
-            : isHi
-              ? "<span class='lu-badge'>" + escapeHtml(t("recommended")) + "</span>"
-              : "") +
-          "<h3>" +
-          escapeHtml(item.title) +
-          "</h3>" +
-          "<p>" +
-          escapeHtml(item.description) +
-          "</p>" +
-          "</div>" +
-          "<button type='button' class='lu-card-btn' data-select-title='" +
+          "<button type='button' class='lu-acc-head' data-acc-id='" +
+          escapeHtml(item.id) +
+          "' data-select-title='" +
           escapeHtml(item.title) +
           "'>" +
-          escapeHtml(t("selectItem")) +
+          (item.badge
+            ? "<span class='lu-acc-badge'>" + escapeHtml(item.badge) + "</span>"
+            : "") +
+          "<span class='lu-acc-title'>" +
+          escapeHtml(item.title) +
+          "</span>" +
           "</button>" +
+          "<div class='lu-acc-body'>" +
+          escapeHtml(item.description) +
+          "</div>" +
           "</div>"
         );
       })
       .join("");
 
-    return "<div class='lu-grid'>" + cardsHtml + "</div>";
+    return "<div class='lu-acc' data-section='" + escapeHtml(sectionKey) + "'>" + html + "</div>";
   }
 
   function renderRoiHtml(fig) {
@@ -1233,16 +1241,26 @@
     var body = _wsRoot.getElementById("lu-ws-body");
     if (!body) return;
 
-    body.querySelectorAll("[data-select-title]").forEach(function (btn) {
+    body.querySelectorAll("[data-acc-id]").forEach(function (btn) {
       btn.addEventListener("click", function () {
-        var itemTitle = btn.getAttribute("data-select-title");
+        var id = btn.getAttribute("data-acc-id");
+        var itemTitle = btn.getAttribute("data-select-title") || id;
+        var root = body.querySelector(".lu-acc");
+        if (root) {
+          root.querySelectorAll(".lu-acc-item").forEach(function (el) {
+            if (el.getAttribute("data-card-id") === id) el.classList.add("is-open");
+            else el.classList.remove("is-open");
+          });
+        }
+        state.activeHighlight = id;
         sendClientMessage({
           type: "ui_user_interaction",
           data: {
             interaction: "item_selected",
             section: sectionKey,
             item: itemTitle,
-            description: "Visitor clicked option: " + itemTitle,
+            item_id: id,
+            description: "Visitor focused option: " + itemTitle,
           },
         });
       });
@@ -2330,6 +2348,14 @@
     setTimeout(scanPageSections, 1200);
 
     var cfg = await loadConfig();
+    /* Workspace on load — first catalog item expanded, site design stays behind */
+    var firstId = null;
+    try {
+      var svc = (state.catalog && state.catalog.services) || [];
+      if (svc.length) firstId = svc[0].id;
+    } catch (e) {}
+    focusSection("services", firstId);
+
     if (!state.voiceEnabled) return;
 
     if (state.turnstileSiteKey) {
