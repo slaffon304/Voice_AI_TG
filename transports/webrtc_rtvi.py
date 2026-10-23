@@ -464,7 +464,13 @@ def _compute_roi(args: dict[str, Any]) -> dict[str, Any]:
     def _num(key: str, default: float) -> float:
         try:
             v = args.get(key)
-            return float(v) if v is not None else default
+            if v is None:
+                return default
+            n = float(v)
+            # Model sometimes sends 0 by mistake — treat non-positive as "use default"
+            if n <= 0 and key in ("cost_per_missed_lead", "capture_rate", "ai_monthly_cost"):
+                return default
+            return n
         except (TypeError, ValueError):
             return default
 
@@ -1301,22 +1307,49 @@ async def run_webrtc_session(
         with contextlib.suppress(Exception):
             await rtvi_proc.set_bot_ready()
 
-    # Стартовое приветствие (Сайт говорит первым) с WOW-эффектом:
-    # Сообщение добавляется в контекст ДО запуска runner, и в очередь кладется LLMRunFrame.
+    # Стартовое приветствие: память + имя, без повторной квалификации
+    mem_core = ((visitor_memory or {}).get("core") or "").strip()
+    mem_short = ((visitor_memory or {}).get("short") or "").strip()
+    has_memory = bool(mem_core or mem_short or visitor_name)
+    name_hint = visitor_name or ""
+
     if call_lang == "ro":
-        greeting_text = (
-            "SYSTEM EVENT: Client just connected to the website voice agent. Speak first! "
-            "WOW-EFFECT START: Salută scurt și cu energie (maxim 2 fraze scurte). "
-            "Explică-i că nu trebuie să citească site-ul, pentru că îl controlezi în timp real chiar pe ecranul lui. "
-            "Întreabă-l direct ce afacere are și ce provocare vrea să automatizeze."
-        )
+        if has_memory:
+            greeting_text = (
+                "SYSTEM EVENT: Client reconnectat. Vorbește prima! "
+                "Ai memorie despre acest vizitator (vezi CALLER_MEMORY). "
+                "Salută scurt, arată că îți amintești contextul (nișă/problemă) — NU reîntreba ce afacere are. "
+                + (f"Folosește numele «{name_hint}». " if name_hint else
+                   "Numele lipsește: întreabă o singură dată cum să-l/o abordezi, apoi folosește numele. ")
+                + "Deschide ecranul potrivit (control_website_ui) și continuă de la obiectivul deja cunoscut. "
+                "Maxim 2 fraze + o întrebare de avansare (nu de recunoaștere)."
+            )
+        else:
+            greeting_text = (
+                "SYSTEM EVENT: Client just connected. Speak first! "
+                "WOW scurt (max 2 fraze): controlezi site-ul în timp real. "
+                "Întreabă numele (o dată) și ce vrea să automatizeze. "
+                "Apelează control_website_ui(section=services) la început."
+            )
     else:
-        greeting_text = (
-            "SYSTEM EVENT: Client just connected to the website voice agent. Speak first! "
-            "WOW-EFFECT START: Поздоровайся энергично и уверенно (максимум 2 коротких предложения). "
-            "Объясни, что посетителю не нужно читать сайт — ты управляешь им в реальном времени прямо на его экране. "
-            "Спроси, какой у него бизнес и какую задачу он хочет автоматизировать прямо сейчас."
-        )
+        if has_memory:
+            greeting_text = (
+                "SYSTEM EVENT: Returning visitor. Speak first! "
+                "You already have CALLER_MEMORY about this person. "
+                "Greet briefly and show you remember their niche/problem — do NOT re-ask what business they run. "
+                + (f"Address them as «{name_hint}». " if name_hint else
+                   "Name unknown: ask once how to address them, then use the name. ")
+                + "Open the right screen (control_website_ui) and continue from the known goal. "
+                "Max 2 sentences + one forward question (not a rediscovery question)."
+            )
+        else:
+            greeting_text = (
+                "SYSTEM EVENT: Client just connected. Speak first! "
+                "Short WOW (max 2 sentences): you control the site live on their screen. "
+                "Ask their first name once, and what they want to automate. "
+                "Call control_website_ui(section=services) immediately. "
+                "When you learn the name, call save_lead with client_name (phone may wait)."
+            )
     context.add_message({"role": "user", "content": greeting_text})
     await task.queue_frames([LLMRunFrame()])
 
