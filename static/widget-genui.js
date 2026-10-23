@@ -805,50 +805,68 @@
 
   function ensureWorkspace() {
     if (_wsRoot && document.getElementById("lu-ws-backdrop")) return _wsRoot;
-    extractHostTheme();
 
-    var text = state.theme.text || "rgb(15, 23, 42)";
-    var heading = state.theme.heading || text;
-    var accent = state.theme.accent || "rgb(16, 185, 129)";
-    var font = state.theme.fontSans || "system-ui, -apple-system, sans-serif";
-    var fontDisplay = state.theme.fontDisplay || font;
-    var surface = state.theme.surface || "rgb(248, 250, 252)";
+    /* Design tokens from the host site stylesheet — not invented */
+    var paper = "var(--paper, #f8f7f3)";
+    var ink = "var(--ink, #0a0a0a)";
+    var muted = "var(--muted, #747474)";
+    var line = "var(--line, #deddd9)";
+    var soft = "var(--soft, #eeede8)";
+    var accent = "var(--accent, #ff6b55)";
+    var font = "var(--font-sans, Urbanist, Arial, sans-serif)";
 
     if (!$("lu-ws-css")) {
       var style = document.createElement("style");
       style.id = "lu-ws-css";
       style.textContent = [
         "#lu-ws-backdrop{position:fixed;inset:0;z-index:99990;display:none;flex-direction:column;",
-        "background:" + surface + ";font-family:" + font + ";color:" + text + ";box-sizing:border-box}",
+        "background:" + paper + ";color:" + ink + ";font-family:" + font + ";box-sizing:border-box}",
         "#lu-ws-backdrop.lu-open{display:flex}",
         "#lu-ws-backdrop .lu-stage{flex:1;min-height:0;width:100%;max-width:720px;margin:0 auto;",
-        "padding:max(56px,env(safe-area-inset-top)) 18px 120px;overflow-y:auto;-webkit-overflow-scrolling:touch;",
-        "box-sizing:border-box;background:transparent;border:0;box-shadow:none}",
-        "#lu-ws-backdrop .lu-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:18px}",
-        "#lu-ws-backdrop .lu-kicker{margin:0 0 6px;font:600 11px/1.2 inherit;letter-spacing:.12em;text-transform:uppercase;color:" + accent + "}",
-        "#lu-ws-backdrop .lu-scene-title{margin:0;font:650 clamp(1.4rem,4.2vw,1.85rem)/1.15 " + fontDisplay + ";letter-spacing:-.03em;color:" + heading + "}",
-        "#lu-ws-backdrop .lu-min-btn{flex-shrink:0;border:0;background:transparent;color:" + text + ";font:600 12px/1.2 inherit;opacity:.55;cursor:pointer;padding:6px 0;text-decoration:underline;text-underline-offset:3px}",
+        "padding:max(64px,env(safe-area-inset-top)) 20px 120px;overflow-y:auto;-webkit-overflow-scrolling:touch}",
+        "#lu-ws-backdrop .lu-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:22px}",
+        "#lu-ws-backdrop .lu-kicker{display:none}",
+        "#lu-ws-backdrop .lu-scene-title{margin:0;font-weight:500;font-size:clamp(1.6rem,5vw,2.1rem);",
+        "letter-spacing:-.04em;line-height:1.1;color:" + ink + "}",
+        "#lu-ws-backdrop .lu-min-btn{border:0;background:transparent;color:" + muted + ";font:600 13px/1.2 " + font + ";",
+        "cursor:pointer;padding:6px 0;opacity:.85}",
         "#lu-ws-backdrop .lu-tabs{display:none!important}",
-        "#lu-ws-backdrop .lu-body{display:flex;flex-direction:column;gap:10px}",
-        "#lu-ws-backdrop .lu-acc{display:flex;flex-direction:column;gap:4px}",
-        "#lu-ws-backdrop .lu-acc-head{display:flex;align-items:center;gap:10px;width:100%;padding:14px 0;border:0;",
-        "border-bottom:1px solid rgba(15,23,42,.12);background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}",
-        "#lu-ws-backdrop .lu-acc-item.is-open .lu-acc-head{border-bottom-color:transparent}",
-        "#lu-ws-backdrop .lu-acc-badge{flex-shrink:0;font:600 10px/1.2 inherit;letter-spacing:.06em;text-transform:uppercase;",
-        "padding:4px 8px;border-radius:999px;color:" + accent + ";border:1px solid rgba(16,185,129,.35);background:transparent}",
-        "#lu-ws-backdrop .lu-acc-title{flex:1;margin:0;font:650 1.05rem/1.25 " + fontDisplay + ";color:" + heading + "}",
-        "#lu-ws-backdrop .lu-acc-item:not(.is-open) .lu-acc-title{opacity:.7;font-size:.95rem}",
-        "#lu-ws-backdrop .lu-acc-body{display:none;padding:0 0 16px;font:400 .98rem/1.5 inherit;opacity:.9}",
+        "#lu-ws-backdrop .lu-body{display:flex;flex-direction:column;gap:14px}",
+        /* Catalog cards — same language as .service-card / .price-card on the site */
+        "#lu-ws-backdrop .lu-acc{display:flex;flex-direction:column;gap:12px}",
+        "#lu-ws-backdrop .lu-acc-item{",
+        "border:1px solid " + line + ";border-radius:22px;background:#fff;overflow:hidden;",
+        "transition:border-color .2s,box-shadow .2s}",
+        "#lu-ws-backdrop .lu-acc-item.is-open{",
+        "border-color:" + ink + ";box-shadow:0 12px 40px rgba(10,10,10,.06)}",
+        "#lu-ws-backdrop .lu-acc-head{",
+        "display:flex;align-items:center;gap:12px;width:100%;padding:16px 18px;border:0;",
+        "background:transparent;color:" + ink + ";font:inherit;text-align:left;cursor:pointer}",
+        "#lu-ws-backdrop .lu-acc-badge{",
+        "flex-shrink:0;font:700 10px/1.2 " + font + ";letter-spacing:.08em;text-transform:uppercase;",
+        "padding:6px 10px;border-radius:999px;background:" + soft + ";color:" + ink + "}",
+        "#lu-ws-backdrop .lu-acc-item.is-open .lu-acc-badge{background:" + ink + ";color:#fff}",
+        "#lu-ws-backdrop .lu-acc-title{",
+        "flex:1;margin:0;font:650 1.05rem/1.25 " + font + ";letter-spacing:-.02em;color:" + ink + "}",
+        "#lu-ws-backdrop .lu-acc-item:not(.is-open) .lu-acc-title{font-weight:600;opacity:.78}",
+        "#lu-ws-backdrop .lu-acc-body{",
+        "display:none;padding:0 18px 18px;font:400 15px/1.55 " + font + ";color:" + muted + "}",
         "#lu-ws-backdrop .lu-acc-item.is-open .lu-acc-body{display:block}",
+        /* ROI / booking — same paper language */
         "#lu-ws-backdrop .lu-roi-grid,#lu-ws-backdrop .lu-form{display:grid;gap:12px}",
-        "#lu-ws-backdrop .lu-control-group,#lu-ws-backdrop .lu-roi-out,#lu-ws-backdrop .lu-form label{display:block;padding:10px 0;border-bottom:1px solid rgba(15,23,42,.1)}",
-        "#lu-ws-backdrop .lu-control-head{display:flex;justify-content:space-between;gap:8px;margin-bottom:6px}",
+        "#lu-ws-backdrop .lu-control-group,#lu-ws-backdrop .lu-roi-out{",
+        "padding:14px 16px;border:1px solid " + line + ";border-radius:16px;background:#fff}",
+        "#lu-ws-backdrop .lu-control-head{display:flex;justify-content:space-between;gap:8px;margin-bottom:8px;",
+        "font:600 13px/1.2 " + font + "}",
         "#lu-ws-backdrop input[type=range]{width:100%}",
-        "#lu-ws-backdrop input[type=text],#lu-ws-backdrop input[type=tel]{width:100%;box-sizing:border-box;padding:10px 12px;",
-        "border:1px solid rgba(15,23,42,.18);border-radius:10px;background:#fff;color:" + text + ";font:inherit}",
-        "#lu-ws-backdrop .lu-primary{margin-top:8px;border:0;border-radius:999px;padding:12px 18px;font:600 14px/1.2 inherit;cursor:pointer;background:" + accent + ";color:#fff}",
-        "#lu-ws-backdrop .lu-sub{opacity:.75;margin:0 0 12px}",
-        "#lu-ws-backdrop .lu-title{margin:0 0 8px;font:650 1.35rem/1.2 " + fontDisplay + ";color:" + heading + "}",
+        "#lu-ws-backdrop input[type=text],#lu-ws-backdrop input[type=tel]{",
+        "width:100%;box-sizing:border-box;padding:12px 14px;border:1px solid " + line + ";",
+        "border-radius:12px;background:#fff;color:" + ink + ";font:inherit}",
+        "#lu-ws-backdrop .lu-primary{",
+        "margin-top:8px;border:0;border-radius:999px;min-height:48px;padding:0 22px;",
+        "font:650 15px/1 " + font + ";cursor:pointer;background:" + ink + ";color:#fff}",
+        "#lu-ws-backdrop .lu-sub{color:" + muted + ";margin:0 0 12px;font-size:15px;line-height:1.5}",
+        "#lu-ws-backdrop .lu-title{margin:0 0 8px;font:500 1.4rem/1.15 " + font + ";letter-spacing:-.03em}",
       ].join("");
       document.head.appendChild(style);
     }
@@ -1343,6 +1361,29 @@
     }
   }
 
+  function sectionTitle(key) {
+    var cat = state.catalog || {};
+    var sample = "";
+    try {
+      var arr = cat[key] || cat.services || [];
+      if (arr[0]) sample = String(arr[0].title || arr[0].description || "");
+    } catch (e) {}
+    var cyr = /[а-яА-ЯёЁ]/.test(sample);
+    if (cyr) {
+      var ru = {
+        services: "Услуги и решения",
+        pricing: "Тарифы и форматы",
+        cases: "Кейсы и результаты",
+        roi_calculator: "Расчёт окупаемости",
+        booking_widget: "Запись и контакт",
+        contacts: "Контакты",
+        hero: "О компании",
+      };
+      return ru[key] || t("section_" + key);
+    }
+    return t("section_" + key) || key;
+  }
+
   function renderWorkspaceScene(sectionKey, highlight, prefill, components) {
     ensureWorkspace();
     var key = (sectionKey || "services").toLowerCase();
@@ -1360,9 +1401,8 @@
     renderTabs(key);
     var titleEl = _wsRoot.getElementById("lu-ws-title");
     var kickEl = _wsRoot.getElementById("lu-ws-kicker");
-    if (titleEl) titleEl.textContent = t("section_" + key) || key;
-    if (kickEl)
-      kickEl.textContent = state.companyName || "Lab Upgrade";
+    if (titleEl) titleEl.textContent = sectionTitle(key);
+    if (kickEl) kickEl.textContent = "";
     var body = _wsRoot.getElementById("lu-ws-body");
     var cat = buildCatalog();
 
