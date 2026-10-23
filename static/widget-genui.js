@@ -723,19 +723,13 @@
 
 
   function buildCatalog() {
-    var def = getDefaultCatalog();
+    /* Series Adaptive Workspace: ONLY ui_catalog from server (flow_config). No invented defaults, no DOM scrape. */
     var custom =
-      (window.LU_CATALOG && typeof window.LU_CATALOG === "object"
-        ? window.LU_CATALOG
-        : null) ||
-      (state.catalog && typeof state.catalog === "object" ? state.catalog : {}) ||
+      (state.catalog && typeof state.catalog === "object" ? state.catalog : null) ||
+      (window.LU_CATALOG && typeof window.LU_CATALOG === "object" ? window.LU_CATALOG : null) ||
       {};
-    var map = state.sectionMap || {};
     function pick(key) {
-      if (Array.isArray(custom[key]) && custom[key].length) return custom[key];
-      var fromDom = extractCardsFromSection(map[key], null);
-      if (fromDom && fromDom.length) return fromDom;
-      return def[key] || [];
+      return Array.isArray(custom[key]) ? custom[key] : [];
     }
     return {
       services: pick("services"),
@@ -1432,10 +1426,15 @@
     var key = section.toLowerCase();
     document.documentElement.setAttribute("data-lu-active-section", key);
 
-    // ROI, Booking without native form, or explicit Workspace mode → render in isolated Shadow DOM Workspace
+    /* Series Adaptive Workspace (default): always render from ui_catalog. No scroll_to landing. */
     var el = findSection(key);
+    var seriesSections = {
+      services: 1, pricing: 1, cases: 1, roi_calculator: 1,
+      booking_widget: 1, contacts: 1, hero: 1
+    };
     var forceWorkspace =
       uiMode !== "navigator" ||
+      seriesSections[key] ||
       key === "roi_calculator" ||
       key === "booking_widget" ||
       !el ||
@@ -1444,16 +1443,16 @@
     if (forceWorkspace) {
       renderWorkspaceScene(key, highlight, prefill, components);
     } else if (el) {
+      /* navigator mode only — still no scroll if policy forbids; soft focus without scroll */
       closeWorkspace();
-      try {
-        el.scrollIntoView({ behavior: "smooth", block: "center" });
-      } catch (e) {}
-      flashHighlight(el, 2600);
       if (highlight) {
         var tEl =
           el.querySelector("#" + highlight) ||
           el.querySelector('[data-id="' + highlight + '"]');
         if (tEl) flashHighlight(tEl, 3000);
+        else flashHighlight(el, 2600);
+      } else {
+        flashHighlight(el, 2600);
       }
     }
 
