@@ -22,6 +22,8 @@ Legacy GSM и /ws НЕ затрагиваются.
   Mid-session abuse: verify → block (как legacy).
   Проверка номера кодом из SMS сразу после первых реплик (только +373);
   номер берётся только из подтверждения, запись — карточка с подтверждением.
+  Пока номер подтверждается, звук посетителя в модель не идёт (токены не тратятся).
+  Дневной предел минут голоса на сайт клиента — счётчик в Redis.
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ from pathlib import Path
 from pipecat.frames.frames import (
     CancelFrame,
     Frame,
+    InputAudioRawFrame,
     InputTransportMessageFrame,
     LLMMessagesAppendFrame,
     LLMRunFrame,
@@ -83,6 +86,7 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 
 from core import (
     DEFAULT_LANG,
+    DEFAULT_TZ,
     FARA_PROGRAMARE,
     GEMINI_API_KEY,
     GEMINI_MODEL,
@@ -119,6 +123,7 @@ from core import (
     telefon_valid,
     tz_for,
     upload_audio_to_supabase,
+    WEB_MAX_MINUTES_PER_DAY,
 )
 
 router = APIRouter(tags=["webrtc-rtvi"])
@@ -276,6 +281,73 @@ class WebAbuseProbe(FrameProcessor):
                 self.replici.append(cheie)
         await self.push_frame(frame, direction)
 
+
+class MicGate(FrameProcessor):
+    """Пауза микрофона для модели: пока номер подтверждается, звук посетителя не уходит в модель.
+
+    Первые 1.5 с после закрытия вместо звука идёт тишина — чтобы модель закрыла
+    начатую реплику посетителя. Дальше звук не отправляется совсем.
+    """
+
+    SILENCE_TAIL_SECONDS = 1.5
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.closed = False
+        self.closed_at = 0.0
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self.closed_at = time.time()
+
+    def open(self) -> None:
+        self.closed = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if self.closed and isinstance(frame, InputAudioRawFrame):
+            if time.time() - self.closed_at < self.SILENCE_TAIL_SECONDS:
+                silence = InputAudioRawFrame(
+                    audio=b"\x00" * len(frame.audio),
+                    sample_rate=frame.sample_rate,
+                    num_channels=frame.num_channels,
+                )
+                await self.push_frame(silence, direction)
+            return
+        await self.push_frame(frame, direction)
+
+
+# Дневной предел минут голоса на сайт клиента (не обходится сменой браузера и адреса)
+def _web_day_key(client_id: str) -> tuple[str, int]:
+    acum = dt.datetime.now(tz_for(DEFAULT_TZ))
+    start_zi = acum.replace(hour=5, minute=0, second=0, microsecond=0)
+    if acum < start_zi:
+        start_zi -= dt.timedelta(days=1)
+    ttl = int((start_zi + dt.timedelta(days=1) - acum).total_seconds()) + 3600
+    return f"web_seconds:{start_zi.strftime('%Y%m%d')}:{client_id}", ttl
+
+
+async def web_seconds_used_today(client_id: str) -> int:
+    if not redis_client or not client_id:
+        return 0
+    key, _ttl = _web_day_key(client_id)
+    try:
+        return int(await redis_client.get(key) or 0)
+    except Exception as exc:
+        log.warning("web day budget read: %s", exc)
+        return 0
+
+
+async def web_seconds_add(client_id: str, seconds: int) -> None:
+    if not redis_client or not client_id or seconds <= 0:
+        return
+    key, ttl = _web_day_key(client_id)
+    try:
+        await redis_client.incrby(key, int(seconds))
+        await redis_client.expire(key, ttl)
+    except Exception as exc:
+        log.warning("web day budget write: %s", exc)
 
 
 ROI_DEFAULTS = {
@@ -586,6 +658,7 @@ async def run_webrtc_session(
     abuse_stage = "none"  # none | verify_required | verified | blocked
     phone_verified_session = False
     abuse_probe = WebAbuseProbe()
+    mic_gate = MicGate()
     # Проверка номера кодом из SMS
     verify_stage = "none"  # none | pending | verified
     verify_code = ""
@@ -1100,13 +1173,15 @@ async def run_webrtc_session(
                 "SYSTEM: Phone verification starts now. If the visitor just asked something, "
                 "answer it in one short sentence first. Then say honestly and briefly: because of "
                 "bad-faith visitors and competitors we confirm the phone number; the field is on "
-                "screen, the phone suggests the number by itself and the SMS code arrives in seconds. "
-                "Never ask to dictate the number. Do not continue the consultation until "
-                "SYSTEM UI EVENT says the phone is verified. If the visitor refuses, say goodbye "
-                "politely. No 'demo' wording."
+                "screen, the phone suggests the number by itself and the SMS code arrives in seconds; "
+                "you will continue right after. The visitor's microphone is paused until then — "
+                "you will not hear them, so say it once and then stay silent. "
+                "Never ask to dictate the number. No 'demo' wording."
             ),
         })
         await task.queue_frames([LLMRunFrame()])
+        # Пока номер подтверждается, голос посетителя в модель не идёт
+        mic_gate.close()
         _restart_verify_timeout()
 
     async def _verify_watch() -> None:
@@ -1218,6 +1293,7 @@ async def run_webrtc_session(
             abuse_stage = "verified"
         if verify_timeout_handle is not None and not verify_timeout_handle.done():
             verify_timeout_handle.cancel()
+        mic_gate.open()
         clog.info("[%s] phone verified by SMS code phone=%s***", call_id, learned_phone[:6])
         await _verify_state("verified", phone="+" + learned_phone)
         # Время разговора считается заново с момента подтверждения
@@ -1483,6 +1559,7 @@ async def run_webrtc_session(
         user_catcher,
         context_aggregator.user(),
         abuse_probe,
+        mic_gate,
         llm,
         ai_catcher,
         transport.output(),
@@ -1646,6 +1723,8 @@ async def run_webrtc_session(
     finally:
         duration = int(max(0.0, time.time() - start_ts))
         clog.info("[%s] WebRTC session ended, %ss", call_id, duration)
+        with contextlib.suppress(Exception):
+            await web_seconds_add(client_id, duration)
 
         with contextlib.suppress(Exception):
             deadline_handle.cancel()
@@ -1820,6 +1899,15 @@ async def webrtc_offer(request: Request):
     if await este_blocat(visitor_id, ip):
         log.warning("webrtc blocked visitor=%s ip=%s", visitor_id[:12], ip)
         return JSONResponse({"error": "blocked"}, status_code=403, headers=_cors_headers(request))
+
+    used_today = await web_seconds_used_today(client_id)
+    if used_today >= WEB_MAX_MINUTES_PER_DAY * 60:
+        log.warning("webrtc daily site minutes spent client=%s used=%ss", client_id, used_today)
+        return JSONResponse(
+            {"error": "daily_limit", "detail": "site_minutes"},
+            status_code=429,
+            headers=_cors_headers(request),
+        )
 
     secret = str(row.get("turnstile_secret_key") or "")
     # Empty token is common on mobile if CF script lags; allow bypass only when
