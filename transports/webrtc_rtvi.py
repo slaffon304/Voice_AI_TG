@@ -13,9 +13,9 @@ Legacy GSM и /ws НЕ затрагиваются.
   Фаза 3.3 ROI Calculator
   Фаза 3.4 Live Screen Audit
   Фаза 3.5 Real-Time Sentiment UI Morphing
-  Фаза 2.5 UI protocol: ui-snapshot + DOM-команды (scroll_to, highlight,
-            set_input_value, click) через RTVIUICommandFrame
-  Agentic Tool-State: set_agent_state → Thinking Orb (thinking-orbs)
+  Фаза 2.5 UI protocol: ui-snapshot (хранится, в контекст модели не идёт)
+  Agentic Tool-State: индикатор (Thinking Orb) переключает сервер сам,
+            внутри каждого действия — у модели отдельного инструмента нет
 
 Защита /api/offer: origin, blacklist, Turnstile, суточные лимиты.
   Soft deadline (warn → close).
@@ -333,84 +333,6 @@ SENTIMENT_MORPH_TOOL = {
     },
 }
 
-# Фаза 2.5 — DOM actions via UI Worker Protocol (scroll_to / highlight / set_input_value / click)
-DOM_ACTION_TOOL = {
-    "name": "dom_action",
-    "description": (
-        "Low-level DOM manipulation on the page the visitor is looking at. "
-        "Use after a ui-snapshot is available or when you know a stable target_id / ref. "
-        "Prefer control_website_ui for high-level section navigation; use this for precise "
-        "scroll, highlight, form fill or click."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["scroll_to", "highlight", "set_input_value", "click", "focus"],
-                "description": "DOM command to execute",
-            },
-            "ref": {
-                "type": "string",
-                "description": "Stable a11y snapshot ref (e.g. 'e42') from the latest ui-snapshot",
-            },
-            "target_id": {
-                "type": "string",
-                "description": "Fallback DOM id (document.getElementById) when ref is unknown",
-            },
-            "value": {
-                "type": "string",
-                "description": "Value for set_input_value",
-            },
-            "duration_ms": {
-                "type": "number",
-                "description": "Highlight duration in ms (default 2000)",
-            },
-        },
-        "required": ["action"],
-    },
-}
-
-# Agentic Tool-State + Thinking Orbs
-# Front-end will render the matching orb from the `thinking-orbs` library.
-AGENT_STATE_TOOL = {
-    "name": "set_agent_state",
-    "description": (
-        "Update the visual agent state indicator on the page (Thinking Orb). "
-        "Call this when you start or finish a meaningful action so the visitor "
-        "sees what you are doing. Use short-lived states; return to 'breathing' "
-        "or clear when idle."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "state": {
-                "type": "string",
-                "enum": [
-                    "working",
-                    "searching",
-                    "solving",
-                    "listening",
-                    "connecting",
-                    "weaving",
-                    "composing",
-                    "breathing",
-                    "shaping",
-                    "idle",
-                ],
-                "description": "Current agent activity shown as a Thinking Orb",
-            },
-            "label": {
-                "type": "string",
-                "description": "Optional short label next to the orb (e.g. 'Checking calendar')",
-            },
-        },
-        "required": ["state"],
-    },
-}
-
-
-
 FLAG_ABUSE_TOOL = {
     "name": "flag_session_abuse",
     "description": (
@@ -442,8 +364,6 @@ def _build_tools_with_ui(client_data: dict, readable_hours: str) -> list[dict]:
     base.append(ROI_CALCULATOR_TOOL)
     base.append(SCREEN_AUDIT_TOOL)
     base.append(SENTIMENT_MORPH_TOOL)
-    base.append(DOM_ACTION_TOOL)
-    base.append(AGENT_STATE_TOOL)
     base.append(FLAG_ABUSE_TOOL)
     return [{"function_declarations": base}]
 
@@ -493,6 +413,42 @@ def _compute_roi(args: dict[str, Any]) -> dict[str, Any]:
         "net_monthly_savings": round(net_save, 2),
         "payback_days": round(payback_days, 1) if payback_days is not None else None,
     }
+
+
+# Подписи индикатора на языке разговора (раньше были только английские)
+ORB_LABELS = {
+    "ru": {
+        "screen": "Готовлю экран",
+        "roi": "Считаю выгоду",
+        "audit": "Смотрю страницу",
+        "audit_compose": "Готовлю выводы",
+        "calendar": "Проверяю календарь",
+        "lead": "Сохраняю заявку",
+        "sms": "Отправляю SMS",
+    },
+    "ro": {
+        "screen": "Pregătesc ecranul",
+        "roi": "Calculez economia",
+        "audit": "Analizez pagina",
+        "audit_compose": "Pregătesc concluziile",
+        "calendar": "Verific calendarul",
+        "lead": "Salvez solicitarea",
+        "sms": "Trimit SMS",
+    },
+    "en": {
+        "screen": "Preparing the screen",
+        "roi": "Calculating savings",
+        "audit": "Reviewing the page",
+        "audit_compose": "Preparing feedback",
+        "calendar": "Checking the calendar",
+        "lead": "Saving your request",
+        "sms": "Sending SMS",
+    },
+}
+
+
+def _orb_label(lang: str, key: str) -> str:
+    return ORB_LABELS.get(lang, ORB_LABELS["en"]).get(key, "")
 
 
 def _default_section_for_signal(signal: str) -> str:
@@ -634,8 +590,6 @@ async def run_webrtc_session(
                 "update_roi_calculator": RTVIFunctionCallReportLevel.FULL,
                 "request_screen_audit": RTVIFunctionCallReportLevel.FULL,
                 "morph_ui_for_sentiment": RTVIFunctionCallReportLevel.FULL,
-                "dom_action": RTVIFunctionCallReportLevel.FULL,
-                "set_agent_state": RTVIFunctionCallReportLevel.FULL,
                 "flag_session_abuse": RTVIFunctionCallReportLevel.FULL,
                 "Booking_tool": RTVIFunctionCallReportLevel.FULL,
             }
@@ -651,6 +605,48 @@ async def run_webrtc_session(
         ),
     )
     task: Optional[PipelineTask] = None
+    orb_reset_handle: Optional[asyncio.Task] = None
+
+    # ----- Индикатор (Thinking Orb): переключает сервер, не модель -----
+
+    async def _orb(state: str, label_key: str = "") -> None:
+        """Показать состояние индикатора. Отменяет отложенный возврат в покой."""
+        nonlocal orb_reset_handle
+        if orb_reset_handle is not None and not orb_reset_handle.done():
+            orb_reset_handle.cancel()
+        orb_reset_handle = None
+        if task is None:
+            return
+        payload: dict[str, Any] = {"state": state}
+        label = _orb_label(call_lang, label_key) if label_key else ""
+        if label:
+            payload["label"] = label
+        with contextlib.suppress(Exception):
+            await task.queue_frames([RTVIUICommandFrame(command="set_agent_state", payload=payload)])
+
+    async def _orb_rest(after: float = 0.0) -> None:
+        """Вернуть индикатор в спокойное состояние сразу или через `after` секунд."""
+        nonlocal orb_reset_handle
+        if after <= 0:
+            await _orb("breathing")
+            return
+
+        async def _later() -> None:
+            nonlocal orb_reset_handle
+            try:
+                await asyncio.sleep(after)
+                orb_reset_handle = None
+                if task is not None:
+                    with contextlib.suppress(Exception):
+                        await task.queue_frames([
+                            RTVIUICommandFrame(command="set_agent_state", payload={"state": "breathing"})
+                        ])
+            except asyncio.CancelledError:
+                return
+
+        if orb_reset_handle is not None and not orb_reset_handle.done():
+            orb_reset_handle.cancel()
+        orb_reset_handle = asyncio.create_task(_later())
 
     # ----- Tool handlers -----
 
@@ -668,6 +664,7 @@ async def run_webrtc_session(
         if components:
             payload["components"] = components
 
+        await _orb("shaping", "screen")
         if task is not None:
             await task.queue_frames([
                 RTVIUICommandFrame(
@@ -675,6 +672,7 @@ async def run_webrtc_session(
                     payload=payload,
                 ),
             ])
+        await _orb_rest(1.2)
         await params.result_callback({
             "status": "ui_updated",
             "active_section": section,
@@ -690,15 +688,12 @@ async def run_webrtc_session(
         nonlocal last_roi
         result = _compute_roi(params.arguments or {})
         last_roi = result
+        await _orb("solving", "roi")
         if task is not None:
             await task.queue_frames([
-                RTVIUICommandFrame(
-                    command="set_agent_state",
-                    payload={"state": "solving", "label": "Calculating ROI"},
-                ),
                 RTVIUICommandFrame(command="update_roi", payload=result),
             ])
-        # Orb state stays under model control (set_agent_state) — no auto-breathing wipe.
+        await _orb_rest(1.5)
 
         await params.result_callback({
             "status": "roi_updated",
@@ -714,13 +709,9 @@ async def run_webrtc_session(
         focus = str(params.arguments.get("focus") or "full_page")
         reason = str(params.arguments.get("reason") or "")
         audit_pending_focus = focus
+        await _orb("searching", "audit")
         if task is not None:
             await task.queue_frames([
-                # Show Thinking Orb while audit is in progress
-                RTVIUICommandFrame(
-                    command="set_agent_state",
-                    payload={"state": "searching", "label": "Reviewing page"},
-                ),
                 RTVIUICommandFrame(
                     command="start_screen_audit",
                     payload={"focus": focus, "reason": reason},
@@ -731,8 +722,7 @@ async def run_webrtc_session(
             "focus": focus,
             "instruction": (
                 "Tell the visitor briefly that you are reviewing the page. "
-                "Wait for SYSTEM UI EVENT with the page summary before giving findings. "
-                "After you speak the findings, call set_agent_state(state='breathing')."
+                "Wait for SYSTEM UI EVENT with the page summary before giving findings."
             ),
         })
 
@@ -762,6 +752,7 @@ async def run_webrtc_session(
             return
         sentiment_fired.add(signal)
 
+        await _orb("shaping", "screen")
         if task is not None:
             frames = [
                 RTVIUICommandFrame(
@@ -782,6 +773,7 @@ async def run_webrtc_session(
                     )
                 )
             await task.queue_frames(frames)
+        await _orb_rest(1.2)
 
         await params.result_callback({
             "status": "ui_morphed",
@@ -794,71 +786,11 @@ async def run_webrtc_session(
             ),
         })
 
-    async def process_dom_action(params: FunctionCallParams):
-        """Фаза 2.5 — низкоуровневые DOM-команды UI Worker Protocol."""
-        action = str(params.arguments.get("action") or "").strip()
-        ref = params.arguments.get("ref")
-        target_id = params.arguments.get("target_id")
-        value = params.arguments.get("value")
-        duration_ms = params.arguments.get("duration_ms") or 2000
-
-        if action not in ("scroll_to", "highlight", "set_input_value", "click", "focus"):
-            await params.result_callback({"status": "error", "message": f"Unknown action: {action}"})
-            return
-
-        payload: dict[str, Any] = {}
-        if ref:
-            payload["ref"] = ref
-        if target_id:
-            payload["target_id"] = target_id
-        if action == "set_input_value":
-            payload["value"] = value or ""
-            payload["replace"] = True
-        if action == "highlight":
-            payload["duration_ms"] = duration_ms
-
-        if task is not None:
-            await task.queue_frames([
-                RTVIUICommandFrame(command=action, payload=payload),
-            ])
-
-        await params.result_callback({
-            "status": "command_sent",
-            "action": action,
-            "payload": payload,
-            "instruction": f"DOM command '{action}' sent. Continue speaking naturally.",
-        })
-
-    async def process_set_agent_state(params: FunctionCallParams):
-        """Agentic Tool-State → Thinking Orb on the client."""
-        state = str(params.arguments.get("state") or "breathing").strip()
-        label = params.arguments.get("label")
-        allowed = {
-            "working", "searching", "solving", "listening",
-            "connecting", "weaving", "composing", "breathing",
-            "shaping", "idle",
-        }
-        if state not in allowed:
-            await params.result_callback({"status": "error", "message": f"Unknown state: {state}"})
-            return
-
-        payload: dict[str, Any] = {"state": state}
-        if label:
-            payload["label"] = str(label)[:80]
-
-        if task is not None:
-            await task.queue_frames([
-                RTVIUICommandFrame(command="set_agent_state", payload=payload)
-            ])
-
-        await params.result_callback({
-            "status": "state_updated",
-            "state": state,
-            "instruction": "Agent state indicator updated. Continue the task.",
-        })
-
     async def process_save_lead(params: FunctionCallParams):
-        nonlocal learned_phone
+        nonlocal learned_phone, visitor_name
+        lead_name = str(params.arguments.get("client_name") or "").strip()
+        if lead_name:
+            visitor_name = lead_name
         phone = str(params.arguments.get("client_phone") or "").strip()
         if not phone and learned_phone:
             params.arguments["client_phone"] = phone = learned_phone
@@ -872,6 +804,7 @@ async def run_webrtc_session(
             await params.result_callback({"status": "success", "message": "Deja salvat."})
             return
 
+        await _orb("working", "lead")
         try:
             result = await call_n8n(
                 "save_lead",
@@ -880,12 +813,14 @@ async def run_webrtc_session(
                 5.0,
             )
             saved_lead_hashes.add(digest)
+            await _orb_rest()
             await params.result_callback(result)
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):
                 await params.result_callback({"status": "cancelled"})
             raise
         except Exception as exc:
+            await _orb_rest()
             await send_tg_alert(
                 tg_chat,
                 f"⚠️ <b>Eroare API (save_lead)</b>\n🏢 {company}\n🔧 <code>{html.escape(str(exc))}</code>",
@@ -893,7 +828,10 @@ async def run_webrtc_session(
             await params.result_callback({"error": f"Eroare CRM: {exc}"})
 
     async def process_booking(params: FunctionCallParams):
-        nonlocal learned_phone, zapis_id
+        nonlocal learned_phone, zapis_id, visitor_name
+        book_name = str(params.arguments.get("client_name") or "").strip()
+        if book_name:
+            visitor_name = book_name
         phone_arg = str(params.arguments.get("phone") or "").strip()
         if not phone_arg and learned_phone:
             params.arguments["phone"] = phone_arg = learned_phone
@@ -939,12 +877,14 @@ async def run_webrtc_session(
             "client_id": client_id,
             "google_calendar_id": client_data.get("google_calendar_id") or "",
         }
+        await _orb("searching", "calendar")
         try:
             if action == "book":
                 proba = await call_n8n(
                     "booking", params_n8n, {**params.arguments, "action": "check"}, 10.0
                 )
                 if not slot_liber(proba):
+                    await _orb_rest()
                     await params.result_callback(proba)
                     return
             result = await call_n8n("booking", params_n8n, params.arguments, 10.0)
@@ -953,12 +893,14 @@ async def run_webrtc_session(
                 zapis_id = id_din_lookup(result) or zapis_id
             if action == "cancel":
                 zapis_id = ""
+            await _orb_rest()
             await params.result_callback(result)
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):
                 await params.result_callback({"status": "cancelled"})
             raise
         except Exception as exc:
+            await _orb_rest()
             await send_tg_alert(
                 tg_chat,
                 f"⚠️ <b>Eroare API (Booking_tool)</b>\n🏢 {company}\n🔧 <code>{html.escape(str(exc))}</code>",
@@ -972,6 +914,7 @@ async def run_webrtc_session(
         if not telefon_valid(phone):
             await params.result_callback(TELEFON_INCOMPLET)
             return
+        await _orb("working", "sms")
         try:
             result = await call_n8n(
                 "send_sms",
@@ -979,12 +922,14 @@ async def run_webrtc_session(
                 params.arguments,
                 5.0,
             )
+            await _orb_rest()
             await params.result_callback(result)
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):
                 await params.result_callback({"status": "cancelled"})
             raise
         except Exception as exc:
+            await _orb_rest()
             await params.result_callback({"status": "error", "message": str(exc)})
 
     async def process_end_call(params: FunctionCallParams):
@@ -1069,8 +1014,6 @@ async def run_webrtc_session(
     llm.register_function("update_roi_calculator", process_update_roi)
     llm.register_function("request_screen_audit", process_request_screen_audit)
     llm.register_function("morph_ui_for_sentiment", process_morph_ui_for_sentiment)
-    llm.register_function("dom_action", process_dom_action)
-    llm.register_function("set_agent_state", process_set_agent_state)
     llm.register_function("save_lead", process_save_lead)
     llm.register_function("Booking_tool", process_booking)
     llm.register_function("send_sms", process_sms)
@@ -1080,7 +1023,7 @@ async def run_webrtc_session(
 
     @rtvi.event_handler("on_client_message")
     async def on_client_message(rtvi_proc, msg):
-        nonlocal learned_phone, audit_pending_focus, phone_verified_session, abuse_stage
+        nonlocal learned_phone, audit_pending_focus, phone_verified_session, abuse_stage, visitor_name
         msg_type = getattr(msg, "type", None) or (msg.get("type") if isinstance(msg, dict) else None)
         data = getattr(msg, "data", None) or (msg.get("data") if isinstance(msg, dict) else {}) or {}
         if isinstance(data, dict) and "type" in data:
@@ -1117,13 +1060,19 @@ async def run_webrtc_session(
                 phone_verified_session = True
                 if abuse_stage == "verify_required":
                     abuse_stage = "verified"
-                clog.info("[%s] phone verified via UI stage=%s", call_id, abuse_stage)
+                pv_name = str(data.get("client_name") or data.get("name") or "").strip()[:80]
+                pv_note = str(data.get("request_summary") or data.get("slot") or "").strip()[:300]
+                if pv_name:
+                    visitor_name = pv_name
+                clog.info("[%s] phone verified via UI stage=%s name=%s", call_id, abuse_stage, pv_name or "-")
                 context.add_message({
                     "role": "user",
                     "content": (
                         "SYSTEM UI EVENT: visitor verified phone on screen. "
                         "Use this number for booking/lead; do not ask them to dictate it. "
-                        "You may continue the conversation."
+                        + (f"Visitor name from the form: {pv_name}. Use it; do not re-ask. " if pv_name else "")
+                        + (f"Visitor note from the form (time / task): {pv_note}. " if pv_note else "")
+                        + "You may continue the conversation."
                     ),
                 })
                 if task is not None:
@@ -1148,19 +1097,13 @@ async def run_webrtc_session(
                     f"SYSTEM UI EVENT: SCREEN AUDIT (focus={focus}"
                     f"{', url=' + url if url else ''}): {page_summary}{issues_txt}. "
                     "Give 2–3 concrete observations. Optionally call control_website_ui "
-                    "or dom_action to highlight weak spots. Do not invent content not in this summary. "
-                    "When finished speaking, call set_agent_state(state='breathing')."
+                    "to show a relevant section. Do not invent content not in this summary."
                 ),
             })
+            await _orb("composing", "audit_compose")
+            await _orb_rest(4.0)
             if task is not None:
-                # Return orb to neutral while the model prepares the answer
-                await task.queue_frames([
-                    RTVIUICommandFrame(
-                        command="set_agent_state",
-                        payload={"state": "composing", "label": "Preparing feedback"},
-                    ),
-                    LLMRunFrame(),
-                ])
+                await task.queue_frames([LLMRunFrame()])
             return
 
         # ----- Dwell -----
@@ -1448,6 +1391,9 @@ async def run_webrtc_session(
             warn_handle.cancel()
         with contextlib.suppress(Exception):
             abuse_watch_handle.cancel()
+        with contextlib.suppress(Exception):
+            if orb_reset_handle is not None:
+                orb_reset_handle.cancel()
         with contextlib.suppress(Exception):
             mixer.close()
 
