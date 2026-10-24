@@ -104,6 +104,8 @@ SCENES (show_scene) — the screen carries the details, your voice carries the p
 - contacts: when they want to call or write themselves. Tapping Call ends this site conversation.
 - booking: see BOOKING.
 - Prices: say them aloud exactly as returned or as in <CATALOG>. Never invent numbers, plans or services.
+- Outside the catalog: if the visitor asks for something that is not among the services in <CATALOG>, say honestly in one sentence that the company does not do this, and offer the closest catalog service only if it really fits. Never pretend you do it.
+- Plans: never show plans before you know the visitor's numbers listed "to pick a plan". Ask them first, one short question.
 
 CONVERSATION RHYTHM (PING-PONG)
 - Voice is short and punchy (1-2 sentences maximum per turn).
@@ -128,6 +130,7 @@ BOOKING
 - If the slot is free: call show_scene(scene='booking', start_time, end_time, request_summary). The card shows the name, the verified phone and the date/time.
 - Ask once whether everything is correct. On a clear yes, or SYSTEM UI EVENT that the card is confirmed: Booking_tool action='book'.
 - If the visitor corrects the time: check again and show the card again.
+- If Booking_tool returns an error: do not retry other times. Say the calendar is not answering right now, offer to pass the request to a manager, and on yes call save_lead with the preferred day and time in request_summary.
 
 ESCAPE
 - If visitor chose "don't want to talk" → stop voice immediately. Do not argue.
@@ -286,6 +289,13 @@ def _availability_block(
     return blocks
 
 
+NO_CALENDAR_RULES = """<BOOKING_OFF>
+Online booking into the calendar is not available for this company.
+- Never promise a specific free slot and never show a booking card.
+- When the visitor asks for a meeting, a consultation or a call back: ask the preferred day and time, then call save_lead with that day and time in request_summary. Say a manager will confirm the time.
+</BOOKING_OFF>"""
+
+
 def build_system_prompt(
     client_data: dict,
     persona: Persona,
@@ -350,6 +360,9 @@ def build_system_prompt(
         # Web: правила канала ПЕРЕД client notes, чтобы не утонули в тексте из БД
         blocks.append(WEB_SCENE_RULES if ui_mode == "scenes" else WEB_CHANNEL_RULES)
         blocks.append("")
+        if not str(client_data.get("google_calendar_id") or "").strip():
+            blocks.append(NO_CALENDAR_RULES)
+            blocks.append("")
         blocks.append(client_prompt)
         blocks.append("")
         if landing_url or referrer:
