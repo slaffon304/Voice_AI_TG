@@ -2170,11 +2170,26 @@
     return { command: String(command || ""), payload: payload || {} };
   }
 
+  /* Timing: tell the server when the screen was actually painted (logged only, not sent to the model) */
+  function ackRendered(command) {
+    try {
+      var raf = window.requestAnimationFrame || function (fn) { return setTimeout(fn, 16); };
+      raf(function () {
+        sendClientMessage({
+          type: "ui_user_interaction",
+          data: { interaction: "ui_rendered", command: command },
+        });
+      });
+    } catch (e) {}
+  }
+
   function dispatchCommand(command, payload) {
     if (command === "navigate_and_render") {
       handleNavigateAndRender(payload);
+      ackRendered(command);
     } else if (command === "update_roi") {
       handleUpdateRoi(payload);
+      ackRendered(command);
     } else if (command === "start_screen_audit") {
       handleStartScreenAudit(payload);
     } else if (command === "set_agent_state") {
