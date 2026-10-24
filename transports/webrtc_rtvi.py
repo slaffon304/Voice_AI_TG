@@ -35,6 +35,7 @@ import datetime as dt
 import hashlib
 import hmac
 import html
+import json
 import logging
 import os
 import re
@@ -140,6 +141,260 @@ _STATIC = Path(__file__).resolve().parent.parent / "static"
 @router.get("/widget-genui.js")
 async def serve_widget_genui():
     return FileResponse(_STATIC / "widget-genui.js", media_type="application/javascript")
+
+
+@router.get("/genui-scenes.js")
+async def serve_genui_scenes():
+    """Слой сцен (каталог клиента на весь экран). Подгружается виджетом."""
+    return FileResponse(
+        _STATIC / "genui-scenes.js",
+        media_type="application/javascript",
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Каталог сцен: bot_personas.flow_config.catalog (тексты на 9 языках)
+# ---------------------------------------------------------------------------
+
+SCENE_LANGS = {"ru", "ro", "en", "fr", "it", "pl", "uk", "pt", "cs"}
+SCENE_NAMES = ["welcome", "services", "plans", "compare", "calculator", "case", "clients", "trust", "contacts", "booking"]
+_catalog_cache: dict[str, tuple[float, Optional[dict]]] = {}
+
+
+async def load_scene_catalog(client_id: str) -> Optional[dict]:
+    """Каталог клиента или None. Кэш на минуту, чтобы не читать базу на каждый запрос."""
+    if not client_id:
+        return None
+    hit = _catalog_cache.get(client_id)
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    cat: Optional[dict] = None
+    try:
+        rows = await sb_select(
+            "bot_personas",
+            {"client_id": f"eq.{client_id}", "select": "flow_config", "limit": "1"},
+            timeout=2.5,
+        )
+        raw = rows[0].get("flow_config") if rows else None
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        if isinstance(raw, dict) and isinstance(raw.get("catalog"), dict):
+            c = raw["catalog"]
+            if isinstance(c.get("plans"), list) or isinstance(c.get("services"), list):
+                cat = c
+    except Exception as exc:
+        log.warning("scene catalog load %s: %s", client_id, exc)
+        return hit[1] if hit else None
+    _catalog_cache[client_id] = (time.time(), cat)
+    return cat
+
+
+def scene_lang(catalog: Optional[dict], lang: str) -> str:
+    langs = (catalog or {}).get("languages") or []
+    lang = (lang or "").lower()[:2]
+    if lang in langs:
+        return lang
+    return "en" if "en" in langs else (langs[0] if langs else "en")
+
+
+def localize_catalog(obj: Any, lang: str) -> Any:
+    """Словари вида {ru:..., ro:..., en:...} превращаются в строку (или список) на одном языке."""
+    if isinstance(obj, dict):
+        if obj and set(obj.keys()) <= SCENE_LANGS:
+            return obj.get(lang) if obj.get(lang) not in (None, "", []) else (obj.get("en") or next(iter(obj.values())))
+        return {k: localize_catalog(v, lang) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [localize_catalog(v, lang) for v in obj]
+    return obj
+
+
+def _catalog_plans(catalog: dict) -> list[dict]:
+    p = catalog.get("plans")
+    items = p.get("items") if isinstance(p, dict) else p
+    return [x for x in (items or []) if isinstance(x, dict) and x.get("id")]
+
+
+def _picker(catalog: dict) -> dict:
+    p = catalog.get("plans")
+    pk = p.get("picker") if isinstance(p, dict) else None
+    return pk if isinstance(pk, dict) else {}
+
+
+def _calculator(catalog: dict) -> dict:
+    c = catalog.get("calculator")
+    return c if isinstance(c, dict) and c.get("inputs") and c.get("outputs") else {}
+
+
+def scene_available(catalog: dict) -> list[str]:
+    """Сцены, для которых у клиента есть данные. Остальные модели не предлагаем."""
+    have = {
+        "welcome": True,
+        "services": bool(catalog.get("services")),
+        "plans": bool(_catalog_plans(catalog)),
+        "compare": len(_catalog_plans(catalog)) >= 2,
+        "calculator": bool(_calculator(catalog)),
+        "case": bool(catalog.get("cases")),
+        "clients": bool(catalog.get("clients")),
+        "trust": bool(catalog.get("trust")),
+        "contacts": bool(catalog.get("contacts")),
+        "booking": True,
+    }
+    return [n for n in SCENE_NAMES if have.get(n)]
+
+
+def scene_need(catalog: dict, values: dict) -> float:
+    """Нужная ёмкость тарифа: сумма «значение × вес» по полям подбора из каталога, плюс запас."""
+    pk = _picker(catalog)
+    total = 0.0
+    for inp in pk.get("inputs") or []:
+        with contextlib.suppress(TypeError, ValueError):
+            total += float(values.get(inp.get("id")) or 0) * float(inp.get("weight") or 0)
+    return total * (1 + float(pk.get("headroom") or 0))
+
+
+def scene_plan_fits(catalog: dict, plan: dict, need: float, values: dict) -> bool:
+    if need and float(plan.get("capacity") or 0) < need:
+        return False
+    limits = plan.get("limits") or {}
+    for lim in _picker(catalog).get("limits") or []:
+        want = values.get(lim.get("id"))
+        if not want:
+            continue
+        have = limits.get(lim.get("plan_limit") or lim.get("id"))
+        if isinstance(have, (int, float)) and have != 0 and have < float(want):
+            return False
+    return True
+
+
+def scene_pick_plan(catalog: dict, need: float, values: dict) -> Optional[dict]:
+    """Самый дешёвый тариф, который подходит по ёмкости и ограничениям (0 = без лимита)."""
+    plans = _catalog_plans(catalog)
+    for p in plans:
+        if scene_plan_fits(catalog, p, need, values):
+            return p
+    return plans[-1] if plans else None
+
+
+def calc_expr(expr: str, variables: dict) -> Optional[float]:
+    """Формула калькулятора из каталога: числа, имена полей, + - * / и скобки."""
+    import ast
+    import operator
+
+    ops = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv}
+
+    def ev(node):
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return float(node.value)
+        if isinstance(node, ast.Name) and node.id in variables:
+            return float(variables[node.id])
+        if isinstance(node, ast.BinOp) and type(node.op) in ops:
+            return ops[type(node.op)](ev(node.left), ev(node.right))
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return -ev(node.operand)
+        raise ValueError("bad expression")
+
+    try:
+        return ev(ast.parse(str(expr or ""), mode="eval"))
+    except Exception:
+        return None
+
+
+_SAFE_ID = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
+_RESERVED_ARGS = {"scene", "activity", "problem", "volume", "services", "service_reasons", "reason",
+                  "billing", "compare_plan", "start_time", "end_time", "request_summary"}
+
+
+def _extra_fields(catalog: dict) -> list[dict]:
+    """Поля, которые модель передаёт числами: подбор тарифа и калькулятор (из каталога клиента)."""
+    out, seen = [], set()
+    pk = _picker(catalog)
+    for group in (pk.get("inputs") or [], pk.get("limits") or [], _calculator(catalog).get("inputs") or []):
+        for f in group:
+            fid = str(f.get("id") or "")
+            if _SAFE_ID.match(fid) and fid not in _RESERVED_ARGS and fid not in seen:
+                seen.add(fid)
+                out.append(f)
+    return out
+
+
+def build_scene_tool(catalog: dict) -> dict:
+    available = scene_available(catalog)
+    service_ids = [str(x.get("id")) for x in (catalog.get("services") or []) if isinstance(x, dict) and x.get("id")]
+    plan_ids = [str(p.get("id")) for p in _catalog_plans(catalog)]
+    props: dict[str, Any] = {
+        "scene": {"type": "string", "enum": available, "description": "Which scene to show."},
+        "activity": {"type": "string", "description": "Visitor's business in 2-5 words, in the conversation language (dossier)."},
+        "problem": {"type": "string", "description": "Visitor's main problem in under 8 words, conversation language (dossier)."},
+        "volume": {"type": "string", "description": "Short summary of the visitor's numbers in their words (dossier)."},
+        "start_time": {"type": "string", "description": "booking: slot start, ISO 8601 local time."},
+        "end_time": {"type": "string", "description": "booking: slot end, ISO 8601 local time."},
+        "request_summary": {"type": "string", "description": "booking: purpose of the meeting, short."},
+    }
+    if service_ids:
+        props["services"] = {"type": "array", "items": {"type": "string", "enum": service_ids},
+                             "description": "services: 1-2 service ids that solve the visitor's problem, best first."}
+        props["service_reasons"] = {"type": "array", "items": {"type": "string"},
+                                    "description": "services: one short reason per chosen service, same order, visitor's language."}
+    if plan_ids:
+        props["reason"] = {"type": "string", "description": "plans: one short sentence why the recommended plan fits, visitor's language."}
+        if any(p.get("year") for p in _catalog_plans(catalog)):
+            props["billing"] = {"type": "string", "enum": ["month", "year"]}
+        if len(plan_ids) >= 2:
+            props["compare_plan"] = {"type": "string", "enum": plan_ids, "description": "compare: the plan the visitor asks about."}
+    for f in _extra_fields(catalog):
+        props[f["id"]] = {"type": "number", "description": str(f.get("ask") or f["id"])}
+    return {
+        "name": "show_scene",
+        "description": (
+            "Shows a full-screen scene from the company catalog on the visitor's screen and updates the visitor dossier. "
+            "Pass every fact you learned (activity, problem, volume and the numeric fields) — the dossier, "
+            "the recommended plan and the calculator are built from them by the server."
+        ),
+        "parameters": {"type": "object", "properties": props, "required": ["scene"]},
+    }
+
+
+def build_scene_prompt(catalog: dict, lang: str) -> str:
+    """Индекс каталога для модели: какие сцены есть, услуги, тарифы, что спросить для подбора и расчёта."""
+    c = localize_catalog(catalog, lang)
+    cur = c.get("currency") or "EUR"
+    out = ["<CATALOG>", "scenes available: " + ", ".join(scene_available(catalog))]
+    for sv in c.get("services") or []:
+        out.append(f"service {sv.get('id')}: {sv.get('title')} — {sv.get('short')}")
+    for p in _catalog_plans(c):
+        out.append(
+            f"plan {p.get('id')}: {p.get('name')} — {'from ' if p.get('from') else ''}{p.get('month')} {cur}/month"
+            + (f" ({p.get('year')} {cur}/month paid yearly)" if p.get("year") else "")
+            + (f"; {p.get('highlight')}" if p.get("highlight") else "")
+            + ("; most popular" if p.get("popular") else "")
+        )
+    note = (c.get("plans") or {}).get("note") if isinstance(c.get("plans"), dict) else None
+    if note:
+        out.append(f"plans note: {note}")
+    pk = _picker(c)
+    if pk.get("inputs"):
+        asks = [f"{f.get('id')} ({f.get('ask')})" for f in (pk.get("inputs") or []) + (pk.get("limits") or [])]
+        out.append("to pick a plan ask for and pass: " + "; ".join(asks) + ". The server picks the plan.")
+    calc = _calculator(c)
+    if calc:
+        asks = [f"{f.get('id')} ({f.get('ask') or f.get('label')})" for f in calc.get("inputs") or []]
+        out.append("calculator inputs: " + "; ".join(asks) + ". Defaults are used for anything not said.")
+    names = [x.get("name") for x in (c.get("clients") or []) if isinstance(x, dict) and x.get("name")]
+    if names:
+        out.append("clients: " + ", ".join(names))
+    k = c.get("contacts") or {}
+    phones = ", ".join(f"{x.get('label')} {x.get('value')}" for x in (k.get("phones") or []) if isinstance(x, dict))
+    if phones:
+        out.append("phones: " + phones)
+    if k.get("email"):
+        out.append("email: " + str(k.get("email")))
+    if k.get("address"):
+        out.append("address: " + str(k.get("address")))
+    out.append("</CATALOG>")
+    return "\n".join(out)
 
 
 DWELL_MIN_SECONDS = 3.0
@@ -643,6 +898,15 @@ def _build_tools_with_ui(client_data: dict, readable_hours: str) -> list[dict]:
     return [{"function_declarations": base}]
 
 
+def _build_tools_with_scenes(client_data: dict, readable_hours: str, catalog: dict) -> list[dict]:
+    """Режим сцен: одна команда show_scene вместо разделов, калькулятора и «морфинга»."""
+    base = build_tools(client_data, readable_hours, web=True)
+    base.append(build_scene_tool(catalog))
+    base.append(SCREEN_AUDIT_TOOL)
+    base.append(FLAG_ABUSE_TOOL)
+    return [{"function_declarations": base}]
+
+
 def _compute_roi(args: dict[str, Any]) -> dict[str, Any]:
     per_day = args.get("missed_calls_per_day")
     per_month = args.get("missed_calls_per_month")
@@ -815,6 +1079,7 @@ async def run_webrtc_session(
     )
 
     # Часы из БД клиента + единая сборка промпта (как в GSM-контуре)
+    has_scenes = bool(await load_scene_catalog(client_id))
     hours = parse_working_hours(client_data.get("working_hours"))
     now = dt.datetime.now(tz_for(tz_name))
     system_prompt, readable_hours = build_system_prompt(
@@ -828,12 +1093,27 @@ async def run_webrtc_session(
         caller_name=visitor_name,
         landing_url=landing_url,
         referrer=referrer,
+        ui_mode="scenes" if has_scenes else "sections",
     )
     clog.info(
         "[%s] session_index=%s max_sec=%s lang=%s prompt_chars=%s",
         call_id, session_index, max_session_seconds, call_lang, len(system_prompt),
     )
-    tools = _build_tools_with_ui(client_data, readable_hours)
+    # Сцены из каталога клиента. Нет каталога — старые разделы, как раньше.
+    scene_catalog = await load_scene_catalog(client_id)
+    scene_lang_used = scene_lang(scene_catalog, call_lang)
+    scene_cat_loc = localize_catalog(scene_catalog, scene_lang_used) if scene_catalog else None
+    scene_profile: dict[str, Any] = {}
+    scene_values: dict[str, float] = {}  # цифры посетителя: поля подбора тарифа и калькулятора из каталога
+    scene_billing = "month"
+    if scene_catalog:
+        system_prompt = system_prompt + "\n\n" + build_scene_prompt(scene_catalog, scene_lang_used)
+        tools = _build_tools_with_scenes(client_data, readable_hours, scene_catalog)
+        ui_tool = "show_scene"
+    else:
+        tools = _build_tools_with_ui(client_data, readable_hours)
+        ui_tool = "control_website_ui"
+    clog.info("[%s] ui mode=%s", call_id, "scenes" if scene_catalog else "sections")
 
     wav_path = f"/tmp/webrtc_{call_id}.wav"
     mixer = WebAudioMixer(wav_path)
@@ -875,6 +1155,7 @@ async def run_webrtc_session(
             function_call_report_level={
                 "*": RTVIFunctionCallReportLevel.NAME,
                 "control_website_ui": RTVIFunctionCallReportLevel.FULL,
+                "show_scene": RTVIFunctionCallReportLevel.FULL,
                 "update_roi_calculator": RTVIFunctionCallReportLevel.FULL,
                 "request_screen_audit": RTVIFunctionCallReportLevel.FULL,
                 "morph_ui_for_sentiment": RTVIFunctionCallReportLevel.FULL,
@@ -994,6 +1275,166 @@ async def run_webrtc_session(
                 + ". Give a short spoken summary of what the visitor sees."
             ),
         })
+
+    async def process_show_scene(params: FunctionCallParams):
+        """Сцена из каталога. Тариф и расчёт считает сервер по правилам каталога; модель озвучивает результат."""
+        nonlocal scene_billing
+        args = params.arguments or {}
+        cat = scene_catalog or {}
+        loc = scene_cat_loc or {}
+        available = scene_available(cat)
+        scene = str(args.get("scene") or "welcome")
+        if scene == "roi":
+            scene = "calculator"
+        if scene not in available:
+            scene = "welcome"
+
+        for k in ("activity", "problem", "volume"):
+            v = str(args.get(k) or "").strip()
+            if v:
+                scene_profile[k] = v[:90]
+        for f in _extra_fields(cat):
+            with contextlib.suppress(TypeError, ValueError):
+                v = float(args.get(f["id"]))
+                if v > 0:
+                    scene_values[f["id"]] = v
+        if args.get("billing") in ("month", "year"):
+            scene_billing = args["billing"]
+
+        plans_loc = _catalog_plans(loc)
+        by_id = {p.get("id"): p for p in plans_loc}
+        picker = _picker(cat)
+        has_numbers = any(scene_values.get(f.get("id")) for f in (picker.get("inputs") or []) + (picker.get("limits") or []))
+        need = scene_need(cat, scene_values) if picker else 0.0
+        if picker and has_numbers:
+            rec = scene_pick_plan(loc, need, scene_values)
+        else:
+            rec = next((p for p in plans_loc if p.get("popular")), plans_loc[0] if plans_loc else None)
+        rec_id = (rec or {}).get("id")
+        if has_numbers and rec_id:
+            scene_profile["solution_plan"] = rec_id
+        fits = {p.get("id"): scene_plan_fits(loc, p, need, scene_values) for p in plans_loc} if has_numbers else {}
+
+        def _price(p: dict) -> float:
+            return float((p.get("year") if scene_billing == "year" and p.get("year") else p.get("month")) or 0)
+
+        def _calc_values(p: Optional[dict]) -> dict:
+            v: dict[str, float] = {"plan_price": _price(p) if p else 0.0}
+            for inp in _calculator(cat).get("inputs") or []:
+                v[inp["id"]] = float(scene_values.get(inp["id"]) or inp.get("default") or 0)
+            return v
+
+        def _plan_facts(p: dict) -> dict:
+            return {
+                "plan": p.get("name"),
+                "price_month": p.get("month"),
+                "price_month_paid_yearly": p.get("year"),
+                "what_it_includes": p.get("highlight"),
+                "fits_visitor": fits.get(p.get("id"), True),
+            }
+
+        scene_args: dict[str, Any] = {"billing": scene_billing}
+        result: dict[str, Any] = {"status": "scene_shown", "scene": scene}
+        orb_state, orb_key = "shaping", "screen"
+
+        if scene == "services":
+            valid = {str(x.get("id")) for x in (loc.get("services") or []) if isinstance(x, dict)}
+            ids = [str(x) for x in (args.get("services") or []) if str(x) in valid][:2]
+            reasons_in = [str(x).strip()[:140] for x in (args.get("service_reasons") or [])]
+            scene_args["highlight"] = ids
+            scene_args["reasons"] = {sid: reasons_in[i] for i, sid in enumerate(ids) if i < len(reasons_in) and reasons_in[i]}
+            result["instruction"] = "Say in one sentence how this solves their problem, then ask the next qualifying question."
+        elif scene == "plans":
+            scene_args.update({"rec": rec_id, "need": round(need), "fits": fits,
+                               "reason": str(args.get("reason") or "").strip()[:160]})
+            if rec:
+                result.update(_plan_facts(rec))
+            if has_numbers or not picker:
+                result["instruction"] = (
+                    "Say the plan name, its monthly price and the main reason in one or two sentences. Details are on screen."
+                )
+            else:
+                result["instruction"] = (
+                    "No numbers yet, so the most popular plan is shown. Ask for the numbers listed in <CATALOG> "
+                    "(to pick a plan), then call show_scene(scene='plans') again with them."
+                )
+        elif scene == "compare":
+            ids = [p.get("id") for p in plans_loc]
+            other = str(args.get("compare_plan") or "")
+            if other not in by_id or other == rec_id:
+                i = ids.index(rec_id) if rec_id in ids else 0
+                other = ids[i - 1] if i > 0 else (ids[i + 1] if i + 1 < len(ids) else rec_id)
+            a, b = (other, rec_id) if ids.index(other) <= ids.index(rec_id) else (rec_id, other)
+            scene_args.update({"a": a, "b": b, "need": round(need), "fits": fits})
+            if any(scene_values.get(i_["id"]) for i_ in _calculator(cat).get("inputs") or []):
+                scene_args["calc"] = {k: v for k, v in _calc_values(None).items() if k != "plan_price"}
+            result["recommended"] = _plan_facts(by_id[rec_id]) if rec_id in by_id else {}
+            result["other"] = _plan_facts(by_id[other]) if other in by_id else {}
+            result["instruction"] = "Explain the key difference in one or two sentences using these facts. The table is on screen."
+        elif scene == "calculator":
+            orb_state, orb_key = "solving", "roi"
+            calc = _calculator(loc)
+            vals = _calc_values(rec)
+            scene_args.update({"plan": rec_id, "calc": {k: v for k, v in vals.items() if k != "plan_price"}})
+            figures = {}
+            for o in calc.get("outputs") or []:
+                val = calc_expr(o.get("expr"), vals)
+                if val is not None:
+                    figures[str(o.get("label") or o.get("id"))] = round(val, 1)
+            result.update({"plan": (rec or {}).get("name"), "inputs": vals, "figures": figures,
+                           "instruction": "Say the main figure and the payback (if any) in one sentence. The calculation is on screen."})
+        elif scene == "case":
+            cs = [x for x in (loc.get("cases") or []) if isinstance(x, dict)]
+            if cs:
+                scene_args["id"] = cs[0].get("id")
+                result["case"] = {k: cs[0].get(k) for k in ("industry", "before", "after", "unit", "metric", "period", "example")}
+            result["instruction"] = "Tell the result in one sentence. If example=true, do not present it as a real client."
+        elif scene == "clients":
+            result["clients"] = [x.get("name") for x in (loc.get("clients") or []) if isinstance(x, dict)]
+            result["instruction"] = "Name two or three of these clients in one sentence."
+        elif scene == "trust":
+            result["instruction"] = "Answer the concern in one or two sentences; the proof is on screen."
+        elif scene == "contacts":
+            result["instruction"] = (
+                "The phone numbers, email and social links are on screen. Tapping 'Call' ends this site conversation "
+                "and opens the phone call. Offer the booking as the alternative."
+            )
+        elif scene == "booking":
+            if not phone_verified_session:
+                await _start_verification("booking")
+                await params.result_callback({
+                    "status": "verify_first",
+                    "instruction": (
+                        "The visitor's phone is not verified yet. Phone verification is now on screen. "
+                        "Wait for SYSTEM UI EVENT that the phone is verified, then call show_scene(scene='booking') again."
+                    ),
+                })
+                return
+            orb_state, orb_key = "searching", "calendar"
+            scene_args.update(_booking_prefill({
+                "start_time": str(args.get("start_time") or "").strip()[:40],
+                "end_time": str(args.get("end_time") or "").strip()[:40],
+                "request_summary": str(args.get("request_summary") or "").strip()[:200],
+            }))
+            result["instruction"] = "Ask once whether everything on the card is correct. On a clear yes call Booking_tool action='book'."
+        else:
+            result["instruction"] = "Continue the conversation; ask one forward question."
+
+        await _orb(orb_state, orb_key)
+        if task is not None:
+            await task.queue_frames([
+                RTVIUICommandFrame(
+                    command="show_scene",
+                    payload={
+                        "scene": scene,
+                        "args": scene_args,
+                        "profile": dict(scene_profile),
+                        "agent": persona.persona_name or "",
+                    },
+                ),
+            ])
+        await _orb_rest(1.2)
+        await params.result_callback(result)
 
     async def process_update_roi(params: FunctionCallParams):
         nonlocal last_roi
@@ -1482,6 +1923,7 @@ async def run_webrtc_session(
         await _block_abuse(f"repeat_after_verify:{reason}")
 
     llm.register_function("control_website_ui", process_control_website_ui)
+    llm.register_function("show_scene", process_show_scene)
     llm.register_function("flag_session_abuse", process_flag_session_abuse)
     llm.register_function("update_roi_calculator", process_update_roi)
     llm.register_function("request_screen_audit", process_request_screen_audit)
@@ -1542,6 +1984,31 @@ async def run_webrtc_session(
             return
 
         # ----- Карточка записи подтверждена на экране -----
+        # ----- Scene layer: visitor moved the calculator sliders / tapped Call -----
+        if interaction == "roi_adjusted":
+            ids = {str(f.get("id")) for f in (_calculator(scene_catalog or {}).get("inputs") or [])}
+            changed = {}
+            for key, val in (data or {}).items():
+                if key in ids:
+                    with contextlib.suppress(TypeError, ValueError):
+                        v = float(val)
+                        if v > 0:
+                            scene_values[key] = v
+                            changed[key] = v
+            if changed:
+                context.add_message({
+                    "role": "user",
+                    "content": (
+                        "SYSTEM UI EVENT: the visitor adjusted the calculator on screen: "
+                        + ", ".join(f"{k}={v:g}" for k, v in changed.items())
+                        + ". Use these numbers from now on; do not comment unless asked."
+                    ),
+                })
+            return
+        if interaction == "call_tap":
+            clog.info("[%s] visitor tapped Call on the contacts scene — site session ends", call_id)
+            return
+
         if interaction == "booking_confirmed":
             bc_name = str(data.get("client_name") or "").strip()[:80]
             bc_start = str(data.get("start_time") or "").strip()[:40]
@@ -1584,8 +2051,8 @@ async def run_webrtc_session(
                 "content": (
                     f"SYSTEM UI EVENT: SCREEN AUDIT (focus={focus}"
                     f"{', url=' + url if url else ''}): {page_summary}{issues_txt}. "
-                    "Give 2–3 concrete observations. Optionally call control_website_ui "
-                    "to show a relevant section. Do not invent content not in this summary."
+                    f"Give 2–3 concrete observations. Optionally call {ui_tool} "
+                    "to show a relevant screen. Do not invent content not in this summary."
                 ),
             })
             await _orb("composing", "audit_compose")
@@ -1732,7 +2199,7 @@ async def run_webrtc_session(
                 "Salută scurt, arată că îți amintești contextul (nișă/problemă) — NU reîntreba ce afacere are. "
                 + (f"Folosește numele «{name_hint}». " if name_hint else
                    "Numele lipsește: întreabă o singură dată cum să-l/o abordezi, apoi folosește numele. ")
-                + "Deschide ecranul potrivit (control_website_ui) și continuă de la obiectivul deja cunoscut. "
+                + f"Deschide ecranul potrivit ({ui_tool}) și continuă de la obiectivul deja cunoscut. "
                 "Maxim 2 fraze + o întrebare de avansare (nu de recunoaștere)."
             )
         else:
@@ -1740,7 +2207,8 @@ async def run_webrtc_session(
                 "SYSTEM EVENT: Client just connected. Speak first! "
                 "WOW scurt (max 2 fraze): controlezi site-ul în timp real. "
                 "Întreabă numele (o dată) și ce vrea să automatizeze. "
-                "Apelează control_website_ui(section=services) la început."
+                + ("Apelează show_scene(scene='welcome') la început." if scene_catalog else
+                   "Apelează control_website_ui(section=services) la început.")
             )
     else:
         if has_memory:
@@ -1750,7 +2218,7 @@ async def run_webrtc_session(
                 "Greet briefly and show you remember their niche/problem — do NOT re-ask what business they run. "
                 + (f"Address them as «{name_hint}». " if name_hint else
                    "Name unknown: ask once how to address them, then use the name. ")
-                + "Open the right screen (control_website_ui) and continue from the known goal. "
+                + f"Open the right screen ({ui_tool}) and continue from the known goal. "
                 "Max 2 sentences + one forward question (not a rediscovery question)."
             )
         else:
@@ -1758,8 +2226,9 @@ async def run_webrtc_session(
                 "SYSTEM EVENT: Client just connected. Speak first! "
                 "Short WOW (max 2 sentences): you control the site live on their screen. "
                 "Ask their first name once, and what they want to automate. "
-                "Call control_website_ui(section=services) immediately. "
-                "When you learn the name, call save_lead with client_name (phone may wait)."
+                + ("Call show_scene(scene='welcome') immediately. " if scene_catalog else
+                   "Call control_website_ui(section=services) immediately. ")
+                + "When you learn the name, call save_lead with client_name (phone may wait)."
             )
     context.add_message({"role": "user", "content": greeting_text})
     await task.queue_frames([LLMRunFrame()])
@@ -1931,177 +2400,4 @@ async def run_webrtc_session(
                         call_id, call_status, lead_was_saved,
                     )
                 except Exception as post_exc:
-                    clog.exception("[%s] archivist failed: %s", call_id, post_exc)
-
-            if transcript or user_replies > 0 or learned_phone:
-                asyncio.create_task(_post())
-            else:
-                clog.info("[%s] skip archivist — empty session", call_id)
-        except Exception as fin_exc:
-            clog.exception("[%s] post-processing failed: %s", call_id, fin_exc)
-
-
-def _cors_headers(request: Request) -> dict[str, str]:
-    """Minimal CORS for browser widget on client sites."""
-    origin = (request.headers.get("origin") or "").strip()
-    # Reflect allowed-looking https origins; tighten via env on the app middleware.
-    allow = origin if origin.startswith("https://") else "*"
-    return {
-        "Access-Control-Allow-Origin": allow,
-        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Authorization, Content-Type",
-        "Access-Control-Max-Age": "86400",
-        "Vary": "Origin",
-    }
-
-
-@router.options("/api/offer")
-async def webrtc_offer_options(request: Request):
-    return JSONResponse({}, status_code=204, headers=_cors_headers(request))
-
-@router.post("/api/offer", response_model=None)
-async def webrtc_offer(request: Request):
-    """Signalling endpoint for SmallWebRTCTransport (SDP offer → answer)."""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid json"}, status_code=400, headers=_cors_headers(request))
-
-    offer_sdp = body.get("sdp")
-    offer_type = body.get("type", "offer")
-    key = str(body.get("key") or body.get("widget_key") or "").strip()
-    visitor_id = str(body.get("visitor_id") or "").strip()
-    project_id = str(body.get("project_id") or "").strip()
-    raw_lang = str(body.get("lang") or body.get("language") or body.get("locale") or "").strip()
-    accept_lang = request.headers.get("accept-language") or ""
-    device_lang = ""
-    if accept_lang:
-        primary = accept_lang.split(",")[0].split(";")[0].strip()
-        if "-" in primary:
-            device_lang = primary.split("-")[0].lower()
-        elif "_" in primary:
-            device_lang = primary.split("_")[0].lower()
-        else:
-            device_lang = primary.lower()[:8]
-    browser_lang = device_lang or raw_lang
-    landing_url = str(body.get("landing_url") or body.get("url") or body.get("page_url") or "").strip()[:500]
-    referrer = str(body.get("referrer") or body.get("ref") or "").strip()[:500]
-    turnstile_token = str(
-        body.get("turnstile_token")
-        or body.get("t")
-        or body.get("cf-turnstile-response")
-        or ""
-    ).strip()
-    if not offer_sdp or not key:
-        return JSONResponse({"error": "sdp and key required"}, status_code=400, headers=_cors_headers(request))
-
-    forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
-    ip = forwarded or (request.client.host if request.client else "")
-    origin = request.headers.get("origin") or ""
-
-    try:
-        channel_rows = await sb_select(
-            "bot_channels",
-            {
-                "identifier": f"eq.{key}",
-                "platform": "eq.web",
-                "select": "client_id,project_id,allowed_origins,turnstile_secret_key,voice_enabled",
-                "limit": "1",
-            },
-            timeout=2.5,
-        )
-    except Exception as exc:
-        log.error("webrtc channel lookup failed: %s", exc)
-        return JSONResponse({"error": "channel lookup failed"}, status_code=500, headers=_cors_headers(request))
-
-    if not channel_rows or not channel_rows[0].get("client_id"):
-        return JSONResponse({"error": "unknown widget key"}, status_code=403, headers=_cors_headers(request))
-
-    row = channel_rows[0]
-    client_id = str(row["client_id"])
-    if not project_id:
-        project_id = str(row.get("project_id") or "")
-
-    if row.get("voice_enabled") is False:
-        return JSONResponse({"error": "voice disabled"}, status_code=403, headers=_cors_headers(request))
-
-    if not origin_permis(origin, row.get("allowed_origins")):
-        log.warning("webrtc origin refused: %s key=%s", origin, key[:12])
-        return JSONResponse({"error": "origin not allowed"}, status_code=403, headers=_cors_headers(request))
-
-    if await este_blocat(visitor_id, ip):
-        log.warning("webrtc blocked visitor=%s ip=%s", visitor_id[:12], ip)
-        return JSONResponse({"error": "blocked"}, status_code=403, headers=_cors_headers(request))
-
-    used_today = await web_seconds_used_today(client_id)
-    if used_today >= WEB_MAX_MINUTES_PER_DAY * 60:
-        log.warning("webrtc daily site minutes spent client=%s used=%ss", client_id, used_today)
-        return JSONResponse(
-            {"error": "daily_limit", "detail": "site_minutes"},
-            status_code=429,
-            headers=_cors_headers(request),
-        )
-
-    secret = str(row.get("turnstile_secret_key") or "")
-    # Empty token is common on mobile if CF script lags; allow bypass only when
-    # WEB_SKIP_TURNSTILE=1 on the voice server (debug / staged rollout).
-    import os as _os
-    skip_ts = (_os.getenv("WEB_SKIP_TURNSTILE") or "").strip().lower() in ("1", "true", "yes")
-    if not await propusk_valabil(turnstile_token, ip, secret):
-        if skip_ts:
-            log.warning("webrtc turnstile failed ip=%s — WEB_SKIP_TURNSTILE, allowing", ip)
-        else:
-            log.warning("webrtc turnstile failed ip=%s token_len=%s", ip, len(turnstile_token))
-            return JSONResponse(
-                {"error": "verification failed"},
-                status_code=403,
-                headers=_cors_headers(request),
-            )
-
-    limit_err, session_index, max_session_seconds = await web_session_budget(visitor_id, ip)
-    if limit_err:
-        log.warning("webrtc daily limit: %s", limit_err)
-        return JSONResponse(
-            {"error": "daily_limit", "detail": limit_err, "session_index": session_index},
-            status_code=429,
-            headers=_cors_headers(request),
-        )
-
-    connection = SmallWebRTCConnection(ice_servers=_get_ice_servers())
-    await connection.initialize(sdp=offer_sdp, type=offer_type)
-
-    transport = SmallWebRTCTransport(
-        webrtc_connection=connection,
-        params=TransportParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            audio_out_sample_rate=24000,
-        ),
-    )
-
-    vid = visitor_id or uuid.uuid4().hex
-    asyncio.create_task(
-        run_webrtc_session(
-            transport,
-            client_id,
-            vid,
-            project_id,
-            visitor_ip=ip,
-            browser_lang=browser_lang,
-            landing_url=landing_url,
-            referrer=referrer,
-            session_index=session_index,
-            max_session_seconds=max_session_seconds,
-        )
-    )
-
-    answer = connection.get_answer()
-    return JSONResponse(
-        {
-            "sdp": answer["sdp"],
-            "type": answer["type"],
-            "session_index": session_index,
-            "max_session_seconds": max_session_seconds,
-        },
-        headers=_cors_headers(request),
-    )
+            
