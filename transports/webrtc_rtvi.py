@@ -24,6 +24,7 @@ Legacy GSM и /ws НЕ затрагиваются.
   номер берётся только из подтверждения, запись — карточка с подтверждением.
   Пока номер подтверждается, звук посетителя в модель не идёт (токены не тратятся).
   Дневной предел минут голоса на сайт клиента — счётчик в Redis.
+  Замер задержек: строка TIMING на каждый ответ агента и итог в конце разговора.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ import logging
 import os
 import re
 import secrets
+import statistics
 import time
 import uuid
 from typing import Any, Optional
@@ -46,8 +48,12 @@ from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pathlib import Path
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     CancelFrame,
     Frame,
+    FunctionCallInProgressFrame,
+    FunctionCallResultFrame,
     InputAudioRawFrame,
     InputTransportMessageFrame,
     LLMMessagesAppendFrame,
@@ -57,6 +63,7 @@ from pipecat.frames.frames import (
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -316,6 +323,124 @@ class MicGate(FrameProcessor):
                 await self.push_frame(silence, direction)
             return
         await self.push_frame(frame, direction)
+
+
+class LatencyObserver(BaseObserver):
+    """Замер задержек одного разговора. Ничего не меняет, только пишет в лог.
+
+    Конец фразы посетителя — последний громкий кусок его звука, пока агент молчит
+    (Gemini Live сам не сообщает, когда посетитель замолчал). От этой точки считается:
+    когда модель вызвала инструмент, сколько он работал, когда команда ушла на экран,
+    когда агент начал говорить. Отрисовку на экране подтверждает виджет.
+    """
+
+    SPEECH_RMS = 500  # порог громкости речи (16-бит PCM, около -36 дБ)
+
+    def __init__(self, call_id: str, logger: Any) -> None:
+        super().__init__()
+        self.call_id = call_id
+        self.log = logger
+        self._seen: set[int] = set()
+        self.bot_speaking = False
+        self.speech_end = 0.0
+        self.events: list[str] = []
+        self.tool_started: dict[str, float] = {}
+        self.ui_sent: dict[str, float] = {}
+        self.replies_ms: list[int] = []
+
+    def _first_time(self, frame: Frame) -> bool:
+        key = frame.id
+        sib = getattr(frame, "broadcast_sibling_id", None)
+        if sib:
+            key = min(frame.id, sib)
+        if key in self._seen:
+            return False
+        if len(self._seen) > 20000:
+            self._seen.clear()
+        self._seen.add(key)
+        return True
+
+    def _rel(self, now: float) -> str:
+        return f"+{int((now - self.speech_end) * 1000)}ms" if self.speech_end else "+?"
+
+    async def on_push_frame(self, data: FramePushed) -> None:
+        frame = data.frame
+        try:
+            if isinstance(frame, InputAudioRawFrame):
+                if self.bot_speaking or not self._first_time(frame):
+                    return
+                n = len(frame.audio) // 2
+                if n:
+                    a = memoryview(frame.audio).cast("h")
+                    step = 4
+                    acc = 0
+                    cnt = 0
+                    for i in range(0, n, step):
+                        v = a[i]
+                        acc += v * v
+                        cnt += 1
+                    if cnt and (acc / cnt) ** 0.5 >= self.SPEECH_RMS:
+                        self.speech_end = time.time()
+                        self.events.clear()
+                return
+            if not isinstance(
+                frame,
+                (
+                    BotStartedSpeakingFrame,
+                    BotStoppedSpeakingFrame,
+                    FunctionCallInProgressFrame,
+                    FunctionCallResultFrame,
+                    RTVIUICommandFrame,
+                ),
+            ):
+                return
+            if not self._first_time(frame):
+                return
+            now = time.time()
+            if isinstance(frame, FunctionCallInProgressFrame):
+                self.tool_started[frame.tool_call_id or frame.function_name] = now
+                self.events.append(f"tool {frame.function_name} start {self._rel(now)}")
+            elif isinstance(frame, FunctionCallResultFrame):
+                t0 = self.tool_started.pop(frame.tool_call_id or frame.function_name, 0.0)
+                took = f"{int((now - t0) * 1000)}ms" if t0 else "?"
+                self.events.append(f"tool {frame.function_name} done in {took}")
+            elif isinstance(frame, RTVIUICommandFrame):
+                if frame.command == "set_agent_state":
+                    return
+                self.ui_sent[frame.command] = now
+                self.events.append(f"screen {frame.command} sent {self._rel(now)}")
+            elif isinstance(frame, BotStartedSpeakingFrame):
+                self.bot_speaking = True
+                if self.speech_end:
+                    ms = int((now - self.speech_end) * 1000)
+                    self.replies_ms.append(ms)
+                    tail = (" | " + "; ".join(self.events)) if self.events else ""
+                    self.log.info("[%s] TIMING voice %sms after visitor stopped%s", self.call_id, ms, tail)
+                self.speech_end = 0.0
+                self.events.clear()
+            elif isinstance(frame, BotStoppedSpeakingFrame):
+                self.bot_speaking = False
+        except Exception as exc:  # замер не должен ломать разговор
+            self.log.debug("[%s] latency observer: %s", self.call_id, exc)
+
+    def screen_rendered(self, command: str) -> None:
+        t0 = self.ui_sent.get(command)
+        if t0:
+            self.log.info(
+                "[%s] TIMING screen %s rendered %sms after it was sent",
+                self.call_id, command, int((time.time() - t0) * 1000),
+            )
+
+    def summary(self) -> None:
+        if not self.replies_ms:
+            return
+        self.log.info(
+            "[%s] TIMING summary replies=%s median=%sms max=%sms",
+            self.call_id,
+            len(self.replies_ms),
+            int(statistics.median(self.replies_ms)),
+            max(self.replies_ms),
+        )
 
 
 # Дневной предел минут голоса на сайт клиента (не обходится сменой браузера и адреса)
@@ -659,6 +784,7 @@ async def run_webrtc_session(
     phone_verified_session = False
     abuse_probe = WebAbuseProbe()
     mic_gate = MicGate()
+    latency = LatencyObserver(call_id, clog)
     # Проверка номера кодом из SMS
     verify_stage = "none"  # none | pending | verified
     verify_code = ""
@@ -1387,6 +1513,11 @@ async def run_webrtc_session(
         except (TypeError, ValueError):
             dwell_sec = 0.0
 
+        # ----- Виджет подтвердил отрисовку экрана (только для замера, в модель не идёт) -----
+        if interaction == "ui_rendered":
+            latency.screen_rendered(str(data.get("command") or ""))
+            return
+
         # ----- Escape: visitor chose "don't want to talk" -----
         if interaction in ("escape", "mute_voice", "dont_want_to_talk", "decline_voice"):
             clog.info("[%s] visitor escape interaction=%s", call_id, interaction)
@@ -1573,7 +1704,7 @@ async def run_webrtc_session(
             idle_timeout=IDLE_TIMEOUT_SECONDS,
             enable_metrics=True,
         ),
-        observers=[rtvi_observer],
+        observers=[rtvi_observer, latency],
     )
 
     @transport.event_handler("on_client_disconnected")
@@ -1723,6 +1854,8 @@ async def run_webrtc_session(
     finally:
         duration = int(max(0.0, time.time() - start_ts))
         clog.info("[%s] WebRTC session ended, %ss", call_id, duration)
+        with contextlib.suppress(Exception):
+            latency.summary()
         with contextlib.suppress(Exception):
             await web_seconds_add(client_id, duration)
 
