@@ -2331,6 +2331,8 @@
             state.dwellTimers[key] = setTimeout(function () {
               state.dwellTimers[key] = null;
               if (state.dwellSeen[key] || state.workspaceOpen) return;
+              /* the scene layer covers the page: nothing on the page is being looked at */
+              if (window.LuScenes && window.LuScenes.isOpen()) return;
               state.dwellSeen[key] = true;
               sendClientMessage({
                 type: "ui_user_interaction",
