@@ -1343,7 +1343,7 @@ async def run_webrtc_session(
             reasons_in = [str(x).strip()[:140] for x in (args.get("service_reasons") or [])]
             scene_args["highlight"] = ids
             scene_args["reasons"] = {sid: reasons_in[i] for i, sid in enumerate(ids) if i < len(reasons_in) and reasons_in[i]}
-            result["instruction"] = "Say in one sentence how this solves their problem, then ask the next qualifying question."
+            result["instruction"] = "Shown on screen. If you already explained it and asked a question, stay silent and wait for the answer; otherwise say in one sentence how this solves their problem and ask the next question."
         elif scene == "plans":
             scene_args.update({"rec": rec_id, "need": round(need), "fits": fits,
                                "reason": str(args.get("reason") or "").strip()[:160]})
@@ -1351,7 +1351,8 @@ async def run_webrtc_session(
                 result.update(_plan_facts(rec))
             if has_numbers or not picker:
                 result["instruction"] = (
-                    "Say the plan name, its monthly price and the main reason in one or two sentences. Details are on screen."
+                    "If you have not yet said it, say the plan name, its monthly price and the main reason in one or two "
+                    "sentences. Details are on screen. Never name a different plan."
                 )
             else:
                 result["instruction"] = (
@@ -1388,12 +1389,12 @@ async def run_webrtc_session(
             if cs:
                 scene_args["id"] = cs[0].get("id")
                 result["case"] = {k: cs[0].get(k) for k in ("industry", "before", "after", "unit", "metric", "period", "example")}
-            result["instruction"] = "Tell the result in one sentence. If example=true, do not present it as a real client."
+            result["instruction"] = "If you have not yet told this result, tell it in one sentence (if example=true, do not present it as a real client); otherwise stay silent."
         elif scene == "clients":
             result["clients"] = [x.get("name") for x in (loc.get("clients") or []) if isinstance(x, dict)]
-            result["instruction"] = "Name two or three of these clients in one sentence."
+            result["instruction"] = "If you have not yet named clients, name two or three in one sentence; otherwise stay silent."
         elif scene == "trust":
-            result["instruction"] = "Answer the concern in one or two sentences; the proof is on screen."
+            result["instruction"] = "Shown on screen. If you already answered the concern, stay silent; otherwise answer it in one or two sentences."
         elif scene == "contacts":
             result["instruction"] = (
                 "The phone numbers, email and social links are on screen. Tapping 'Call' ends this site conversation "
@@ -1418,7 +1419,7 @@ async def run_webrtc_session(
             }))
             result["instruction"] = "Ask once whether everything on the card is correct. On a clear yes call Booking_tool action='book'."
         else:
-            result["instruction"] = "Continue the conversation; ask one forward question."
+            result["instruction"] = "Shown on screen. Do not comment on it; if you already asked a question, wait for the answer."
 
         await _orb(orb_state, orb_key)
         if task is not None:
@@ -1566,10 +1567,17 @@ async def run_webrtc_session(
 
         await _orb("working", "lead")
         try:
+            lead_body = dict(params.arguments or {})
+            lead_body["web_id"] = visitor_id or ""
+            lead_body["platform"] = "web"
+            if project_id:
+                lead_body["project_id"] = project_id
+            if learned_phone and not lead_body.get("client_phone"):
+                lead_body["client_phone"] = "+" + learned_phone.lstrip("+")
             result = await call_n8n(
                 "save_lead",
                 {"client_id": client_id, "tg_chat_id": tg_chat or ""},
-                params.arguments,
+                lead_body,
                 5.0,
             )
             saved_lead_hashes.add(digest)
@@ -1728,28 +1736,49 @@ async def run_webrtc_session(
         clog.info("[%s] phone verification started reason=%s", call_id, reason)
         if task is None:
             return
-        await task.queue_frames([
-            RTVIUICommandFrame(
-                command="require_phone_verification",
-                payload={"reason": reason},
-            )
-        ])
-        context.add_message({
-            "role": "user",
-            "content": (
-                "SYSTEM: Phone verification starts now. If the visitor just asked something, "
-                "answer it in one short sentence first. Then say honestly and briefly: because of "
-                "bad-faith visitors and competitors we confirm the phone number; the field is on "
-                "screen, the phone suggests the number by itself and the SMS code arrives in seconds; "
-                "you will continue right after. The visitor's microphone is paused until then — "
-                "you will not hear them, so say it once and then stay silent. "
-                "Never ask to dictate the number. No 'demo' wording."
-            ),
-        })
-        await task.queue_frames([LLMRunFrame()])
-        # Пока номер подтверждается, голос посетителя в модель не идёт
-        mic_gate.close()
-        _restart_verify_timeout()
+        asyncio.create_task(_announce_verification(reason))
+
+    async def _announce_verification(reason: str) -> None:
+        """Сначала агент договаривает и предупреждает о проверке, потом появляется форма и пауза микрофона."""
+        try:
+            t0 = time.time()
+            while latency.bot_speaking and time.time() - t0 < 15:
+                await asyncio.sleep(0.2)
+            await asyncio.sleep(0.4)
+            await task.queue_frames([
+                LLMMessagesAppendFrame(messages=[{
+                    "role": "user",
+                    "content": (
+                        "SYSTEM: Phone verification starts now. If the visitor just asked something, "
+                        "answer it in one short sentence first. Then say honestly and briefly: because of "
+                        "bad-faith visitors and competitors we confirm the phone number; the field appears "
+                        "on screen right after you finish this sentence, the phone suggests the number by "
+                        "itself and the SMS code arrives in seconds; you will continue right after. "
+                        "The visitor's microphone is paused until then — say it once and then stay silent. "
+                        "Never ask to dictate the number. No 'demo' wording."
+                    ),
+                }]),
+                LLMRunFrame(),
+            ])
+            t1 = time.time()
+            while not latency.bot_speaking and time.time() - t1 < 5:
+                await asyncio.sleep(0.15)
+            t2 = time.time()
+            while latency.bot_speaking and time.time() - t2 < 15:
+                await asyncio.sleep(0.15)
+            if phone_verified_session or abuse_stage == "blocked" or task is None:
+                return
+            await task.queue_frames([
+                RTVIUICommandFrame(command="require_phone_verification", payload={"reason": reason}),
+            ])
+            # Пока номер подтверждается, голос посетителя в модель не идёт
+            mic_gate.close()
+            _restart_verify_timeout()
+            clog.info("[%s] verification form shown after announcement (%.1fs)", call_id, time.time() - t0)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            clog.warning("[%s] verification announce error: %s", call_id, exc)
 
     async def _verify_watch() -> None:
         """Проверка начинается после N реплик посетителя или через N секунд."""
@@ -1828,7 +1857,7 @@ async def run_webrtc_session(
         verify_sends += 1
         verify_last_send = now_ts
         clog.info("[%s] verification code sent phone=%s*** send=%s", call_id, phone[:6], verify_sends)
-        await _verify_state("code_sent", phone="+" + phone)
+        await _verify_state("code_sent", phone="+" + phone, **({"debug_code": code} if WEB_SMS_DEBUG else {}))
         _restart_verify_timeout()
 
     async def _verify_submit_code(raw_code: str) -> None:
@@ -1923,7 +1952,8 @@ async def run_webrtc_session(
         await _block_abuse(f"repeat_after_verify:{reason}")
 
     llm.register_function("control_website_ui", process_control_website_ui)
-    llm.register_function("show_scene", process_show_scene)
+    # Сцена не должна останавливать речь: модель продолжает говорить, результат приходит, когда она замолчит
+    llm.register_function("show_scene", process_show_scene, cancel_on_interruption=False)
     llm.register_function("flag_session_abuse", process_flag_session_abuse)
     llm.register_function("update_roi_calculator", process_update_roi)
     llm.register_function("request_screen_audit", process_request_screen_audit)
