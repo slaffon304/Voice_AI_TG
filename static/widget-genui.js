@@ -314,6 +314,11 @@
     dwellTimers: {},
     sectionMap: {},
     catalog: null,
+    sceneCatalog: null,
+    sceneLang: "en",
+    capNew: true,
+    ttsSeen: false,
+    hiddenTimer: 0,
     lastRoi: {
       missed_calls_per_month: 120,
       cost_per_missed_lead: 50,
@@ -1563,6 +1568,18 @@
   }
 
   // —— 5. Permanent Chrome & Thinking Orb ——
+  function escapeVoice() {
+    state.escaped = true;
+    sendClientMessage({
+      type: "ui_user_interaction",
+      data: { interaction: "escape" },
+    });
+    stopSession("escape");
+    var btn = $("lu-escape-voice");
+    if (btn) btn.style.display = "none";
+    document.documentElement.classList.add("lu-voice-off");
+  }
+
   function ensureChrome() {
     if (!$("lu-escape-voice")) {
       var btn = document.createElement("button");
@@ -1575,16 +1592,7 @@
         "padding:8px 14px;border-radius:999px;border:0;cursor:pointer;" +
         "background:#111;color:#fff;font:600 13px/1.2 system-ui,sans-serif;" +
         "box-shadow:0 4px 16px rgba(0,0,0,.25)";
-      btn.addEventListener("click", function () {
-        state.escaped = true;
-        sendClientMessage({
-          type: "ui_user_interaction",
-          data: { interaction: "escape" },
-        });
-        stopSession("escape");
-        btn.style.display = "none";
-        document.documentElement.classList.add("lu-voice-off");
-      });
+      btn.addEventListener("click", escapeVoice);
       document.body.appendChild(btn);
     }
 
@@ -1632,40 +1640,18 @@
   var _orbReactRoot = null;
   var _orbsLoading = null;
 
+  /* Scene layer + orb engine: one script from our server (no React, no esm.sh) */
   function loadThinkingOrbs() {
-    if (
-      window.ThinkingOrb &&
-      window.React &&
-      window.ReactDOM &&
-      window.ReactDOM.createRoot
-    ) {
-      return Promise.resolve();
-    }
+    if (window.LuOrb && window.LuScenes) return Promise.resolve();
     if (_orbsLoading) return _orbsLoading;
     _orbsLoading = new Promise(function (resolve) {
       var s = document.createElement("script");
-      s.type = "module";
-      s.textContent = [
-        "import React from 'https://esm.sh/react@18.3.1';",
-        "import { createRoot } from 'https://esm.sh/react-dom@18.3.1/client';",
-        "import { ThinkingOrb } from 'https://esm.sh/thinking-orbs@0.3.2?deps=react@18.3.1';",
-        "window.React = React;",
-        "window.ReactDOM = { createRoot: createRoot };",
-        "window.ThinkingOrb = ThinkingOrb;",
-        "window.dispatchEvent(new Event('lu-orbs-ready'));",
-      ].join("\n");
-      var finished = false;
-      function finish() {
-        if (finished) return;
-        finished = true;
-        resolve();
-      }
-      window.addEventListener("lu-orbs-ready", finish, { once: true });
-      s.onerror = function () {
-        finish();
-      };
+      s.src = apiBase + "/genui-scenes.js";
+      s.async = true;
+      s.onload = function () { resolve(); };
+      s.onerror = function () { resolve(); };
       document.head.appendChild(s);
-      setTimeout(finish, 8000);
+      setTimeout(resolve, 8000);
     });
     return _orbsLoading;
   }
@@ -1687,21 +1673,19 @@
     };
     if (!allowed[st]) st = "breathing";
 
-    if (window.ThinkingOrb && window.React && window.ReactDOM) {
+    if (window.LuOrb) {
       try {
-        if (!_orbReactRoot && window.ReactDOM.createRoot) {
-          _orbReactRoot = window.ReactDOM.createRoot(host);
+        if (!_orbReactRoot) {
+          host.innerHTML = "";
+          host.style.background = "transparent";
+          host.style.boxShadow = "none";
+          var cv = document.createElement("canvas");
+          host.appendChild(cv);
+          _orbReactRoot = window.LuOrb(cv, { state: st, display: 64, dark: !!(state.theme && state.theme.isDark) });
+        } else {
+          _orbReactRoot.set(st);
         }
-        if (_orbReactRoot) {
-          _orbReactRoot.render(
-            window.React.createElement(window.ThinkingOrb, {
-              state: st,
-              size: 64,
-              theme: "auto",
-            })
-          );
-          return;
-        }
+        return;
       } catch (e) {}
     }
     applyOrbCss(st);
@@ -1734,6 +1718,9 @@
   function setAgentState(orbState, labelText) {
     state.agentState = orbState || "breathing";
     state.agentLabel = labelText || "";
+    if (window.LuScenes && window.LuScenes.isOpen()) {
+      window.LuScenes.orb(state.agentState === "idle" ? "breathing" : state.agentState, labelText || "");
+    }
     loadThinkingOrbs().then(function () {
       tryMountThinkingOrb(state.agentState);
     });
@@ -2183,7 +2170,110 @@
     } catch (e) {}
   }
 
+  /* —— Scenes from the client catalog (full-screen layer) —— */
+  function sceneChrome(hidden) {
+    var pill = $("lu-escape-voice");
+    if (pill && !state.escaped) pill.style.display = hidden ? "none" : "";
+    var orbWrap = $("lu-voice-orb-wrap");
+    if (orbWrap) orbWrap.style.display = hidden ? "none" : "flex";
+  }
+
+  function configureScenes() {
+    if (!window.LuScenes || !state.sceneCatalog) return false;
+    window.LuScenes.configure({
+      catalog: state.sceneCatalog,
+      lang: state.sceneLang || "en",
+      base: apiBase,
+      on: {
+        escape: escapeVoice,
+        call: function () {
+          sendClientMessage({ type: "ui_user_interaction", data: { interaction: "call_tap" } });
+          /* the tel: link opens the dialer; the site line closes so it does not burn minutes */
+          setTimeout(function () { stopSession("call_tap"); }, 50);
+        },
+        booking: function (a) {
+          a = a || {};
+          sendClientMessage({
+            type: "ui_user_interaction",
+            data: {
+              interaction: "booking_confirmed",
+              client_name: a.client_name || "",
+              start_time: a.start_time || "",
+              end_time: a.end_time || "",
+              request_summary: a.request_summary || "",
+              description: "Visitor confirmed the booking card on screen",
+            },
+          });
+        },
+        roi: function (values) {
+          /* calculator fields come from the client's catalog; send them as they are */
+          var data = { interaction: "roi_adjusted" };
+          Object.keys(values || {}).forEach(function (k) { data[k] = values[k]; });
+          sendClientMessage({ type: "ui_user_interaction", data: data });
+        },
+      },
+    });
+    return true;
+  }
+
+  function handleShowScene(payload) {
+    loadThinkingOrbs().then(function () {
+      if (!configureScenes()) return;
+      if (window.LuScenes.show(payload || {})) {
+        sceneChrome(true);
+        window.LuScenes.orb(state.agentState === "idle" ? "breathing" : state.agentState, state.agentLabel || "");
+        ackRendered("show_scene");
+      }
+    });
+  }
+
+  function handleTranscript(command, payload) {
+    if (!window.LuScenes || !window.LuScenes.isOpen()) return;
+    var text = String((payload && (payload.text || payload.transcript)) || "").trim();
+    if (command === "bot-started-speaking") { state.capNew = true; return; }
+    if (!text) return;
+    if (command === "user-transcription") {
+      if (payload.final === false) return;
+      window.LuScenes.caption("you", text, false);
+      state.capNew = true;
+      return;
+    }
+    if (command === "bot-tts-text") state.ttsSeen = true;
+    if (command === "bot-transcription" && state.ttsSeen) return;
+    window.LuScenes.caption("agent", text, !state.capNew);
+    state.capNew = false;
+  }
+
+  function loadSceneCatalog() {
+    return fetch(
+      apiBase + "/api/scene-catalog?key=" + encodeURIComponent(widgetKey) + "&lang=" + encodeURIComponent(String(lang).slice(0, 2)),
+      { cache: "no-store" }
+    )
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d && d.catalog && typeof d.catalog === "object") {
+          state.sceneCatalog = d.catalog;
+          state.sceneLang = d.lang || "en";
+          loadThinkingOrbs().then(configureScenes);
+        }
+      })
+      .catch(function () {});
+  }
+
   function dispatchCommand(command, payload) {
+    if (command === "show_scene") {
+      handleShowScene(payload);
+      return;
+    }
+    if (
+      command === "bot-tts-text" ||
+      command === "bot-transcription" ||
+      command === "user-transcription" ||
+      command === "bot-started-speaking"
+    ) {
+      handleTranscript(command, payload);
+      return;
+    }
     if (command === "navigate_and_render") {
       handleNavigateAndRender(payload);
       ackRendered(command);
@@ -2464,8 +2554,13 @@
   function stopSession(reason) {
     state.connected = false;
     state.connecting = false;
+    clearTimeout(state.hiddenTimer);
     /* Always restore the page: any end reason, not only escape */
     closeWorkspace();
+    if (window.LuScenes && window.LuScenes.isOpen()) {
+      window.LuScenes.close();
+      sceneChrome(false);
+    }
     var reopen = $("lu-reopen-ws");
     if (reopen) reopen.style.display = "none";
     setAgentState("idle");
@@ -2642,6 +2737,7 @@
     scanPageSections();
     setTimeout(scanPageSections, 1200);
 
+    var catalogPromise = loadSceneCatalog();
     var cfg = await loadConfig();
     /* Site stays untouched on load. Workspace opens only when the agent shows the first scene. */
 
@@ -2682,6 +2778,17 @@
     window.addEventListener("pagehide", function () {
       stopSession("pagehide");
     });
+
+    /* Tab in the background (another app, minimised): 20 s to come back, then the line closes */
+    document.addEventListener("visibilitychange", function () {
+      clearTimeout(state.hiddenTimer);
+      if (document.visibilityState === "hidden" && (state.connected || state.connecting)) {
+        state.hiddenTimer = setTimeout(function () {
+          if (document.visibilityState === "hidden") stopSession("hidden");
+        }, 20000);
+      }
+    });
+    catalogPromise.then(function () {});
   }
 
   if (document.readyState === "loading") {
