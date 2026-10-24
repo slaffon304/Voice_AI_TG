@@ -241,4 +241,7 @@ def build_tools(client_data: dict, readable_hours: str, web: bool = False) -> li
             },
         },
     ]
+    if web and not str(client_data.get("google_calendar_id") or "").strip():
+        # Нет календаря у клиента — запись в календарь невозможна, заявку берёт save_lead
+        tools = [t for t in tools if t.get("name") != "Booking_tool"]
     return tools
