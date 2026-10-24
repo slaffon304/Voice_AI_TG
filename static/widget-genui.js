@@ -2045,8 +2045,12 @@
     if (st === "code_sent") {
       verifyStage("code");
       var ci = $("lu-verify-code");
-      if (ci) ci.value = "";
-      verifyStatus(t("vs_code_sent").replace("{phone}", formatPhone(payload.phone || "")), false);
+      if (ci) ci.value = payload.debug_code ? String(payload.debug_code) : "";
+      verifyStatus(
+        t("vs_code_sent").replace("{phone}", formatPhone(payload.phone || "")) +
+          (payload.debug_code ? " (TEST " + payload.debug_code + ")" : ""),
+        false
+      );
       listenSmsCode();
     } else if (st === "verified") {
       verifyStatus(t("vs_verified"), false);
@@ -2227,21 +2231,11 @@
     });
   }
 
-  function handleTranscript(command, payload) {
+  /* Voice line: who is talking now (live subtitles removed — speech recognition chunks lag and break words) */
+  function handleTranscript(command) {
     if (!window.LuScenes || !window.LuScenes.isOpen()) return;
-    var text = String((payload && (payload.text || payload.transcript)) || "").trim();
-    if (command === "bot-started-speaking") { state.capNew = true; return; }
-    if (!text) return;
-    if (command === "user-transcription") {
-      if (payload.final === false) return;
-      window.LuScenes.caption("you", text, false);
-      state.capNew = true;
-      return;
-    }
-    if (command === "bot-tts-text") state.ttsSeen = true;
-    if (command === "bot-transcription" && state.ttsSeen) return;
-    window.LuScenes.caption("agent", text, !state.capNew);
-    state.capNew = false;
+    if (command === "bot-started-speaking") window.LuScenes.voice(true);
+    else if (command === "bot-stopped-speaking") window.LuScenes.voice(false);
   }
 
   function loadSceneCatalog() {
@@ -2265,13 +2259,8 @@
       handleShowScene(payload);
       return;
     }
-    if (
-      command === "bot-tts-text" ||
-      command === "bot-transcription" ||
-      command === "user-transcription" ||
-      command === "bot-started-speaking"
-    ) {
-      handleTranscript(command, payload);
+    if (command === "bot-started-speaking" || command === "bot-stopped-speaking") {
+      handleTranscript(command);
       return;
     }
     if (command === "navigate_and_render") {
