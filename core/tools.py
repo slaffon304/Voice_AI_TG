@@ -125,10 +125,11 @@ def build_tools(client_data: dict, readable_hours: str, web: bool = False) -> li
             "description": (
                 "Salvează datele de contact și motivul apelului în CRM. "
                 + (
-                    "Pe site numărul vine doar din formularul de pe ecran (SYSTEM UI EVENT). "
-                    "Nu cere niciodată numărul cu voce și nu-l repeta cifră cu cifră. "
-                    "Dacă numărul lipsește, deschide ecranul de programare (show_scene scene='booking' "
-                    "sau control_website_ui section='booking_widget') și așteaptă SYSTEM UI EVENT."
+                    "Pe site apelează-l DOAR când vizitatorul cere explicit o întâlnire, o consultație "
+                    "sau să fie sunat înapoi. Numele aflat, problema sau numărul confirmat prin SMS "
+                    "(verificarea anti-abuz) NU sunt o cerere de contact — nu salva lead pentru ele. "
+                    "Numărul vine doar din verificarea de pe ecran; nu-l cere cu voce. "
+                    "Dacă numărul nu e confirmat încă, sistemul pornește verificarea — așteaptă SYSTEM UI EVENT."
                     if web else
                     "Dacă clientul a dat un ALT număr decât cel de pe care sună, repetă-l "
                     "cifră cu cifră și așteaptă confirmarea înainte de apel."
